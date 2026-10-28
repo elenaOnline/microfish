@@ -267,7 +267,15 @@ pub fn drain_lua_outbox(
                 crate::focus_trace::mark_once("lua_out");
                 commands.trigger(SendMessageTrigger(Event::Command { command }));
             }
-            FromLua::Flash { message, duration } => commands.flash_message(message, duration),
+            FromLua::Flash {
+                message,
+                detail: Some(detail),
+                duration,
+            } => commands.flash_warning(message, detail, duration),
+            FromLua::Flash {
+                message, duration, ..
+            } => commands.flash_message(message, duration),
+            FromLua::Reloaded => {}
             FromLua::ConfigChanged => {
                 // Swap into the shared handle, then re-apply the same side
                 // effects a TOML reload does.

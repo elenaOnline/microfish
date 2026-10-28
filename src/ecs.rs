@@ -272,8 +272,10 @@ pub struct ActiveWorkspaceMarker;
 #[derive(Component)]
 pub struct SelectedVirtualMarker;
 
+/// A transient on-screen message. `detail` makes it a warning, laid out like
+/// the helper's failure HUD (glyph, red title, one line of detail).
 #[derive(Component)]
-pub struct FlashMessage(pub String);
+pub struct FlashMessage(pub String, pub Option<String>);
 
 /// Marker component for the currently active display.
 #[derive(Component)]
@@ -609,6 +611,9 @@ pub trait SpawnCommandsExt {
 
     fn flash_message(&mut self, message: String, duration: f32);
 
+    /// A flash in the failure HUD's warning layout: `title`, then `detail`.
+    fn flash_warning(&mut self, title: String, detail: String, duration: f32);
+
     // Spawns a layout strip in a single place, to properly insert all components.
     fn spawn_layout_strip(
         &mut self,
@@ -671,7 +676,13 @@ impl SpawnCommandsExt for Commands<'_, '_> {
     #[instrument(level = Level::TRACE, skip(self))]
     fn flash_message(&mut self, message: String, duration: f32) {
         let timeout = Timeout::new(Duration::from_secs_f32(duration), None, self);
-        self.spawn((timeout, FlashMessage(message)));
+        self.spawn((timeout, FlashMessage(message, None)));
+    }
+
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn flash_warning(&mut self, title: String, detail: String, duration: f32) {
+        let timeout = Timeout::new(Duration::from_secs_f32(duration), None, self);
+        self.spawn((timeout, FlashMessage(title, Some(detail))));
     }
 
     #[instrument(level = Level::TRACE, skip(self))]

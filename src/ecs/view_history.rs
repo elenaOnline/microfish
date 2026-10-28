@@ -93,7 +93,8 @@ fn path() -> std::path::PathBuf {
 }
 pub(crate) fn initialize(world: &mut World) {
     load(world);
-    publish_status(world, "Navigation ready");
+    // Nothing to report: the Window Map shows this status only when it says something.
+    publish_status(world, "");
 }
 fn publish_status(world: &mut World, text: &str) {
     #[cfg(test)]
@@ -127,6 +128,13 @@ fn publish_status(world: &mut World, text: &str) {
 fn announce(world: &mut World, text: &str) {
     publish_status(world, text);
     world.commands().flash_message(text.to_owned(), 1.6);
+}
+/// A problem, shown in the failure HUD's layout: what failed, then why.
+fn warn_user(world: &mut World, title: &str, detail: &str) {
+    publish_status(world, &format!("{title}. {detail}"));
+    world
+        .commands()
+        .flash_warning(title.to_owned(), detail.to_owned(), 3.0);
 }
 fn load(world: &mut World) {
     if world.resource::<History>().loaded {
@@ -253,7 +261,7 @@ fn unlock(world: &mut World) {
         world.entity_mut(entity).remove::<ViewLock>();
     }
     if changed {
-        publish_status(world, "View released");
+        publish_status(world, "");
     }
 }
 fn restore_view(world: &mut World, view: &View) -> bool {
@@ -267,7 +275,11 @@ fn restore_view(world: &mut World, view: &View) -> bool {
         .into_iter()
         .find(|e| view_for(world, *e).is_some_and(|v| compatible(view, &v)))
     else {
-        announce(world, "View unavailable: windows or layout changed");
+        warn_user(
+            world,
+            "Couldn’t restore the view",
+            "Its windows or layout have changed.",
+        );
         return false;
     };
     let focus = world.get::<LayoutStrip>(target).and_then(|s| {
@@ -363,7 +375,7 @@ fn begin_move(world: &mut World) {
 }
 fn undo(world: &mut World) {
     let Some(saved) = world.resource_mut::<History>().undo.take() else {
-        announce(world, "No layout move to undo");
+        announce(world, "Nothing to undo");
         return;
     };
     let Some(now) = layout(world) else {
@@ -375,7 +387,11 @@ fn undo(world: &mut World) {
             .iter()
             .any(|r| world.get::<Display>(r.parent).is_none())
     {
-        announce(world, "Cannot undo: the window set changed");
+        warn_user(
+            world,
+            "Couldn’t undo",
+            "The windows changed since the move.",
+        );
         return;
     }
     unlock(world);
@@ -457,7 +473,7 @@ fn view_command(world: &mut World, op: Operation) {
                     let mut h = world.resource_mut::<History>();
                     h.previous = current;
                     h.navigating = false;
-                    announce(world, "Previous view pinned");
+                    announce(world, "Previous view");
                 }
             } else {
                 announce(world, "No previous view yet");
@@ -480,19 +496,20 @@ fn view_command(world: &mut World, op: Operation) {
                 let previous = current_view(world);
                 if restore_view(world, &view) {
                     world.resource_mut::<History>().previous = previous;
-                    announce(world, &format!("Pinned view {slot}"));
+                    announce(world, &format!("View {slot}"));
                 }
             } else if let Some(view) = current_view(world) {
                 restore_view(world, &view);
                 world.resource_mut::<History>().pins.insert(slot, view);
-                announce(
-                    world,
-                    if save(world) {
-                        "View saved and pinned"
-                    } else {
-                        "Pinned for this session; saving failed"
-                    },
-                );
+                if save(world) {
+                    announce(world, &format!("View {slot} saved"));
+                } else {
+                    warn_user(
+                        world,
+                        &format!("Couldn’t save View {slot}"),
+                        "It will be kept until Microfish quits.",
+                    );
+                }
             }
             world.resource_mut::<History>().navigating = false;
         }

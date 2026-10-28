@@ -1605,7 +1605,12 @@ pub fn toggle_tabbed_display_handler(
         if let Some(now_tabbed) = strip.toggle_tabbed_display(entity) {
             commands.reshuffle_around(entity);
             commands.flash_message(
-                if now_tabbed { "Tabs on" } else { "Tabs off" }.to_string(),
+                if now_tabbed {
+                    "Showing as tabs"
+                } else {
+                    "Showing as a stack"
+                }
+                .to_string(),
                 1.0,
             );
         }

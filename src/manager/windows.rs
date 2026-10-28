@@ -191,7 +191,8 @@ fn first_rejection(window_id: WinID) -> bool {
     reported.insert(window_id)
 }
 
-/// The one INFO line per window that says what the engine did with it and why:
+/// The one line per window that says what the engine did with it and why (INFO
+/// for real windows, DEBUG for tooltips and other non-window elements):
 /// `admission: window 4711 (Preview) role AXWindow subrole AXFloatingWindow
 /// resizable true: unmanaged: panel`.
 pub fn log_admission(
@@ -201,12 +202,20 @@ pub fn log_admission(
     resizable: Option<bool>,
     decision: &str,
 ) {
-    info!(
-        "admission: window {window_id} ({app_name}) role {} subrole {} resizable {}: {decision}",
-        admission.role,
-        admission.subrole,
-        resizable.map_or_else(|| "?".to_string(), |resizable| resizable.to_string()),
-    );
+    let resizable = resizable.map_or_else(|| "?".to_string(), |resizable| resizable.to_string());
+    // Tooltips, popovers and other non-window elements are routine; only real
+    // windows (role AXWindow) are worth an INFO line.
+    if admission.role == "AXWindow" {
+        info!(
+            "admission: window {window_id} ({app_name}) role {} subrole {} resizable {resizable}: {decision}",
+            admission.role, admission.subrole,
+        );
+    } else {
+        debug!(
+            "admission: window {window_id} ({app_name}) role {} subrole {} resizable {resizable}: {decision}",
+            admission.role, admission.subrole,
+        );
+    }
 }
 
 /// Reports a rejection the first time a window is seen, `false` when it already was.

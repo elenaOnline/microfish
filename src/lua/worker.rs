@@ -69,11 +69,16 @@ pub(super) enum FromLua {
     Command(Command),
     Flash {
         message: String,
+        /// Set for a warning (the failure HUD's layout): its detail line.
+        detail: Option<String>,
         duration: f32,
     },
     /// A reload installed a script that calls `paneru.setup{...}`; tells the
     /// main thread to re-apply the config in [`LuaWorker::built_config`].
     ConfigChanged,
+    /// A reload succeeded. Nothing is shown: Settings confirms its own Apply,
+    /// and a pill for every Apply would say the same thing twice.
+    Reloaded,
 }
 
 /// One world read, as every waiter sees it: an `Arc` so one extraction can
@@ -335,12 +340,18 @@ fn reload(
                 let _ = to_main.try_send(FromLua::ConfigChanged);
             }
             info!("Reloaded Lua script {}", path.display());
-            flash(to_main, "Settings reloaded".to_string(), 1.5);
+            let _ = to_main.try_send(FromLua::Reloaded);
             Some(runtime)
         }
         Err(err) => {
             error!("Reloading Lua script '{}': {err}", path.display());
-            flash(to_main, format!("Couldn’t load settings: {err}"), 4.0);
+            // The error itself is in the log and in Settings' footer; the
+            // flash says what happened and what is still in force.
+            let _ = to_main.try_send(FromLua::Flash {
+                message: "Couldn’t load settings".to_string(),
+                detail: Some("The previous settings are still in use.".to_string()),
+                duration: 4.0,
+            });
             None
         }
     }
@@ -355,7 +366,11 @@ fn publish_config(slot: &Mutex<Option<Config>>, config: &Config) {
 
 /// Queues an on-screen message for the main thread to show.
 fn flash(to_main: &Sender<FromLua>, message: String, duration: f32) {
-    let _ = to_main.try_send(FromLua::Flash { message, duration });
+    let _ = to_main.try_send(FromLua::Flash {
+        message,
+        detail: None,
+        duration,
+    });
 }
 
 /// The worker thread itself: load, then dispatch whatever arrives until the
@@ -658,6 +673,7 @@ mod tests {
             FromLua::Flash { message, .. } => message,
             FromLua::Command(command) => panic!("expected a flash, got {command:?}"),
             FromLua::ConfigChanged => panic!("expected a flash, got a config change"),
+            FromLua::Reloaded => panic!("expected a flash, got a reload notice"),
         }
     }
 
@@ -803,7 +819,7 @@ mod tests {
         std::fs::write(&script, "this is not lua ===").unwrap();
         worker.send_reload(script.clone());
         assert!(
-            next_flash(&worker, "the reload error").starts_with("Couldn’t load settings:"),
+            next_flash(&worker, "the reload error") == "Couldn’t load settings",
             "a broken script should be reported"
         );
 
@@ -833,9 +849,9 @@ mod tests {
         )
         .unwrap();
         worker.send_reload(script.clone());
-        assert_eq!(
-            next_flash(&worker, "the reload notice"),
-            "Settings reloaded"
+        assert!(
+            matches!(next_effect(&worker, "the reload notice"), FromLua::Reloaded),
+            "a successful reload should be reported"
         );
         assert!(
             worker.has_event_handlers(),
@@ -939,6 +955,7 @@ mod tests {
                 FromLua::Flash { message, .. } => panic!("expected ops, got flash {message:?}"),
                 FromLua::Command(command) => panic!("expected ops, got {command:?}"),
                 FromLua::ConfigChanged => panic!("expected ops, got a config change"),
+                FromLua::Reloaded => panic!("expected ops, got a reload notice"),
             },
         }
     }
@@ -1033,11 +1050,13 @@ mod tests {
 
         // The write is served along the way; the reload notice is the first
         // effect either script produces.
-        let FromLua::Flash { message, .. } = serve_until_effect(&worker, "the reload notice")
-        else {
-            panic!("expected the reload notice");
-        };
-        assert_eq!(message, "Settings reloaded");
+        assert!(
+            matches!(
+                serve_until_effect(&worker, "the reload notice"),
+                FromLua::Reloaded
+            ),
+            "expected the reload notice"
+        );
 
         worker.send_binds(vec![1]);
         let FromLua::Flash { message, .. } = serve_until_effect(&worker, "the value read back")

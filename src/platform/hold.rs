@@ -29,6 +29,9 @@ const MENU_WALK_TIMEOUT_SEC: f32 = 0.25;
 /// How far into a menu to look for the New Window item: bar item, menu, item,
 /// submenu, item. Apps that file it under a "New" submenu are one level deeper.
 const MENU_WALK_DEPTH: usize = 5;
+/// Each AX read is a round trip to the app, and the walk runs on the engine's
+/// main thread: stop looking after this long rather than stall in a big menu.
+const MENU_WALK_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// What the engine does with a key that arrives while it holds the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,7 +144,9 @@ fn press_new_window(pid: Pid) -> bool {
     )) else {
         return false;
     };
-    let Some(item) = find_new_window_item(&menu_bar, MENU_WALK_DEPTH) else {
+    let deadline = std::time::Instant::now() + MENU_WALK_BUDGET;
+    let Some(item) = find_new_window_item(&menu_bar, MENU_WALK_DEPTH, deadline) else {
+        debug!("no enabled ⌘N item found in pid {pid} within the walk budget");
         return false;
     };
     let press = CFString::from_static_str(accessibility_sys::kAXPressAction);
@@ -156,8 +161,9 @@ fn press_new_window(pid: Pid) -> bool {
 fn find_new_window_item(
     element: &CFRetained<AXUIWrapper>,
     depth: usize,
+    deadline: std::time::Instant,
 ) -> Option<CFRetained<AXUIWrapper>> {
-    if depth == 0 {
+    if depth == 0 || std::time::Instant::now() >= deadline {
         return None;
     }
     if is_command_n(element) {
@@ -171,7 +177,7 @@ fn find_new_window_item(
     children
         .to_vec()
         .iter()
-        .find_map(|child| find_new_window_item(child, depth - 1))
+        .find_map(|child| find_new_window_item(child, depth - 1, deadline))
 }
 
 /// Whether `element` is an enabled menu item whose whole shortcut is ⌘N.

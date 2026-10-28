@@ -1,15 +1,19 @@
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSBackingStoreType, NSBezierPath, NSColor, NSCompositingOperation, NSFloatingWindowLevel,
-    NSFont, NSGraphicsContext, NSParagraphStyle, NSScreen, NSView, NSWindow,
+    NSAccessibilityAnnouncementKey, NSAccessibilityAnnouncementRequestedNotification,
+    NSAccessibilityNotificationUserInfoKey, NSAccessibilityPostNotificationWithUserInfo,
+    NSAccessibilityPriorityKey, NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua,
+    NSAppearanceNameDarkAqua, NSAppearanceNameVibrantDark, NSAppearanceNameVibrantLight,
+    NSApplication, NSBackingStoreType, NSBezierPath, NSColor, NSCompositingOperation,
+    NSFloatingWindowLevel, NSFont, NSGraphicsContext, NSImage, NSImageView, NSLineBreakMode,
+    NSScreen, NSTextAlignment, NSTextField, NSView, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGFloat;
-use objc2_foundation::{
-    NSAttributedString, NSDictionary, NSMutableCopying, NSPoint, NSRect, NSSize, NSString,
-};
+use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSPoint, NSRect, NSSize, NSString};
 
 #[derive(Clone, PartialEq)]
 pub struct BorderParams {
@@ -347,208 +351,396 @@ impl OverlayManager {
 }
 
 // ── FlashMessage ────────────────────────────────────────────────────────
+//
+// The engine's transient confirmations ("View 3", "Layout move undone",
+// "Settings reloaded", row badges) in the same family as the helper's own
+// transient panels (`src/main.swift`: the minimap HUD and `FailureHUDView`):
+// `.hudWindow` material behind the window, 16 pt corners, a vibrant appearance
+// that follows the system, the system type scale, and a place inside the
+// display's visible frame, 18 pt in from its edge. Top right is where macOS
+// shows its own transient HUDs (volume, brightness, Focus) and keeps clear of
+// the minimap, which may be up while Hyper is held.
 
-#[derive(Debug, Clone)]
-struct FlashMessageViewIvars {
-    opacity: f32,
-    message: Retained<NSString>,
-    is_badge: bool,
+/// Corner radius shared with the helper's HUD panels.
+const HUD_RADIUS: f64 = 16.0;
+/// Distance from the visible frame's edge, as the minimap uses.
+const HUD_EDGE_INSET: f64 = 18.0;
+/// One-line confirmation: height and horizontal padding.
+const NOTE_HEIGHT: f64 = 40.0;
+const NOTE_PADDING: f64 = 18.0;
+/// Warning: the failure HUD's metrics (title, detail, warning glyph).
+const WARNING_WIDTH: f64 = 340.0;
+const WARNING_HEIGHT: f64 = 62.0;
+/// `NSFontWeightMedium` / `NSFontWeightSemibold`. The macOS 27 SDK no longer
+/// exports these as symbols, so the documented values are used.
+const FONT_WEIGHT_MEDIUM: f64 = 0.23;
+const FONT_WEIGHT_SEMIBOLD: f64 = 0.3;
+/// Row badge (`workspace_popup_status`): a square HUD tile holding the number.
+const BADGE_SIDE: f64 = 64.0;
+
+/// What a flash says: a one-line note, a row badge, or a warning with a detail
+/// line (the failure HUD's layout).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FlashContent {
+    pub title: String,
+    pub detail: Option<String>,
 }
 
-define_class!(
-    #[unsafe(super(NSView))]
-    #[thread_kind = MainThreadOnly]
-    #[name = "PaneruFlashMessageView"]
-    #[ivars = FlashMessageViewIvars]
-    #[derive(Debug)]
-    struct FlashMessageView;
+impl FlashContent {
+    fn is_badge(&self) -> bool {
+        self.detail.is_none() && !self.title.is_empty() && self.title.chars().count() <= 2
+    }
+}
 
-    impl FlashMessageView {
-        #[unsafe(method(drawRect:))]
-        fn draw_rect(&self, _dirty_rect: NSRect) {
-            let ivars = self.ivars();
-            let bounds = self.bounds();
-            let is_badge = ivars.is_badge;
+/// The appearance the helper's panels use for a given system appearance.
+fn hud_appearance(mtm: MainThreadMarker) -> (Retained<NSAppearance>, bool) {
+    let app = NSApplication::sharedApplication(mtm);
+    let effective = app.effectiveAppearance();
+    let names = NSArray::from_slice(&[unsafe { NSAppearanceNameAqua }, unsafe {
+        NSAppearanceNameDarkAqua
+    }]);
+    let dark = effective
+        .bestMatchFromAppearancesWithNames(&names)
+        .is_some_and(|name| &*name == unsafe { NSAppearanceNameDarkAqua });
+    let vibrant = if dark {
+        unsafe { NSAppearanceNameVibrantDark }
+    } else {
+        unsafe { NSAppearanceNameVibrantLight }
+    };
+    let appearance = NSAppearance::appearanceNamed(vibrant).unwrap_or(effective);
+    (appearance, dark)
+}
 
-            // 1. Draw semi-transparent bezel
-            let bezel_color = NSColor::colorWithSRGBRed_green_blue_alpha(
-                0.12, 0.12, 0.12,
-                CGFloat::from(ivars.opacity * 0.88),
-            );
-            bezel_color.setFill();
-            let radius = if is_badge {
-                24.0
-            } else {
-                bounds.size.height / 2.0
-            };
-            let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-                bounds, radius, radius,
-            );
-            path.fill();
+fn hud_color(rgb: u32) -> Retained<NSColor> {
+    NSColor::colorWithSRGBRed_green_blue_alpha(
+        f64::from((rgb >> 16) & 0xFF) / 255.0,
+        f64::from((rgb >> 8) & 0xFF) / 255.0,
+        f64::from(rgb & 0xFF) / 255.0,
+        1.0,
+    )
+}
 
-            // Draw subtle border for contrast
-            let border_color = NSColor::colorWithSRGBRed_green_blue_alpha(
-                1.0, 1.0, 1.0,
-                CGFloat::from(ivars.opacity * 0.15),
-            );
-            border_color.setStroke();
-            path.setLineWidth(1.0);
-            path.stroke();
+fn hud_label(mtm: MainThreadMarker) -> Retained<NSTextField> {
+    let label = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+    label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+    label.setMaximumNumberOfLines(1);
+    label
+}
 
-            // 2. Draw text
-            let font = if is_badge {
-                NSFont::boldSystemFontOfSize(bounds.size.height * 0.62)
-            } else {
-                NSFont::systemFontOfSize(30.0)
-            };
-            let color = NSColor::colorWithSRGBRed_green_blue_alpha(
-                1.0, 1.0, 1.0,
-                CGFloat::from(ivars.opacity * 0.95),
-            );
+/// The flash window. It is built once and re-configured per message, so no
+/// view is ever freed (on macOS 27 freeing a label that had a superview leaks;
+/// see the helper's view pooling).
+struct FlashPanel {
+    window: Retained<NSWindow>,
+    effect: Retained<NSVisualEffectView>,
+    title: Retained<NSTextField>,
+    detail: Retained<NSTextField>,
+    glyph: Retained<NSImageView>,
+}
 
-            let paragraph_style = unsafe {
-                let style = NSParagraphStyle::defaultParagraphStyle().mutableCopy();
-                let _: () = msg_send![&style, setAlignment: 1isize]; // Center (NSTextAlignmentCenter = 1)
-                let _: () = msg_send![&style, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail = 4
-                style
-            };
-
-            let attr_str: Retained<NSAttributedString> = unsafe {
-                let font_key = NSString::from_str("NSFont");
-                let color_key = NSString::from_str("NSColor");
-                let para_key = NSString::from_str("NSParagraphStyle");
-
-                let keys = [&*font_key, &*color_key, &*para_key];
-                let objects = [
-                    &*font as &AnyObject,
-                    &*color as &AnyObject,
-                    &*paragraph_style as &AnyObject,
-                ];
-
-                let attributes = NSDictionary::from_slices(&keys, &objects);
-                let alloc = NSAttributedString::alloc();
-                msg_send![alloc, initWithString: &*ivars.message, attributes: &*attributes]
-            };
-
-            let text_size: NSSize = unsafe { msg_send![&attr_str, size] };
-
-            let text_rect = if is_badge {
-                NSRect::new(
-                    NSPoint::new(
-                        bounds.origin.x + (bounds.size.width - text_size.width) / 2.0,
-                        bounds.origin.y + (bounds.size.height - text_size.height) / 2.0,
-                    ),
-                    text_size,
-                )
-            } else {
-                let h_pad = 24.0;
-                let available_width = (bounds.size.width - (2.0 * h_pad)).max(1.0);
-                NSRect::new(
-                    NSPoint::new(
-                        bounds.origin.x + h_pad,
-                        bounds.origin.y + (bounds.size.height - text_size.height) / 2.0,
-                    ),
-                    NSSize::new(available_width, text_size.height),
-                )
-            };
-
-            unsafe {
-                let _: () = msg_send![&attr_str, drawInRect: text_rect];
-            };
+impl FlashPanel {
+    fn new(mtm: MainThreadMarker) -> Self {
+        let frame = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(WARNING_WIDTH, NOTE_HEIGHT),
+        );
+        let window = make_overlay_window(mtm, frame);
+        window.setLevel(NSFloatingWindowLevel + 1);
+        window.setHasShadow(true);
+        let effect = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), frame);
+        effect.setMaterial(NSVisualEffectMaterial::HUDWindow);
+        effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+        effect.setState(NSVisualEffectState::Active);
+        effect.setWantsLayer(true);
+        if let Some(layer) = effect.layer() {
+            layer.setCornerRadius(HUD_RADIUS);
+            layer.setMasksToBounds(true);
+        }
+        let title = hud_label(mtm);
+        let detail = hud_label(mtm);
+        let glyph = NSImageView::initWithFrame(
+            NSImageView::alloc(mtm),
+            NSRect::new(NSPoint::new(14.0, 21.0), NSSize::new(20.0, 20.0)),
+        );
+        glyph.setImage(
+            NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                &NSString::from_str("exclamationmark.triangle"),
+                Some(&NSString::from_str("Warning")),
+            )
+            .as_deref(),
+        );
+        effect.addSubview(&title);
+        effect.addSubview(&detail);
+        effect.addSubview(&glyph);
+        window.setContentView(Some(&effect));
+        Self {
+            window,
+            effect,
+            title,
+            detail,
+            glyph,
         }
     }
-);
 
-impl FlashMessageView {
-    fn new(
-        mtm: MainThreadMarker,
-        frame: NSRect,
-        message: &str,
-        opacity: f32,
-        is_badge: bool,
-    ) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(FlashMessageViewIvars {
-            opacity,
-            message: NSString::from_str(message),
-            is_badge,
-        });
-        unsafe { msg_send![super(this), initWithFrame: frame] }
+    /// Lays the panel out for `content` and returns its size.
+    fn configure(&self, mtm: MainThreadMarker, content: &FlashContent, max_width: f64) -> NSSize {
+        let (appearance, dark) = hud_appearance(mtm);
+        self.effect.setAppearance(Some(&appearance));
+        let title = NSString::from_str(&content.title);
+        self.title.setStringValue(&title);
+        self.title.setTextColor(Some(&NSColor::labelColor()));
+        self.title.setAlignment(NSTextAlignment::Left);
+        if let Some(detail) = &content.detail {
+            // The failure HUD: glyph, red title, one line of detail.
+            let width = WARNING_WIDTH.min(max_width);
+            let red = hud_color(if dark { 0x00FF_6961 } else { 0x00C4_000F });
+            self.title.setFont(Some(&NSFont::systemFontOfSize_weight(
+                13.0,
+                FONT_WEIGHT_SEMIBOLD,
+            )));
+            self.title.setTextColor(Some(&red));
+            self.title.setFrame(NSRect::new(
+                NSPoint::new(44.0, 31.0),
+                NSSize::new(width - 60.0, 17.0),
+            ));
+            self.detail.setStringValue(&NSString::from_str(detail));
+            self.detail.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+            self.detail
+                .setTextColor(Some(&NSColor::secondaryLabelColor()));
+            self.detail.setFrame(NSRect::new(
+                NSPoint::new(44.0, 14.0),
+                NSSize::new(width - 60.0, 16.0),
+            ));
+            self.detail.setHidden(false);
+            self.glyph.setContentTintColor(Some(&hud_color(if dark {
+                0x00FF_6961
+            } else {
+                0x00D7_0015
+            })));
+            self.glyph.setFrame(NSRect::new(
+                NSPoint::new(14.0, 21.0),
+                NSSize::new(20.0, 20.0),
+            ));
+            self.glyph.setHidden(false);
+            NSSize::new(width, WARNING_HEIGHT)
+        } else if content.is_badge() {
+            self.detail.setHidden(true);
+            self.glyph.setHidden(true);
+            let font = NSFont::monospacedDigitSystemFontOfSize_weight(30.0, FONT_WEIGHT_SEMIBOLD);
+            self.title.setFont(Some(&font));
+            self.title.setAlignment(NSTextAlignment::Center);
+            let height = self.title.intrinsicContentSize().height.ceil();
+            self.title.setFrame(NSRect::new(
+                NSPoint::new(0.0, ((BADGE_SIDE - height) / 2.0).round()),
+                NSSize::new(BADGE_SIDE, height),
+            ));
+            NSSize::new(BADGE_SIDE, BADGE_SIDE)
+        } else {
+            self.detail.setHidden(true);
+            self.glyph.setHidden(true);
+            self.title.setFont(Some(&NSFont::systemFontOfSize_weight(
+                13.0,
+                FONT_WEIGHT_MEDIUM,
+            )));
+            let text = self.title.intrinsicContentSize();
+            let width = (text.width.ceil() + 2.0 * NOTE_PADDING)
+                .max(120.0)
+                .min(max_width.max(120.0));
+            self.title.setAlignment(NSTextAlignment::Center);
+            let height = text.height.ceil();
+            self.title.setFrame(NSRect::new(
+                NSPoint::new(NOTE_PADDING, ((NOTE_HEIGHT - height) / 2.0).round()),
+                NSSize::new(width - 2.0 * NOTE_PADDING, height),
+            ));
+            NSSize::new(width, NOTE_HEIGHT)
+        }
     }
+}
+
+/// Where a flash of `size` sits: the top-right corner of `visible` (Cocoa
+/// coordinates, the screen's `visibleFrame`), inset like the minimap.
+pub fn flash_frame(visible: NSRect, size: NSSize) -> NSRect {
+    let x = visible.origin.x + visible.size.width - size.width - HUD_EDGE_INSET;
+    let y = visible.origin.y + visible.size.height - size.height - HUD_EDGE_INSET;
+    NSRect::new(
+        NSPoint::new(x.max(visible.origin.x), y.max(visible.origin.y)),
+        size,
+    )
+}
+
+/// The opacity of a flash with `remaining` seconds left: fully there, then a
+/// short fade at the end (the minimap's release fade), no fade-in.
+pub fn flash_opacity(remaining: f32) -> f32 {
+    const FADE: f32 = 0.2;
+    (remaining / FADE).clamp(0.0, 1.0)
 }
 
 pub struct FlashMessageManager {
     mtm: MainThreadMarker,
-    window: Option<Retained<NSWindow>>,
+    panel: Option<FlashPanel>,
+    /// What is on screen: the content, its display and appearance, so a
+    /// per-frame `show` only changes the alpha.
+    shown: Option<(FlashContent, u32, bool)>,
+    visible: bool,
 }
 
 impl FlashMessageManager {
     pub fn new(mtm: MainThreadMarker) -> Self {
-        Self { mtm, window: None }
+        Self {
+            mtm,
+            panel: None,
+            shown: None,
+            visible: false,
+        }
     }
 
-    #[allow(clippy::cast_precision_loss)]
-    pub fn show(&mut self, message: &str, opacity: f32, top_right_abs_cg: NSPoint) {
-        let is_badge = message.chars().count() <= 2;
-        let screen_h = primary_screen_height(self.mtm);
-
-        let size = if is_badge {
-            NSSize::new(150.0, 150.0)
-        } else {
-            let font = NSFont::systemFontOfSize(30.0);
-            let font_key = NSString::from_str("NSFont");
-            let keys = [&*font_key];
-            let objects = [&*font as &AnyObject];
-            let attributes = NSDictionary::from_slices(&keys, &objects);
-            let msg_ns = NSString::from_str(message);
-            let attr_str: Retained<NSAttributedString> = unsafe {
-                let alloc = NSAttributedString::alloc();
-                msg_send![alloc, initWithString: &*msg_ns, attributes: &*attributes]
-            };
-            let text_size: NSSize = unsafe { msg_send![&attr_str, size] };
-            let horizontal_padding = 48.0;
-            let max_width = 780.0;
-            let min_width = 140.0;
-            let width = (text_size.width + horizontal_padding).clamp(min_width, max_width);
-            NSSize::new(width, 64.0)
-        };
-
-        let padding = 20.0;
-
-        let cocoa_origin_x = top_right_abs_cg.x - size.width - padding;
-        let cocoa_origin_y = screen_h - (top_right_abs_cg.y + size.height + padding);
-
-        let frame = NSRect::new(NSPoint::new(cocoa_origin_x, cocoa_origin_y), size);
-
-        if let Some(window) = &self.window {
-            let view = FlashMessageView::new(
-                self.mtm,
-                NSRect::new(NSPoint::new(0.0, 0.0), size),
-                message,
-                opacity,
-                is_badge,
-            );
-            window.setContentView(Some(&view));
-            window.setFrame_display(frame, true);
-            window.orderFront(None::<&AnyObject>);
-        } else {
-            let window = make_overlay_window(self.mtm, frame);
-            window.setLevel(NSFloatingWindowLevel + 1);
-            let view = FlashMessageView::new(
-                self.mtm,
-                NSRect::new(NSPoint::new(0.0, 0.0), size),
-                message,
-                opacity,
-                is_badge,
-            );
-            window.setContentView(Some(&view));
-            window.orderFront(None::<&AnyObject>);
-            self.window = Some(window);
+    /// Shows `content` on display `display_id` at `opacity`. `fallback` is the
+    /// display's usable area in CG coordinates, used only if no `NSScreen`
+    /// matches the display.
+    pub fn show(
+        &mut self,
+        content: &FlashContent,
+        opacity: f32,
+        display_id: u32,
+        fallback: NSRect,
+    ) {
+        let mtm = self.mtm;
+        let panel = self.panel.get_or_insert_with(|| FlashPanel::new(mtm));
+        let dark = hud_appearance(mtm).1;
+        let key = (content.clone(), display_id, dark);
+        if !self.visible || self.shown.as_ref() != Some(&key) {
+            let screens = NSScreen::screens(mtm);
+            let visible = crate::util::read_screen_property(&screens, display_id, |screen| {
+                screen.visibleFrame()
+            })
+            .unwrap_or_else(|| cg_abs_to_cocoa(fallback, primary_screen_height(mtm)));
+            let max_width = (visible.size.width - 2.0 * HUD_EDGE_INSET).min(480.0);
+            let size = panel.configure(mtm, content, max_width);
+            panel
+                .window
+                .setFrame_display(flash_frame(visible, size), true);
+            panel.window.invalidateShadow();
+            let is_new =
+                self.shown.as_ref().is_none_or(|(old, ..)| old != content) || !self.visible;
+            self.shown = Some(key);
+            if is_new {
+                announce(content);
+            }
+        }
+        panel.window.setAlphaValue(CGFloat::from(opacity));
+        if !self.visible {
+            panel.window.orderFrontRegardless();
+            self.visible = true;
         }
     }
 
     pub fn remove(&mut self) {
-        if let Some(window) = self.window.take() {
-            window.orderOut(None::<&AnyObject>);
+        if let Some(panel) = &self.panel
+            && self.visible
+        {
+            panel.window.orderOut(None::<&AnyObject>);
         }
+        self.visible = false;
+        self.shown = None;
+    }
+}
+
+/// Reads the flash to `VoiceOver`, as a system HUD would be read.
+fn announce(content: &FlashContent) {
+    let text = match &content.detail {
+        Some(detail) => format!("{}. {detail}", content.title),
+        None => content.title.clone(),
+    };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let announcement = NSString::from_str(&text);
+    let priority = NSNumber::new_isize(50); // NSAccessibilityPriorityMedium
+    unsafe {
+        let keys: [&NSAccessibilityNotificationUserInfoKey; 2] =
+            [NSAccessibilityAnnouncementKey, NSAccessibilityPriorityKey];
+        let objects: [&AnyObject; 2] = [&announcement, &priority];
+        let info = NSDictionary::from_slices(&keys, &objects);
+        NSAccessibilityPostNotificationWithUserInfo(
+            &app,
+            NSAccessibilityAnnouncementRequestedNotification,
+            Some(&info),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FlashContent, HUD_EDGE_INSET, flash_frame, flash_opacity};
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
+        NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+    }
+
+    /// Distance from the top of the screen to the top of `frame`, in points,
+    /// for a screen `height` tall (Cocoa coordinates, origin bottom-left).
+    fn top_gap(frame: NSRect, height: f64) -> f64 {
+        height - (frame.origin.y + frame.size.height)
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn flash_sits_below_a_notched_menu_bar() {
+        // 14-inch MacBook Pro default: 1512×982, a 37 pt menu bar, Dock hidden.
+        let visible = rect(0.0, 0.0, 1512.0, 982.0 - 37.0);
+        let frame = flash_frame(visible, NSSize::new(180.0, 40.0));
+        assert_close(top_gap(frame, 982.0), 37.0 + HUD_EDGE_INSET);
+        assert_close(frame.origin.x + frame.size.width, 1512.0 - HUD_EDGE_INSET);
+    }
+
+    #[test]
+    fn flash_sits_below_a_plain_menu_bar_and_clear_of_a_right_dock() {
+        // 1920×1080, a 24 pt menu bar, a 70 pt Dock on the right.
+        let visible = rect(0.0, 0.0, 1920.0 - 70.0, 1080.0 - 24.0);
+        let frame = flash_frame(visible, NSSize::new(340.0, 62.0));
+        assert_close(top_gap(frame, 1080.0), 24.0 + HUD_EDGE_INSET);
+        assert_close(frame.origin.x + frame.size.width, 1850.0 - HUD_EDGE_INSET);
+    }
+
+    #[test]
+    fn flash_on_a_secondary_display_stays_on_it() {
+        // A display left of and above the main one.
+        let visible = rect(-1920.0, 1080.0, 1920.0, 1080.0 - 24.0);
+        let frame = flash_frame(visible, NSSize::new(64.0, 64.0));
+        assert!(frame.origin.x >= visible.origin.x);
+        assert!(frame.origin.x + frame.size.width <= visible.origin.x + visible.size.width);
+        assert!(frame.origin.y + frame.size.height <= visible.origin.y + visible.size.height);
+    }
+
+    #[test]
+    fn flash_holds_then_fades_out_without_fading_in() {
+        assert!((flash_opacity(1.6) - 1.0).abs() < f32::EPSILON);
+        assert!((flash_opacity(0.2) - 1.0).abs() < f32::EPSILON);
+        assert!((flash_opacity(0.1) - 0.5).abs() < 1e-6);
+        assert!(flash_opacity(0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn short_titles_are_badges_and_warnings_never_are() {
+        let badge = FlashContent {
+            title: "3".into(),
+            detail: None,
+        };
+        let warning = FlashContent {
+            title: "3".into(),
+            detail: Some("x".into()),
+        };
+        let note = FlashContent {
+            title: "View 3".into(),
+            detail: None,
+        };
+        assert!(badge.is_badge());
+        assert!(!warning.is_badge());
+        assert!(!note.is_badge());
     }
 }

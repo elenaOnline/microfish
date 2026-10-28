@@ -112,6 +112,15 @@ objc2-app-kit = { version = "0.3", features = [
   "NSStringDrawing",
   "NSImage",
   "NSControl",
+  "NSAccessibilityConstants",
+  "NSAppearance",
+  "NSApplication",
+  "NSFontDescriptor",
+  "NSImageView",
+  "NSResponder",
+  "NSText",
+  "NSTextField",
+  "NSVisualEffectView",
 ] }
 objc2-core-foundation = { version = "0.3", features = ["CFRunLoop"] }
 objc2-core-graphics = "0.3"

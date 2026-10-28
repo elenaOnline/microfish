@@ -11,7 +11,7 @@ use bevy::math::IRect;
 use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
 use bevy::time::Time;
-use objc2_foundation::NSPoint;
+use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
@@ -37,7 +37,7 @@ use crate::events::{Event, InputEvent};
 use crate::manager::{
     Application, Display, Process, Window, WindowManager, WindowOS, bruteforce_windows,
 };
-use crate::overlay::{FlashMessageManager, OverlayManager};
+use crate::overlay::{FlashContent, FlashMessageManager, OverlayManager, flash_opacity};
 use crate::platform::input::TapHealth;
 use crate::platform::{PlatformCallbacks, WinID};
 
@@ -1801,7 +1801,10 @@ pub(crate) fn update_flash_messages(
 
     let (display, _) = *active_display;
     let bounds = display.bounds();
-    let top_right = NSPoint::new(f64::from(bounds.max.x), f64::from(bounds.min.y));
+    let fallback = NSRect::new(
+        NSPoint::new(f64::from(bounds.min.x), f64::from(bounds.min.y)),
+        NSSize::new(f64::from(bounds.width()), f64::from(bounds.height())),
+    );
 
     // When several FlashMessages coexist (rapid keypresses spawn a fresh
     // one per workspace switch before the previous timer expires), the
@@ -1811,9 +1814,9 @@ pub(crate) fn update_flash_messages(
     // `flash_manager.remove()` even though the newer ones are still
     // alive. Keep the newest (most time remaining), despawn the rest,
     // and render exactly once.
-    let mut alive: Option<(Entity, &str, &Timeout)> = None;
+    let mut alive: Option<(Entity, &FlashMessage, &Timeout)> = None;
     let mut stale: Vec<Entity> = Vec::new();
-    for (entity, FlashMessage(flash), timeout) in messages {
+    for (entity, flash, timeout) in messages {
         if timeout.timer.is_finished() {
             stale.push(entity);
             continue;
@@ -1837,9 +1840,13 @@ pub(crate) fn update_flash_messages(
         }
     }
 
-    if let Some((_, flash, timeout)) = alive {
-        let opacity = timeout.timer.fraction_remaining();
-        flash_manager.show(flash, opacity, top_right);
+    if let Some((_, FlashMessage(title, detail), timeout)) = alive {
+        let content = FlashContent {
+            title: title.clone(),
+            detail: detail.clone(),
+        };
+        let opacity = flash_opacity(timeout.timer.remaining().as_secs_f32());
+        flash_manager.show(&content, opacity, display.id(), fallback);
     } else {
         flash_manager.remove();
     }
