@@ -537,6 +537,12 @@ final class ColumnCard: NSView {
  override func accessibilityPerformPress() -> Bool { guard exposedAsButton, let onClick else { return super.accessibilityPerformPress() }; onClick(); return true }
  var onPress: ((Bool) -> Void)?
  var onClick: (() -> Void)?
+ // Select-on-press (native tab behavior): set by the tab strip only. A plain primary-button press runs
+ // onSelect at once and the release then does not click. Modifier-clicks, the Hyper secondary route and
+ // cards without the flag (minimap cards, overflow, map) keep act-on-release.
+ var selectsOnPress = false
+ var onSelect: (() -> Void)?
+ private var pressSelected = false
  var onClickAt: ((CGPoint) -> Void)?
  var onDrag: ((CGPoint) -> Void)?
  var onDrop: ((CGPoint) -> Void)?
@@ -552,6 +558,11 @@ final class ColumnCard: NSView {
  override func mouseDown(with event: NSEvent) {
   NSLog("Navigator %@ mouseDown button=%d window=%d visible=%d",diagnosticName,event.buttonNumber,window?.windowNumber ?? 0,window?.isVisible == true ? 1 : 0)
   press.begin(); drag.begin(at:event.locationInWindow); onPress?(true)
+  pressSelected=false
+  if selectsOnPress, let onSelect, event.type == .leftMouseDown, event.buttonNumber == 0,
+   event.modifierFlags.intersection([.control,.option,.command,.shift,.function]).isEmpty {
+   pressSelected=true; onSelect()
+  }
  }
  // macOS may route Control-click as a secondary mouse event. Hyper
  // includes Control; keep this route equivalent without adopting ordinary
@@ -581,7 +592,7 @@ final class ColumnCard: NSView {
  func cancelInteraction() {
   escapeTimer?.invalidate(); escapeTimer=nil
   let wasDragging=drag.started
-  press=CardPress(); drag.cancel(); hyperSecondaryPress=false
+  press=CardPress(); drag.cancel(); hyperSecondaryPress=false; pressSelected=false
   if wasDragging { onCancelDrag?(); NSCursor.arrow.set() }
   onPress?(false)
  }
@@ -597,7 +608,9 @@ final class ColumnCard: NSView {
   let inside=bounds.contains(convert(event.locationInWindow, from:nil))
   let wasDragging=drag.started
   let cancelled=drag.cancelled || CGEventSource.keyState(.combinedSessionState,key:53)
-  let fire = press.end(inside:inside) && !wasDragging && !cancelled
+  let armedInside = press.end(inside:inside)
+  let fire = armedInside && !wasDragging && !cancelled && !pressSelected
+  pressSelected=false
   if wasDragging {
    if !cancelled, let window { onDrop?(window.convertPoint(toScreen:event.locationInWindow)) }
    else { onCancelDrag?() }
@@ -659,6 +672,84 @@ struct QuitSequence {
     Thread.sleep(forTimeInterval: 0.02)
    }
    return child.terminationStatus
+  }
+ }
+}
+// Runs the engine bridge (PaneruNavigatorCommand) one command at a time, in submission order, so the engine
+// receives commands in the order the user made them. Completion is event-driven: the next command starts
+// when the previous process has exited (terminationHandler) and its stderr has closed, with no thread parked
+// in Process.waitUntilExit, which returned ~65 ms after the child had exited (focus-latency-report.md).
+// `finished` runs on `queue`, not on main; callers hop to main themselves.
+final class CommandRunner {
+ struct Outcome { var status: Int32; var diagnostic: String; var launchError: String? }
+ private struct Job { let arguments: [String]; let finished: (Outcome) -> Void }
+ private final class Running {
+  private let lock = NSLock()
+  private var exited = false, closed = false, done = false
+  private var data = Data()
+  var status: Int32 = 0
+  var complete: ((Outcome) -> Void)?
+  func append(_ d: Data) { lock.lock(); data.append(d); lock.unlock() }
+  func eof() { settle(exit: false, eof: true) }
+  func exit(_ code: Int32) { lock.lock(); status = code; lock.unlock(); settle(exit: true, eof: false) }
+  // A descendant that inherited stderr can hold it open after the bridge has gone: stop waiting for EOF then.
+  func forceEOF() { lock.lock(); let ok = exited; lock.unlock(); if ok { settle(exit: false, eof: true) } }
+  private func settle(exit e: Bool, eof f: Bool) {
+   lock.lock()
+   if e { exited = true }; if f { closed = true }
+   let fire = exited && closed && !done
+   if fire { done = true }
+   let outcome = Outcome(status: status, diagnostic: String(data: data, encoding: .utf8) ?? "", launchError: nil)
+   lock.unlock()
+   if fire { complete?(outcome); complete = nil }
+  }
+ }
+ let executable: URL
+ private let queue: DispatchQueue
+ private let lock = NSLock()
+ private var pending: [Job] = []
+ private var busy = false
+ var eofGrace = 0.5
+ init(executable: URL, queue: DispatchQueue) { self.executable = executable; self.queue = queue }
+ func submit(_ arguments: [String], finished: @escaping (Outcome) -> Void) {
+  lock.lock(); pending.append(Job(arguments: arguments, finished: finished))
+  let start = !busy; busy = true
+  lock.unlock()
+  if start { queue.async { [self] in startNext() } }
+ }
+ private func startNext() {
+  lock.lock()
+  guard !pending.isEmpty else { busy = false; lock.unlock(); return }
+  let job = pending.removeFirst()
+  lock.unlock()
+  let command = Process()
+  command.executableURL = executable
+  command.arguments = job.arguments
+  command.standardOutput = FileHandle.nullDevice
+  let errors = Pipe(); command.standardError = errors
+  let running = Running()
+  running.complete = { [self] outcome in
+   errors.fileHandleForReading.readabilityHandler = nil
+   command.terminationHandler = nil
+   try? errors.fileHandleForReading.close()
+   job.finished(outcome)
+   queue.async { [self] in startNext() }
+  }
+  errors.fileHandleForReading.readabilityHandler = { handle in
+   let d = handle.availableData
+   if d.isEmpty { handle.readabilityHandler = nil; running.eof() } else { running.append(d) }
+  }
+  command.terminationHandler = { [grace = eofGrace, queue] process in
+   running.exit(process.terminationStatus)
+   queue.asyncAfter(deadline: .now() + grace) { running.forceEOF() }
+  }
+  do { try command.run() }
+  catch {
+   errors.fileHandleForReading.readabilityHandler = nil
+   command.terminationHandler = nil
+   running.complete = nil
+   job.finished(Outcome(status: -1, diagnostic: "", launchError: error.localizedDescription))
+   queue.async { [self] in startNext() }
   }
  }
 }
@@ -730,6 +821,9 @@ final class Navigator: NSObject, NSApplicationDelegate {
  var timer: Timer?
  var icons: [String:NSImage] = [:]
  let commandQueue = DispatchQueue(label: "local.paneru.navigator.commands", qos: .userInitiated)
+ lazy var commandRunner = CommandRunner(
+  executable: URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.deletingLastPathComponent().appendingPathComponent("PaneruNavigatorCommand"),
+  queue: commandQueue)
  init(path: String) { self.path=path }
  // Status menu: Settings, Reload, then Quit last, as menu bar apps do (⌘Q while the menu is open).
  func makeStatusMenu() -> NSMenu {
@@ -1055,32 +1149,21 @@ final class Navigator: NSObject, NSApplicationDelegate {
   sendCommand(["focus",String(id)])
  }
  func sendCommand(_ arguments: [String], completion: ((Bool) -> Void)? = nil) {
-  let executable = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
-   .deletingLastPathComponent().appendingPathComponent("PaneruNavigatorCommand")
   NSLog("Navigator command queued %@",arguments.joined(separator:" "))
-  commandQueue.async { [weak self] in
-   let command = Process()
-   command.executableURL = executable
-   command.arguments = arguments
-   command.standardOutput = FileHandle.nullDevice
-   let errors=Pipe(); command.standardError = errors
-   do {
-    try command.run()
-    let diagnostic=String(data:errors.fileHandleForReading.readDataToEndOfFile(),encoding:.utf8) ?? ""
-    command.waitUntilExit()
-    if command.terminationStatus != 0 {
-     NSLog("Navigator command rejected: %@",diagnostic)
-     DispatchQueue.main.async { [weak self] in self?.showCommandFailure(arguments.first ?? "",diagnostic:diagnostic) }
-    }
-    let accepted = command.terminationStatus == 0
-    DispatchQueue.main.async { completion?(accepted) }
-    NSLog("Navigator command finished %@ status=%d",arguments.first ?? "",command.terminationStatus)
-   }
-   catch {
+  commandRunner.submit(arguments) { [weak self] outcome in
+   if let launchError = outcome.launchError {
     DispatchQueue.main.async { completion?(false) }
-    NSLog("Navigator command failed: %@",error.localizedDescription)
-    DispatchQueue.main.async { [weak self] in self?.showCommandFailure(arguments.first ?? "",diagnostic:error.localizedDescription) }
+    NSLog("Navigator command failed: %@",launchError)
+    DispatchQueue.main.async { [weak self] in self?.showCommandFailure(arguments.first ?? "",diagnostic:launchError) }
+    return
    }
+   if outcome.status != 0 {
+    NSLog("Navigator command rejected: %@",outcome.diagnostic)
+    DispatchQueue.main.async { [weak self] in self?.showCommandFailure(arguments.first ?? "",diagnostic:outcome.diagnostic) }
+   }
+   let accepted = outcome.status == 0
+   DispatchQueue.main.async { completion?(accepted) }
+   NSLog("Navigator command finished %@ status=%d",arguments.first ?? "",outcome.status)
   }
  }
  func showCommandFailure(_ action: String, diagnostic: String) {

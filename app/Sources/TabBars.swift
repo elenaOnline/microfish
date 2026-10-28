@@ -479,6 +479,14 @@ final class TabBars: NSObject {
       NSLog("Navigator tab click column=%d target=%d",column,entry.id)
       self?.focus?(entry.id)
      }
+     // Tabs select on mouse-down, as native tabs do. A drag from the same press reorders as before and
+     // sends no further focus; releasing without a drag does not click again. onClick stays for the
+     // modifier, Hyper and VoiceOver paths.
+     card.selectsOnPress = true
+     card.onSelect = { [weak self] in
+      NSLog("Navigator tab click column=%d target=%d on=down",column,entry.id)
+      self?.focus?(entry.id)
+     }
      let displayTitle=aliases[entry.bundle+"\t"+entry.title] ?? entry.title
      let help = "Drag between tabs to regroup, or to a minimap gap to separate."
      card.toolTip = "\(displayTitle.isEmpty ? entry.app : "\(entry.app) — \(displayTitle)")\n\(help)"
