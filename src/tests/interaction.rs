@@ -3145,14 +3145,19 @@ fn test_focus_into_hidden_virtual_workspace_keeps_target_window() {
         .on_iteration(3, |world, _state| {
             assert_focused!(world, 3);
         })
-        .on_iteration(5, |_world, state| {
+        .on_iteration(5, |world, state| {
+            // A click or keypress of the user's, which ends any focus handoff
+            // the switch to VW1 began.
+            world.write_message(Event::CancelKeyboardFocusHandoff);
             state.focus_window(3);
         })
         .on_iteration(6, |world, _state| {
             assert_focused!(world, 3);
         })
-        .on_iteration(7, |_world, state| {
-            // Cmd-Tab straight into window 2, the other window on VW1.
+        .on_iteration(7, |world, state| {
+            // Cmd-Tab straight into window 2, the other window on VW1. The
+            // keypress itself ends the focus handoff the switch to VW0 began.
+            world.write_message(Event::CancelKeyboardFocusHandoff);
             state.focus_window(2);
         })
         .on_iteration(8, |world, _state| {
@@ -3217,7 +3222,14 @@ fn test_focus_into_hidden_virtual_workspace_exposes_target_window() {
         },
     ]);
 
-    let focus_next = |id: WinID| move |_world: &mut World, state: MockState| state.focus_window(id);
+    // Each is the user's own click or keypress, which ends any focus handoff a
+    // workspace switch began.
+    let focus_next = |id: WinID| {
+        move |world: &mut World, state: MockState| {
+            world.write_message(Event::CancelKeyboardFocusHandoff);
+            state.focus_window(id);
+        }
+    };
     TestHarness::new()
         .with_config(config)
         .with_windows(6)
@@ -3244,10 +3256,15 @@ fn test_focus_into_hidden_virtual_workspace_exposes_target_window() {
         .on_iteration(11, focus_next(2))
         .on_iteration(12, |world, _state| {
             assert_focused!(world, 2);
-            assert_eq!(
-                window_x(world, 2),
-                0,
-                "the workspace restore must show all of the window it was activated for"
+            // Flush with either edge or anywhere between: the window must be
+            // shown whole, not left hanging a quarter off the left edge. Where
+            // exactly depends on whether the restore guard from the earlier
+            // visit to VW1 outlived the focus handoff of the switch to VW0.
+            let x = window_x(world, 2);
+            assert!(
+                (0..=TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH).contains(&x),
+                "the workspace restore must show all of the window it was activated for, \
+                 but it sits at x={x}"
             );
         })
         .run(commands);

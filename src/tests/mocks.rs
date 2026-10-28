@@ -114,6 +114,22 @@ struct MockStateInner {
     /// Windows the app keeps out of its accessibility window list while the
     /// window server still reports them on screen: a background native tab.
     background_tabs: HashSet<WinID>,
+    /// Every native focus request the engine made, in order: the window it
+    /// asked the OS to focus and, for a no-raise request, the window it named
+    /// as the one losing focus.
+    focus_calls: Vec<FocusCall>,
+    /// Native focus requests each window will still ignore, modelling an app
+    /// that takes the focus back from the window it was just handed to.
+    refused_focus: HashMap<WinID, u8>,
+}
+
+/// One native focus request recorded by the mock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FocusCall {
+    pub(crate) target: WinID,
+    pub(crate) losing: Option<WinID>,
+    /// Where the target window physically was when the request was made.
+    pub(crate) target_origin: Origin,
 }
 
 #[derive(Clone)]
@@ -136,6 +152,8 @@ impl MockState {
                 stale_window_ids: HashMap::new(),
                 unordered_windows: HashSet::new(),
                 background_tabs: HashSet::new(),
+                focus_calls: Vec::new(),
+                refused_focus: HashMap::new(),
             })),
         }
     }
@@ -221,6 +239,46 @@ impl MockState {
         if let Some(app) = inner.apps.get_mut(&pid) {
             app.focused_window_id = Some(id);
         }
+    }
+
+    /// Native focus requests made so far, oldest first.
+    pub(crate) fn focus_calls(&self) -> Vec<FocusCall> {
+        self.inner.force_read().focus_calls.clone()
+    }
+
+    /// Makes the next `times` native focus requests for window `id` do nothing.
+    pub(crate) fn refuse_focus(&self, id: WinID, times: u8) {
+        self.inner.force_write().refused_focus.insert(id, times);
+    }
+
+    /// Records a native focus request and reports whether the OS honours it.
+    fn record_focus_call(&self, target: WinID, losing: Option<WinID>) -> bool {
+        let mut inner = self.inner.force_write();
+        let target_origin = inner
+            .windows
+            .get(&target)
+            .map_or(Origin::ZERO, |window| window.frame.min);
+        inner.focus_calls.push(FocusCall {
+            target,
+            losing,
+            target_origin,
+        });
+        match inner.refused_focus.get_mut(&target) {
+            Some(times) if *times > 0 => {
+                *times -= 1;
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// The window the application `pid` reports as focused.
+    pub(crate) fn app_focused_window(&self, pid: Pid) -> Option<WinID> {
+        self.inner
+            .force_read()
+            .apps
+            .get(&pid)
+            .and_then(|app| app.focused_window_id)
     }
 
     pub fn focus_window(&self, id: WinID) {
@@ -600,7 +658,9 @@ impl MockState {
 
         let s = self.clone();
         mw.expect_focus_with_raise().returning(move |_psn| {
-            s.focus_window(id);
+            if s.record_focus_call(id, None) {
+                s.focus_window(id);
+            }
         });
 
         let s = self.clone();
@@ -719,8 +779,10 @@ impl MockState {
         // window that had actually been focused.
         let s = self.clone();
         mw.expect_focus_without_raise()
-            .returning(move |_psn, _focused, _focused_psn| {
-                s.set_focused_window(id);
+            .returning(move |_psn, focused, _focused_psn| {
+                if s.record_focus_call(id, Some(focused.id())) {
+                    s.set_focused_window(id);
+                }
             });
         let s = self.clone();
         mw.expect_set_padding().returning(move |padding| {

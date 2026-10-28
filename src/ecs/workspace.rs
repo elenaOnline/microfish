@@ -19,7 +19,8 @@ use tracing::{Level, debug, error, instrument, warn};
 
 use super::{ActiveDisplayMarker, SpawnWindowTrigger};
 use crate::commands::{
-    Direction, MoveFocus, Operation, filter_window_operations, get_window_in_direction,
+    Direction, MoveFocus, Operation, filter_window_operations, focus_with_verification,
+    get_window_in_direction,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -907,6 +908,11 @@ fn mid_strip_slot(
 
 /// Explicit growable row navigation. An empty boundary row is the growth stop,
 /// so repeating a held Up or Down key cannot allocate an unbounded sequence of rows.
+///
+/// Every press in the frame counts: key repeat on a busy frame delivers several
+/// at once, and reading only the first silently dropped the rest. They are
+/// replayed in order against a model of the rows, and only the row the last one
+/// lands on is switched to, so no intermediate row is shown and focused.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn navigate_row_bind(
     mut messages: MessageReader<Event>,
@@ -914,11 +920,15 @@ fn navigate_row_bind(
     workspaces: Query<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     mut commands: Commands,
 ) {
-    let Some(Operation::Row(direction)) =
-        filter_window_operations(&mut messages, |op| matches!(op, Operation::Row(_))).next()
-    else {
+    let directions = filter_window_operations(&mut messages, |op| matches!(op, Operation::Row(_)))
+        .filter_map(|op| match op {
+            Operation::Row(direction) => Some(direction.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if directions.is_empty() {
         return;
-    };
+    }
     let mut rows = workspaces
         .iter()
         .filter(|(_, strip, _)| strip.id() == active_display.active_strip().id())
@@ -927,57 +937,65 @@ fn navigate_row_bind(
     let Some(current) = rows.iter().position(|(_, _, active)| *active) else {
         return;
     };
-    let next = match direction {
-        Direction::North if current > 0 => Some(current - 1),
-        Direction::South if current + 1 < rows.len() => Some(current + 1),
-        Direction::North
-            if rows[current].1.len() != 0
-                && rows
-                    .last()
-                    .is_some_and(|(_, strip, _)| strip.virtual_index < 8) =>
-        {
-            let entities = rows
-                .iter()
-                .map(|(entity, _, _)| *entity)
-                .collect::<Vec<_>>();
-            // Keep strip identities, group membership and saved viewport/focus
-            // components. Only their ordinal row labels change.
-            commands.queue(move |world: &mut bevy::ecs::world::World| {
-                for entity in entities {
-                    if let Some(mut strip) = world.get_mut::<LayoutStrip>(entity) {
-                        strip.virtual_index += 1;
-                    }
+    let count = rows.len();
+    let populated = |row: usize| rows[row].1.len() != 0;
+    let last_index = rows.last().map_or(0, |(_, strip, _)| strip.virtual_index);
+
+    // Slot 0 is a row that does not exist yet above the first, slot `count + 1`
+    // one below the last, and slot `n + 1` is `rows[n]`. A row made on the way
+    // and left again while empty is never created, as if already reaped.
+    let (mut above, mut below) = (false, false);
+    let mut slot = current + 1;
+    for direction in &directions {
+        let cap_allows = last_index + u32::from(above) + u32::from(below) < 8;
+        match direction {
+            Direction::North => {
+                if slot > usize::from(!above) {
+                    slot -= 1;
+                } else if slot == 1 && populated(0) && cap_allows {
+                    (above, slot) = (true, 0);
                 }
-            });
-            commands.spawn_layout_strip(
-                LayoutStrip::new(active_display.active_strip().id(), 0),
-                active_display.bounds().min,
-                active_display.entity(),
-                true,
-            );
-            None
+            }
+            Direction::South => {
+                if slot < count + usize::from(below) {
+                    slot += 1;
+                } else if slot == count && populated(count - 1) && cap_allows {
+                    (below, slot) = (true, count + 1);
+                }
+            }
+            _ => {}
         }
-        Direction::South
-            if rows[current].1.len() != 0
-                && rows
-                    .last()
-                    .is_some_and(|(_, strip, _)| strip.virtual_index < 8) =>
-        {
-            commands.spawn_layout_strip(
-                LayoutStrip::new(
-                    active_display.active_strip().id(),
-                    rows[current].1.virtual_index + 1,
-                ),
-                active_display.bounds().min,
-                active_display.entity(),
-                true,
-            );
-            None
-        }
-        _ => None,
-    };
-    if let Some(next) = next
-        && let Ok(mut entity_commands) = commands.get_entity(rows[next].0)
+    }
+
+    if slot == 0 {
+        let entities = rows
+            .iter()
+            .map(|(entity, _, _)| *entity)
+            .collect::<Vec<_>>();
+        // Keep strip identities, group membership and saved viewport/focus
+        // components. Only their ordinal row labels change.
+        commands.queue(move |world: &mut bevy::ecs::world::World| {
+            for entity in entities {
+                if let Some(mut strip) = world.get_mut::<LayoutStrip>(entity) {
+                    strip.virtual_index += 1;
+                }
+            }
+        });
+        commands.spawn_layout_strip(
+            LayoutStrip::new(active_display.active_strip().id(), 0),
+            active_display.bounds().min,
+            active_display.entity(),
+            true,
+        );
+    } else if slot == count + 1 {
+        commands.spawn_layout_strip(
+            LayoutStrip::new(active_display.active_strip().id(), last_index + 1),
+            active_display.bounds().min,
+            active_display.entity(),
+            true,
+        );
+    } else if slot - 1 != current
+        && let Ok(mut entity_commands) = commands.get_entity(rows[slot - 1].0)
     {
         entity_commands.try_insert(ActiveWorkspaceMarker);
     }
@@ -1271,6 +1289,28 @@ fn column_closest_to_center(
         .map(|(candidate, _)| candidate)
 }
 
+/// The column of `strip` whose window sits nearest `viewport_center_x` when the
+/// strip is placed at horizontal offset `origin_x`: what the user would be
+/// looking at when the row is revealed. Unlike [`column_closest_to_center`] it
+/// reads the layout, not the windows' frames, so it works for a parked strip.
+fn column_nearest_viewport_center(
+    strip: &LayoutStrip,
+    origin_x: i32,
+    viewport_center_x: i32,
+    windows: &Windows,
+) -> Option<Entity> {
+    strip
+        .columns()
+        .filter_map(|column| {
+            let entity = strip.selected_tab(column).or_else(|| column.top())?;
+            let layout_x = windows.layout_position(entity)?.0.x;
+            let center = origin_x + layout_x + windows.size(entity)?.x / 2;
+            Some((entity, (center - viewport_center_x).abs()))
+        })
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(entity, _)| entity)
+}
+
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(crate) fn show_active_workspace(
     activated: Single<Entity, Added<ActiveWorkspaceMarker>>,
@@ -1407,15 +1447,28 @@ pub(crate) fn show_active_workspace(
             return;
         }
 
-        // Focus on the previous window
-        if let Some(focus) = *focus
-            && strip.contains(focus)
-        {
-            spawn_restore_focus_guard(focus, &mut commands);
+        // Focus on the previous window. It may be gone by now - closed,
+        // minimized or moved to another row while this one was hidden - and
+        // then the row would show with its windows unfocused and the key
+        // window still parked on the row just left.
+        let target = focus.filter(|focus| strip.contains(*focus)).or_else(|| {
+            let (display, dock) = displays.get(child.parent()).ok()?;
+            let viewport = display.actual_display_bounds(dock, &config);
+            column_nearest_viewport_center(strip, origin.x, viewport.center().x, &windows)
+        });
+        if let Some(target) = target {
+            spawn_restore_focus_guard(target, &mut commands);
 
-            commands.focus_entity(focus, false);
+            // The same ordered handoff keyboard navigation uses: the windows
+            // are placed first, then the OS is asked to focus, naming the
+            // window actually losing focus and retrying a refusal.
+            focus_with_verification(
+                target,
+                current_focus.map(|(_, entity)| entity),
+                &mut commands,
+            );
             commands.trigger(RaiseWindow {
-                entity: focus,
+                entity: target,
                 with_strip: true,
             });
         }

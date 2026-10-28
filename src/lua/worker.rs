@@ -677,6 +677,48 @@ mod tests {
         );
     }
 
+    /// A row switch changes no strip, only which one is active, yet the
+    /// navigation HUD mirrors the active row from `layout_changed`.
+    #[test]
+    fn switching_the_active_row_publishes_layout_changed() {
+        use crate::ecs::ActiveWorkspaceMarker;
+        use crate::ecs::layout::LayoutStrip;
+        use bevy::app::{App, Last};
+
+        let mut app = App::new();
+        app.insert_resource(worker(
+            r#"
+            local n = 0
+            paneru.on("layout_changed", function() n = n + 1; paneru.flash("layout " .. n) end)
+            "#,
+        ));
+        app.add_systems(Last, crate::lua::dispatch_layout_changed);
+        let first = app
+            .world_mut()
+            .spawn((LayoutStrip::new(1, 0), ActiveWorkspaceMarker))
+            .id();
+        let second = app.world_mut().spawn(LayoutStrip::new(1, 1)).id();
+        app.update();
+        assert_eq!(
+            next_flash(app.world().resource::<LuaWorker>(), "strips being added"),
+            "layout 1"
+        );
+
+        app.update();
+        app.world_mut()
+            .entity_mut(first)
+            .remove::<ActiveWorkspaceMarker>();
+        app.world_mut()
+            .entity_mut(second)
+            .insert(ActiveWorkspaceMarker);
+        app.update();
+        assert_eq!(
+            next_flash(app.world().resource::<LuaWorker>(), "the row switch"),
+            "layout 2",
+            "an idle frame must publish nothing; the switch must publish once"
+        );
+    }
+
     #[test]
     fn event_dispatch_reaches_the_outbox() {
         let worker = worker(r#"paneru.on("space_changed", function(e) paneru.flash(e.type) end)"#);
