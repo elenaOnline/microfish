@@ -27,6 +27,15 @@ pub(crate) struct MockAppData {
     pub(crate) connection: Option<crate::platform::ConnID>,
 }
 
+#[derive(Default)]
+pub(crate) struct MockResizeBehavior {
+    pub rejected_requests: u8,
+    pub delayed_reads: u8,
+    pub minimum_width: i32,
+    pending: Option<Size>,
+    cached: Option<IRect>,
+}
+
 /// Data for a mocked window.
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct MockWindowData {
@@ -44,7 +53,9 @@ pub(crate) struct MockWindowData {
     pub(crate) border_radius: Option<f64>,
     pub(crate) horizontal_padding: i32,
     pub(crate) vertical_padding: i32,
+    pub(crate) requested_padding: (Option<i32>, Option<i32>),
     pub(crate) child_role: bool,
+    pub(crate) resize_behavior: Option<MockResizeBehavior>,
 }
 
 impl Default for MockWindowData {
@@ -64,7 +75,9 @@ impl Default for MockWindowData {
             border_radius: None,
             horizontal_padding: 0,
             vertical_padding: 0,
+            requested_padding: (None, None),
             child_role: false,
+            resize_behavior: None,
         }
     }
 }
@@ -85,6 +98,7 @@ struct MockStateInner {
     active_display_id: u32,
     cursor_position: Origin,
     event_queue: VecDeque<Event>,
+    geometry_writes: Vec<WinID>,
     /// Windows that are gone but which the app's AX window list still reports,
     /// modelling the lag real apps show right after a window closes.
     stale_window_ids: HashMap<WinID, Pid>,
@@ -110,6 +124,7 @@ impl MockState {
                 active_display_id: 0,
                 cursor_position: Origin::ZERO,
                 event_queue: VecDeque::new(),
+                geometry_writes: Vec::new(),
                 stale_window_ids: HashMap::new(),
                 unordered_windows: HashSet::new(),
                 background_tabs: HashSet::new(),
@@ -422,6 +437,73 @@ impl MockState {
         });
     }
 
+    pub fn physical_window_frame(&self, id: WinID) -> IRect {
+        self.inner.force_read().windows[&id].frame
+    }
+
+    pub fn set_resize_behavior(
+        &self,
+        id: WinID,
+        rejected_requests: u8,
+        delayed_reads: u8,
+        minimum_width: i32,
+    ) {
+        self.inner
+            .force_write()
+            .windows
+            .get_mut(&id)
+            .unwrap()
+            .resize_behavior = Some(MockResizeBehavior {
+            rejected_requests,
+            delayed_reads,
+            minimum_width,
+            ..Default::default()
+        });
+    }
+
+    fn request_window_size(&self, id: WinID, size: Size) {
+        let mut inner = self.inner.force_write();
+        inner.geometry_writes.push(id);
+        if let Some(window) = inner.windows.get_mut(&id) {
+            let mut target = size;
+            if let Some(behavior) = &mut window.resize_behavior {
+                behavior.cached = Some(IRect::from_corners(
+                    window.frame.min,
+                    window.frame.min + size,
+                ));
+                if behavior.rejected_requests > 0 {
+                    behavior.rejected_requests -= 1;
+                    return;
+                }
+                target.x = target.x.max(behavior.minimum_width);
+                if behavior.delayed_reads > 0 {
+                    behavior.pending = Some(target);
+                    return;
+                }
+            }
+            window.frame.max = window.frame.min + target;
+        }
+    }
+
+    fn read_window_frame(&self, id: WinID) -> crate::errors::Result<IRect> {
+        let mut inner = self.inner.force_write();
+        let window = inner.windows.get_mut(&id).ok_or(Error::InvalidWindow)?;
+        if let Some(behavior) = &mut window.resize_behavior {
+            behavior.delayed_reads = behavior.delayed_reads.saturating_sub(1);
+            if behavior.delayed_reads == 0
+                && let Some(size) = behavior.pending.take()
+            {
+                window.frame.max = window.frame.min + size;
+            }
+            behavior.cached = Some(window.frame);
+        }
+        Ok(window.frame)
+    }
+
+    pub fn take_geometry_writes(&self) -> Vec<WinID> {
+        std::mem::take(&mut self.inner.force_write().geometry_writes)
+    }
+
     pub fn cursor_position(&self) -> IVec2 {
         self.inner.force_read().cursor_position
     }
@@ -450,21 +532,33 @@ impl MockState {
                 .force_read()
                 .windows
                 .get(&id)
-                .map(|w| w.frame)
+                .map(|window| {
+                    window
+                        .resize_behavior
+                        .as_ref()
+                        .and_then(|behavior| behavior.cached)
+                        .unwrap_or(window.frame)
+                })
                 .unwrap_or_default()
         });
 
         let s = self.clone();
         mw.expect_resize().returning(move |size| {
-            let mut inner = s.inner.force_write();
-            if let Some(w) = inner.windows.get_mut(&id) {
-                w.frame.max = w.frame.min + size;
-            }
+            s.request_window_size(id, size);
         });
+        let s = self.clone();
+        mw.expect_request_native_sibling_size()
+            .returning(move |size| {
+                s.request_window_size(id, size);
+            });
+        let s = self.clone();
+        mw.expect_native_sibling_frame()
+            .returning(move || s.read_window_frame(id));
 
         let s_move = self.clone();
         mw.expect_reposition().returning(move |origin| {
             let mut inner = s_move.inner.force_write();
+            inner.geometry_writes.push(id);
             if let Some(w) = inner.windows.get_mut(&id) {
                 let size = w.frame.size();
                 w.frame.min = origin;
@@ -500,14 +594,8 @@ impl MockState {
         });
 
         let s = self.clone();
-        mw.expect_update_frame().returning(move || {
-            s.inner
-                .force_read()
-                .windows
-                .get(&id)
-                .map(|w| w.frame)
-                .ok_or(Error::InvalidWindow)
-        });
+        mw.expect_update_frame()
+            .returning(move || s.read_window_frame(id));
 
         let s = self.clone();
         mw.expect_identifier().returning(move || {
@@ -602,7 +690,19 @@ impl MockState {
             .returning(move |_psn, _focused, _focused_psn| {
                 s.set_focused_window(id);
             });
-        mw.expect_set_padding().return_const(());
+        let s = self.clone();
+        mw.expect_set_padding().returning(move |padding| {
+            if let Some(window) = s.inner.force_write().windows.get_mut(&id) {
+                match padding {
+                    crate::manager::WindowPadding::Horizontal(value) => {
+                        window.requested_padding.0 = Some(value);
+                    }
+                    crate::manager::WindowPadding::Vertical(value) => {
+                        window.requested_padding.1 = Some(value);
+                    }
+                }
+            }
+        });
 
         Window::new(Box::new(mw))
     }

@@ -8,10 +8,10 @@ use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
-use super::{MouseHeldMarker, Timeout};
+use super::{MouseDraggingMarker, MouseHeldMarker, Timeout};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::params::{GlobalState, Windows};
+use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, MissionControlActive, Position, Scrolling,
     SpawnCommandsExt,
@@ -33,6 +33,7 @@ pub struct MouseEventsPlugin;
 
 impl Plugin for MouseEventsPlugin {
     fn build(&self, app: &mut App) {
+        app.add_plugins(super::drag::DragReorderPlugin);
         let mission_control_inactive = |mission_control: Option<Res<MissionControlActive>>| {
             mission_control.is_none_or(|active| !active.0)
         };
@@ -50,6 +51,7 @@ impl Plugin for MouseEventsPlugin {
                 )
                     .run_if(mission_control_inactive),
                 mouse_up_trigger,
+                refresh_mouse_hold.before(super::systems::window_resized_update_frame),
                 horizontal_warp_mouse_trigger,
             )
                 .run_if(on_message::<InputEvent>),
@@ -204,14 +206,16 @@ fn mouse_moved_trigger(
 /// * `active_display` - A query for the active display.
 /// * `main_cid` - The main connection ID resource.
 /// * `commands` - Bevy commands to trigger a reshuffle.
-fn mouse_down_trigger(
+pub(super) fn mouse_down_trigger(
     mut messages: MessageReader<InputEvent>,
-    windows: Windows,
-    active_workspace: Query<(Entity, Option<&Scrolling>), With<ActiveWorkspaceMarker>>,
+    mut ctx: WindowCtx,
+    active_workspace: Query<
+        (Entity, &LayoutStrip, Option<&Scrolling>),
+        With<ActiveWorkspaceMarker>,
+    >,
+    active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
-    config: Res<Config>,
     mouse_held: Query<Entity, With<MouseHeldMarker>>,
-    mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
         let Event::MouseDown { point, .. } = event else {
@@ -222,15 +226,15 @@ fn mouse_down_trigger(
         let Some((_, entity)) = window_manager
             .find_window_at_point(point)
             .ok()
-            .and_then(|window_id| windows.find(window_id))
+            .and_then(|window_id| ctx.windows.find(window_id))
         else {
             continue;
         };
 
         // Stop any ongoing scroll.
-        for (entity, scroll) in active_workspace {
+        for (entity, _, scroll) in active_workspace {
             if scroll.is_some()
-                && let Ok(mut entity_commands) = commands.get_entity(entity)
+                && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
             {
                 entity_commands.try_remove::<Scrolling>();
             }
@@ -238,27 +242,44 @@ fn mouse_down_trigger(
 
         // Clean up any stale marker from a previous click.
         for held in &mouse_held {
-            if let Ok(mut entity_commands) = commands.get_entity(held) {
+            if let Ok(mut entity_commands) = ctx.commands.get_entity(held) {
                 entity_commands.try_despawn();
             }
         }
 
-        if config.window_hidden_ratio() >= 1.0 {
-            // At max hidden ratio, never reshuffle on click.
-        } else {
-            // Defer reshuffle until mouse-up so the window doesn't shift
-            // mid-click. The Timeout auto-despawns if mouse-up is lost.
-            let timeout = Timeout::new(Duration::from_secs(5), None, &mut commands);
-            commands.spawn((MouseHeldMarker(entity), timeout));
+        // Track physical ownership even when click reshuffling is disabled.
+        let timeout = Timeout::new(Duration::from_secs(5), None, &mut ctx.commands);
+        let candidate = ctx
+            .config
+            .drag_reorder()
+            .then(|| {
+                active_workspace
+                    .iter()
+                    .find_map(|(strip_entity, strip, _)| {
+                        super::drag::capture(
+                            entity,
+                            strip_entity,
+                            strip,
+                            &ctx.windows,
+                            origin_from(*point),
+                            active_display.bounds(),
+                        )
+                    })
+            })
+            .flatten();
+        let mut hold = ctx.commands.spawn((MouseHeldMarker(entity), timeout));
+        if let Some(candidate) = candidate {
+            hold.insert(candidate);
         }
     }
 }
 
 /// Handles mouse-up events. Triggers the deferred reshuffle so the clicked
 /// window slides into view after the user releases the button.
-fn mouse_up_trigger(
+pub(super) fn mouse_up_trigger(
     mut messages: MessageReader<InputEvent>,
     mouse_held: Query<(Entity, &MouseHeldMarker)>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
@@ -267,10 +288,29 @@ fn mouse_up_trigger(
         }
 
         for (held_entity, marker) in &mouse_held {
-            commands.reshuffle_around(marker.0);
+            if config.window_hidden_ratio() < 1.0 {
+                commands.reshuffle_around(marker.0);
+            }
             if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                 entity_commands.try_despawn();
             }
+        }
+    }
+}
+
+/// Native drag traffic renews the lost-release fallback. A long live drag
+/// therefore retains ownership; an abandoned gesture still expires.
+pub(super) fn refresh_mouse_hold(
+    mut messages: MessageReader<InputEvent>,
+    mut holds: Query<(Entity, &mut Timeout), With<MouseHeldMarker>>,
+    mut commands: Commands,
+) {
+    if messages.read().fold(false, |dragged, InputEvent(event)| {
+        dragged | matches!(event, Event::MouseDragged { .. })
+    }) {
+        for (entity, mut timeout) in &mut holds {
+            timeout.timer.reset();
+            commands.entity(entity).insert(MouseDraggingMarker);
         }
     }
 }

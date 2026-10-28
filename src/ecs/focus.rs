@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use bevy::app::{App, Plugin, PostUpdate, Update};
+use bevy::app::{App, Plugin, PostUpdate, PreUpdate, Update};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, Remove};
+use bevy::ecs::message::MessageReader;
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Populated, Query, Res, Single};
+use bevy::ecs::system::{Commands, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use bevy::prelude::Event as BevyEvent;
 use bevy::time::common_conditions::on_timer;
@@ -94,6 +95,13 @@ pub struct FocusEventsPlugin;
 impl Plugin for FocusEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FocusHistory>();
+        app.init_resource::<KeyboardFocusHandoff>();
+        app.add_systems(
+            PreUpdate,
+            cancel_keyboard_focus
+                .after(super::systems::pump_events)
+                .run_if(bevy::ecs::schedule::common_conditions::on_message::<Event>),
+        );
         app.add_systems(
             Update,
             (
@@ -106,6 +114,12 @@ impl Plugin for FocusEventsPlugin {
             (
                 autocenter_window_on_focus.after(super::systems::animate_resize_entities),
                 mouse_follows_focus.after(super::systems::animate_resize_entities),
+                confirm_keyboard_focus
+                    .after(super::systems::animate_resize_entities)
+                    .after(super::systems::animate_entities)
+                    .after(super::systems::commit_window_position)
+                    .after(super::systems::commit_window_size)
+                    .run_if(|handoff: Res<KeyboardFocusHandoff>| handoff.active()),
                 recover_lost_focus.run_if(on_timer(Duration::from_millis(
                     REFRESH_WINDOW_CHECK_FREQ_MS,
                 ))),
@@ -114,9 +128,11 @@ impl Plugin for FocusEventsPlugin {
         app.add_observer(dim_remove_window_trigger)
             .add_observer(dim_window_trigger)
             .add_observer(maintain_focus_singleton)
+            .add_observer(remember_selected_tab)
             .add_observer(maintain_verify_focus_singleton)
             .add_observer(virtual_strip_activated)
             .add_observer(stray_focus_observer)
+            .add_observer(begin_keyboard_focus)
             .add_observer(focus_window_trigger)
             .add_observer(raise_window_trigger);
     }
@@ -126,6 +142,281 @@ impl Plugin for FocusEventsPlugin {
 pub(super) struct FocusWindow {
     pub entity: Entity,
     pub raise: bool,
+    pub source: Option<Entity>,
+}
+
+/// Only explicit keyboard navigation gets bounded native confirmation. Swipes
+/// continue to use their existing focus path.
+#[derive(BevyEvent)]
+pub(crate) struct KeyboardFocusRequest {
+    pub target: Entity,
+    pub source: Option<Entity>,
+}
+
+#[derive(Default, Resource)]
+pub(super) struct KeyboardFocusHandoff(Option<KeyboardFocusAttempt>);
+
+impl KeyboardFocusHandoff {
+    pub(super) fn cancel_target_in(&mut self, entities: &[Entity]) {
+        if self
+            .0
+            .as_ref()
+            .is_some_and(|attempt| entities.contains(&attempt.target))
+        {
+            self.0 = None;
+        }
+    }
+
+    pub(super) fn active(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+struct KeyboardFocusAttempt {
+    target: Entity,
+    source: Option<Entity>,
+    elapsed: Duration,
+    next_check: Duration,
+    retries: u8,
+    confirmations: u8,
+    prepared: bool,
+}
+
+fn begin_keyboard_focus(
+    trigger: On<KeyboardFocusRequest>,
+    mut handoff: ResMut<KeyboardFocusHandoff>,
+    windows: Windows,
+    apps: Query<&Application>,
+) {
+    // Rapid repeated navigation advances the logical selection before native
+    // focus catches up. Capture the actual source, not that optimistic marker.
+    let source = apps
+        .iter()
+        .find(|app| app.is_frontmost())
+        .and_then(|app| app.focused_window_id().ok())
+        .and_then(|id| windows.find(id).map(|(_, entity)| entity))
+        .or(trigger.source);
+    handoff.0 = Some(KeyboardFocusAttempt {
+        target: trigger.target,
+        source,
+        elapsed: Duration::ZERO,
+        next_check: Duration::ZERO,
+        retries: 0,
+        confirmations: 0,
+        prepared: false,
+    });
+}
+
+fn cancel_keyboard_focus(
+    mut handoff: ResMut<KeyboardFocusHandoff>,
+    mut messages: MessageReader<Event>,
+) {
+    // Consume the entire batch: a short-circuit iterator leaves old cancel
+    // events unread, which could cancel the next keyboard request.
+    let cancelled = messages.read().fold(false, |cancelled, event| cancelled | matches!(event,
+        Event::MouseDown { .. } | Event::CancelKeyboardFocusHandoff |
+        Event::Swipe { .. } | Event::VerticalSwipe { .. } | Event::Scroll { .. } | Event::VerticalScrollTick { .. } |
+        Event::Command { command: crate::commands::Command::Window(_) }
+            if !matches!(event, Event::Command { command: crate::commands::Command::Window(crate::commands::Operation::Focus(_)) })
+    ));
+    if cancelled {
+        handoff.0 = None;
+    }
+}
+
+type KeyboardRevealMarkers<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    bevy::ecs::query::Or<(
+        With<super::RepositionMarker>,
+        With<super::ReshuffleAroundMarker>,
+        With<super::EnsureVisibleMarker>,
+        With<ResizeMarker>,
+    )>,
+>;
+
+fn keyboard_reveal_pending(
+    target: Entity,
+    windows: &Windows,
+    strips: &Query<(Entity, &mut LayoutStrip)>,
+    origins: &Query<&Position, With<LayoutStrip>>,
+    moving: &KeyboardRevealMarkers,
+) -> bool {
+    let strip = strips
+        .iter()
+        .find_map(|(entity, strip)| strip.contains(target).then_some(entity));
+    let uncommitted = strip
+        .and_then(|strip| origins.get(strip).ok())
+        .zip(windows.layout_position(target))
+        .is_some_and(|(origin, layout)| {
+            let expected = origin.0 + layout.0;
+            windows
+                .frame(target)
+                .is_none_or(|frame| frame.min != expected)
+                || windows
+                    .get(target)
+                    .is_none_or(|window| window.frame().min != expected)
+        });
+    uncommitted || moving.contains(target) || strip.is_some_and(|entity| moving.contains(entity))
+}
+
+fn request_keyboard_native_focus(
+    attempt: &KeyboardFocusAttempt,
+    native_id: Option<crate::platform::WinID>,
+    windows: &Windows,
+    commands: &mut Commands,
+) {
+    commands.trigger(FocusWindow {
+        entity: attempt.target,
+        raise: false,
+        source: native_id
+            .and_then(|id| windows.find(id).map(|(_, entity)| entity))
+            .or(attempt.source),
+    });
+}
+
+fn activate_prepared_keyboard_target(
+    attempt: &mut KeyboardFocusAttempt,
+    native_id: Option<crate::platform::WinID>,
+    windows: &Windows,
+    commands: &mut Commands,
+) {
+    attempt.prepared = true;
+    attempt.elapsed = Duration::ZERO;
+    attempt.next_check = Duration::from_millis(150);
+    if let Ok(mut entity_commands) = commands.get_entity(attempt.target) {
+        entity_commands.try_insert((
+            VerifyFocus,
+            Timeout::for_component::<VerifyFocus>(VERIFY_FOCUS_TIMEOUT),
+        ));
+    }
+    request_keyboard_native_focus(attempt, native_id, windows, commands);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn confirm_keyboard_focus(
+    mut handoff: ResMut<KeyboardFocusHandoff>,
+    time: Res<bevy::time::Time>,
+    windows: Windows,
+    apps: Query<(Entity, &Application)>,
+    strips: Query<(Entity, &mut LayoutStrip)>,
+    strip_origins: Query<&Position, With<LayoutStrip>>,
+    moving: KeyboardRevealMarkers,
+    mut commands: Commands,
+) {
+    let Some(attempt) = handoff.0.as_mut() else {
+        return;
+    };
+    attempt.elapsed += time.delta();
+    if attempt.prepared {
+        if attempt.elapsed < attempt.next_check {
+            return;
+        }
+        attempt.next_check += Duration::from_millis(150);
+    }
+    let parent_of = |entity: Entity| {
+        windows
+            .get(entity)
+            .and_then(|window| windows.find_parent(window.id()))
+            .map(|(_, _, parent)| parent)
+    };
+    let Some(target_parent) = parent_of(attempt.target) else {
+        handoff.0 = None;
+        return;
+    };
+    let Some(target_window) = windows.get(attempt.target) else {
+        handoff.0 = None;
+        return;
+    };
+    let source_parent = attempt.source.and_then(parent_of);
+    let native = apps
+        .iter()
+        .find(|(_, app)| app.is_frontmost())
+        .map(|(parent, app)| (parent, app.focused_window_id().ok()));
+    if native.is_some_and(|(parent, _)| parent != target_parent && Some(parent) != source_parent) {
+        handoff.0 = None;
+        return;
+    }
+    if !attempt.prepared {
+        if keyboard_reveal_pending(attempt.target, &windows, &strips, &strip_origins, &moving) {
+            if attempt.elapsed >= Duration::from_millis(600) {
+                warn!(
+                    window_id = target_window.id(),
+                    "keyboard reveal did not settle before focus handoff"
+                );
+                if let Some((_, Some(window_id))) = native {
+                    commands.trigger(SendMessageTrigger(Event::WindowFocused { window_id }));
+                }
+                handoff.0 = None;
+            }
+            return;
+        }
+        activate_prepared_keyboard_target(
+            attempt,
+            native.and_then(|(_, id)| id),
+            &windows,
+            &mut commands,
+        );
+        return;
+    }
+    let confirmed = native.is_some_and(|(parent, id)| {
+        parent == target_parent
+            && id.is_some_and(|id| {
+                id == target_window.id()
+                    || windows.find_parent(id).is_some_and(|(_, actual, _)| {
+                        shares_a_tab_group(&strips, &windows, attempt.target, actual)
+                    })
+            })
+    });
+    if confirmed {
+        if attempt.confirmations == 0
+            && let Some((_, Some(window_id))) = native
+        {
+            // This is a native AX acknowledgment, including the actual member
+            // of a tab group, not the optimistic logical selection.
+            commands.trigger(SendMessageTrigger(Event::WindowFocused { window_id }));
+        }
+        attempt.confirmations += 1;
+        if attempt.confirmations >= 2 || attempt.elapsed >= Duration::from_millis(600) {
+            handoff.0 = None;
+        }
+        return;
+    }
+    attempt.confirmations = 0;
+    if attempt.retries < 2 && attempt.elapsed < Duration::from_millis(600) {
+        attempt.retries += 1;
+        // The first attempt already revealed the target. Retry after layout has
+        // settled, rather than repeating the pre-reveal focus request.
+        if let Ok(mut entity_commands) = commands.get_entity(attempt.target) {
+            entity_commands.try_insert(FocusedMarker);
+        }
+        request_keyboard_native_focus(
+            attempt,
+            native.and_then(|(_, id)| id),
+            &windows,
+            &mut commands,
+        );
+        return;
+    }
+    warn!(
+        window_id = target_window.id(),
+        retries = attempt.retries,
+        "keyboard focus handoff did not receive native confirmation"
+    );
+    if let Some((_, Some(window_id))) = native {
+        commands.trigger(SendMessageTrigger(Event::WindowFocused { window_id }));
+    }
+    handoff.0 = None;
+}
+
+fn remember_selected_tab(trigger: On<Add, FocusedMarker>, mut strips: Query<&mut LayoutStrip>) {
+    let entity = trigger.event().entity;
+    for mut strip in &mut strips {
+        if strip.is_tabbed_display(entity) {
+            strip.remember_selected_tab(entity);
+        }
+    }
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
@@ -308,6 +599,13 @@ fn detect_focus_rejection(
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn autocenter_window_on_focus(
+    pinned: Query<
+        (),
+        (
+            With<super::view_history::ViewLock>,
+            With<ActiveWorkspaceMarker>,
+        ),
+    >,
     focused: Single<Entity, Added<FocusedMarker>>,
     mouse_held: Query<&MouseHeldMarker>,
     restored: Query<&RestoreFocusMarker>,
@@ -316,6 +614,9 @@ fn autocenter_window_on_focus(
     mut ctx: WindowCtx,
 ) {
     let entity = *focused;
+    if !pinned.is_empty() {
+        return;
+    }
 
     // Skip auto-centering when this focus came from a workspace restore, since
     // the strip is already at its saved origin. window_focused_trigger and
@@ -463,7 +764,11 @@ fn focus_window_trigger(
     verifying: Query<Entity, With<VerifyFocus>>,
     mut commands: Commands,
 ) {
-    let FocusWindow { entity, raise } = *trigger.event();
+    let FocusWindow {
+        entity,
+        raise,
+        source,
+    } = *trigger.event();
     for other in verifying {
         if other != entity
             && let Ok(mut entity_commands) = commands.get_entity(other)
@@ -478,7 +783,9 @@ fn focus_window_trigger(
         return;
     };
     if !raise
-        && let Some((focused_window, _)) = windows.focused()
+        && let Some(focused_window) = source
+            .and_then(|entity| windows.get(entity))
+            .or_else(|| windows.focused().map(|(window, _)| window))
         && let Some(focused_psn) = windows.psn(focused_window.id(), &apps)
     {
         window.focus_without_raise(psn, focused_window, focused_psn);
@@ -763,5 +1070,251 @@ mod tests {
         );
         assert!(world.get::<Timeout>(first).is_none());
         assert!(world.get::<VerifyFocus>(second).is_some());
+    }
+    #[derive(Default, Resource)]
+    struct KeyboardRetryTargets(Vec<(Entity, Option<Entity>, bool)>);
+
+    fn keyboard_fixture() -> (World, Entity, std::sync::Arc<std::sync::atomic::AtomicI32>) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicI32, Ordering},
+        };
+        let mut world = World::new();
+        let native = Arc::new(AtomicI32::new(1));
+        let mut entities = Vec::new();
+        for id in 1..=3 {
+            let mut api = MockApplicationApi::new();
+            let state = native.clone();
+            api.expect_is_frontmost()
+                .returning(move || state.load(Ordering::SeqCst) == id);
+            api.expect_focused_window_id().returning(move || Ok(id));
+            let app = world.spawn(Application::new(Box::new(api))).id();
+            entities.push(spawn_window(&mut world, app, id));
+        }
+        let source = entities[0];
+        let target = entities[1];
+        world.entity_mut(target).insert(FocusedMarker);
+        world.insert_resource(KeyboardFocusHandoff(Some(KeyboardFocusAttempt {
+            target,
+            source: Some(source),
+            elapsed: Duration::ZERO,
+            next_check: Duration::from_millis(150),
+            retries: 0,
+            confirmations: 0,
+            prepared: true,
+        })));
+        let mut time = bevy::time::Time::<()>::default();
+        time.advance_by(Duration::from_millis(150));
+        world.insert_resource(time);
+        world.init_resource::<bevy::ecs::message::Messages<Event>>();
+        world.init_resource::<KeyboardRetryTargets>();
+        world.add_observer(
+            |event: On<FocusWindow>, mut retries: ResMut<KeyboardRetryTargets>| {
+                retries.0.push((event.entity, event.source, event.raise));
+            },
+        );
+        (world, target, native)
+    }
+
+    #[test]
+    fn keyboard_handoff_retries_native_cross_app_refusal_and_reclaim() {
+        use std::sync::atomic::Ordering;
+        let (mut world, target, native) = keyboard_fixture();
+        let source = world
+            .resource::<KeyboardFocusHandoff>()
+            .0
+            .as_ref()
+            .unwrap()
+            .source;
+        let system = world.register_system(confirm_keyboard_focus);
+        // The optimistic ECS marker must not count as native confirmation.
+        world.run_system(system).unwrap();
+        let pending = world.resource::<KeyboardFocusHandoff>().0.as_ref().unwrap();
+        assert_eq!(pending.retries, 1);
+        assert_eq!(pending.confirmations, 0);
+        assert!(world.get::<FocusedMarker>(target).is_some());
+        native.store(2, Ordering::SeqCst);
+        world.run_system(system).unwrap();
+        assert_eq!(
+            world
+                .resource::<KeyboardFocusHandoff>()
+                .0
+                .as_ref()
+                .unwrap()
+                .confirmations,
+            1
+        );
+        // The old app reclaims after one native acknowledgment: retry once more.
+        native.store(1, Ordering::SeqCst);
+        world.run_system(system).unwrap();
+        assert_eq!(
+            world
+                .resource::<KeyboardFocusHandoff>()
+                .0
+                .as_ref()
+                .unwrap()
+                .retries,
+            2
+        );
+        native.store(2, Ordering::SeqCst);
+        world.run_system(system).unwrap();
+        assert!(world.resource::<KeyboardFocusHandoff>().0.is_none());
+        assert_eq!(
+            world.resource::<KeyboardRetryTargets>().0,
+            vec![(target, source, false), (target, source, false)]
+        );
+    }
+
+    #[test]
+    fn keyboard_handoff_stops_after_two_refusals_without_floating_target() {
+        let (mut world, target, _) = keyboard_fixture();
+        let system = world.register_system(confirm_keyboard_focus);
+        for _ in 0..4 {
+            world.run_system(system).unwrap();
+        }
+        assert!(world.resource::<KeyboardFocusHandoff>().0.is_none());
+        assert!(world.get::<Unmanaged>(target).is_none());
+    }
+
+    #[test]
+    fn keyboard_handoff_yields_to_click_app_switch_and_swipe() {
+        use std::sync::atomic::Ordering;
+        for event in [
+            Event::CancelKeyboardFocusHandoff,
+            Event::MouseDown {
+                point: objc2_core_foundation::CGPoint::new(0.0, 0.0),
+                modifiers: crate::platform::Modifiers::empty(),
+            },
+            Event::Swipe {
+                delta: 1.0,
+                fingers: 3,
+            },
+        ] {
+            let (mut world, _, _) = keyboard_fixture();
+            world.write_message(event);
+            let cancel = world.register_system(cancel_keyboard_focus);
+            world.run_system(cancel).unwrap();
+            let system = world.register_system(confirm_keyboard_focus);
+            world.run_system(system).unwrap();
+            assert!(world.resource::<KeyboardFocusHandoff>().0.is_none());
+            assert!(world.resource::<KeyboardRetryTargets>().0.is_empty());
+        }
+        let (mut world, _, native) = keyboard_fixture();
+        native.store(3, Ordering::SeqCst);
+        let system = world.register_system(confirm_keyboard_focus);
+        world.run_system(system).unwrap();
+        assert!(world.resource::<KeyboardFocusHandoff>().0.is_none());
+    }
+    #[test]
+    fn old_click_is_drained_before_a_new_keyboard_request() {
+        let (mut world, target, _) = keyboard_fixture();
+        world.write_message(Event::CancelKeyboardFocusHandoff);
+        world.write_message(Event::CancelKeyboardFocusHandoff);
+        let cancel = world.register_system(cancel_keyboard_focus);
+        world.run_system(cancel).unwrap();
+        assert!(world.resource::<KeyboardFocusHandoff>().0.is_none());
+        world.add_observer(begin_keyboard_focus);
+        world.trigger(KeyboardFocusRequest {
+            target,
+            source: None,
+        });
+        world.run_system(cancel).unwrap();
+        assert!(world.resource::<KeyboardFocusHandoff>().active());
+    }
+    #[test]
+    fn keyboard_reveal_commits_geometry_before_native_activation() {
+        use std::sync::{Arc, Mutex};
+        let (mut world, target, _) = keyboard_fixture();
+        let source = world
+            .resource::<KeyboardFocusHandoff>()
+            .0
+            .as_ref()
+            .unwrap()
+            .source;
+        let physical = Arc::new(Mutex::new(IRect::new(0, 0, 800, 600)));
+        let frame = physical.clone();
+        let mut api = MockWindowApi::new();
+        api.expect_id().return_const(2);
+        api.expect_frame().returning(move || *frame.lock().unwrap());
+        world.entity_mut(target).insert((
+            Window::new(Box::new(api)),
+            super::super::WidthRatio(0.5),
+            super::super::LayoutPosition(bevy::math::IVec2::new(400, 0)),
+        ));
+        let mut strip = LayoutStrip::default();
+        strip.append(target);
+        world.spawn((strip, Position(bevy::math::IVec2::new(200, 0))));
+        {
+            let mut handoff = world.resource_mut::<KeyboardFocusHandoff>();
+            let attempt = handoff.0.as_mut().unwrap();
+            attempt.prepared = false;
+            attempt.next_check = Duration::ZERO;
+        }
+        let system = world.register_system(confirm_keyboard_focus);
+        world.run_system(system).unwrap();
+        assert!(world.resource::<KeyboardRetryTargets>().0.is_empty());
+        // Logical geometry alone is insufficient: the native commit still lags.
+        world
+            .entity_mut(target)
+            .insert(Position(bevy::math::IVec2::new(600, 0)));
+        world.run_system(system).unwrap();
+        assert!(world.resource::<KeyboardRetryTargets>().0.is_empty());
+        *physical.lock().unwrap() = IRect::new(600, 0, 1400, 600);
+        world.run_system(system).unwrap();
+        assert_eq!(
+            world.resource::<KeyboardRetryTargets>().0,
+            vec![(target, source, false)]
+        );
+    }
+
+    #[test]
+    fn rapid_keyboard_request_replaces_old_target_and_uses_native_source() {
+        let (mut world, old_target, _) = keyboard_fixture();
+        let source = world
+            .resource::<KeyboardFocusHandoff>()
+            .0
+            .as_ref()
+            .unwrap()
+            .source;
+        let new_target = world
+            .query::<(Entity, &Window)>()
+            .iter(&world)
+            .find_map(|(e, w)| (w.id() == 3).then_some(e))
+            .unwrap();
+        world.add_observer(begin_keyboard_focus);
+        world.trigger(KeyboardFocusRequest {
+            target: new_target,
+            source: Some(old_target),
+        });
+        let pending = world.resource::<KeyboardFocusHandoff>().0.as_ref().unwrap();
+        assert_eq!(pending.target, new_target);
+        assert_eq!(pending.source, source);
+        assert!(!pending.prepared);
+        assert!(world.resource::<KeyboardRetryTargets>().0.is_empty());
+    }
+    #[test]
+    fn keyboard_native_tab_sibling_acknowledgment_does_not_retry() {
+        use std::sync::atomic::Ordering;
+        let (mut world, target, native) = keyboard_fixture();
+        let parent = world.get::<ChildOf>(target).unwrap().parent();
+        let mut app = MockApplicationApi::new();
+        let active = native.clone();
+        app.expect_is_frontmost()
+            .returning(move || active.load(Ordering::SeqCst) == 2);
+        app.expect_focused_window_id().return_const(Ok(20));
+        world
+            .entity_mut(parent)
+            .insert(Application::new(Box::new(app)));
+        let sibling = spawn_window(&mut world, parent, 20);
+        let mut strip = LayoutStrip::default();
+        strip.append(target);
+        strip.convert_to_tabs(target, sibling).unwrap();
+        world.spawn(strip);
+        native.store(2, Ordering::SeqCst);
+        let system = world.register_system(confirm_keyboard_focus);
+        world.run_system(system).unwrap();
+        world.run_system(system).unwrap();
+        assert!(world.resource::<KeyboardFocusHandoff>().0.is_none());
+        assert!(world.resource::<KeyboardRetryTargets>().0.is_empty());
     }
 }

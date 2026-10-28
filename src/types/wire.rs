@@ -86,9 +86,50 @@ use crate::types::state::{
 };
 use crate::types::windowset::{LayoutOp, WindowSet};
 
+/// Explicit, window-addressed helper drop. The bridge captures workspace identity
+/// before submitting; the engine validates it again at mutation time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DropKind {
+    Column,
+    Tab,
+    Detach,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DropSide {
+    Before,
+    After,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayoutDrop {
+    pub source: i32,
+    pub target: i32,
+    pub kind: DropKind,
+    pub side: DropSide,
+    pub native_workspace: u64,
+    pub row: u32,
+}
+
+/// A whole-column move between existing rows on the active display/native Space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowDrop {
+    pub source: i32,
+    pub source_row: u32,
+    pub target_row: u32,
+    pub anchor: Option<(DropSide, i32)>,
+    pub native_workspace: u64,
+    pub display: u32,
+}
+
 /// Something a client asks the daemon to do.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Request {
+    LayoutDrop(LayoutDrop),
+    RowDrop(RowDrop),
+    /// Acquire/renew or release a token-owned 30-second shortcut passthrough lease.
+    Recording {
+        token: String,
+        begin: bool,
+    },
     /// Run a command — the same one a hotkey binds to. Fire-and-forget: the
     /// daemon applies it best-effort against the live world and a client that
     /// wants the result queries for it.
@@ -120,6 +161,9 @@ pub enum ScriptStateRequest {
 /// What the daemon says back.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Response {
+    /// Model mutation accepted; native geometry can still be settling.
+    LayoutDrop,
+    Recording,
     Query(QueryPayload),
     WindowSet(Box<WindowSet>),
     ScriptState(ScriptStateResponse),

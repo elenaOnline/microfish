@@ -168,6 +168,9 @@ pub struct ColumnSet {
     pub width_ratio: f64,
     /// Which of `windows` is on top, for tabs and stacks.
     pub selected: usize,
+    /// Reserved header height for Paneru tabbed stacks, in logical pixels.
+    #[serde(default)]
+    pub tab_bar_height: i32,
     pub windows: Arc<Vec<WindowRec>>,
 }
 
@@ -179,6 +182,7 @@ impl ColumnSet {
             kind: ColumnKind::Single,
             width_ratio,
             selected: 0,
+            tab_bar_height: 0,
             windows: Arc::new(vec![window]),
         }
     }
@@ -652,6 +656,9 @@ impl WindowSet {
                 if record.is_none() || !column.windows.iter().any(|held| held.id == onto) {
                     return;
                 }
+                if tabs {
+                    column.tab_bar_height = 0;
+                }
                 column.kind = if tabs {
                     ColumnKind::Tabs
                 } else {
@@ -747,6 +754,7 @@ fn take_window(displays: &mut [DisplaySet], id: WinID) -> Option<WindowRec> {
                         column.selected = column.selected.min(column.windows.len() - 1);
                         if column.windows.len() == 1 {
                             column.kind = ColumnKind::Single;
+                            column.tab_bar_height = 0;
                         }
                     }
                     return Some(taken);
@@ -776,6 +784,47 @@ mod tests {
             managed: true,
             visible: true,
             focused: false,
+        }
+    }
+
+    #[test]
+    fn transformed_columns_clear_headers_for_native_tabs_and_singles() {
+        let mut set = fixture().stack(2, 1);
+        for_each_column(Arc::make_mut(&mut set.displays).as_mut_slice(), |column| {
+            if column.kind == ColumnKind::Stack {
+                column.tab_bar_height = 28;
+            }
+        });
+        let unstacked = set.unstack(2);
+        assert!(
+            unstacked
+                .current()
+                .unwrap()
+                .columns
+                .iter()
+                .all(|column| column.tab_bar_height == 0)
+        );
+        let native = set.tab(3, 1);
+        assert_eq!(native.current().unwrap().columns[0].kind, ColumnKind::Tabs);
+        assert_eq!(native.current().unwrap().columns[0].tab_bar_height, 0);
+    }
+
+    #[test]
+    fn column_header_metadata_defaults_and_lua_exposure() {
+        let column = ColumnSet::single(window(42, "test"), 0.5);
+        let mut value = serde_json::to_value(&column).unwrap();
+        value.as_object_mut().unwrap().remove("tab_bar_height");
+        let legacy: ColumnSet = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.tab_bar_height, 0);
+        #[cfg(feature = "lua")]
+        {
+            let mut set = fixture();
+            let display = Arc::make_mut(&mut set.displays).first_mut().unwrap();
+            let workspace = Arc::make_mut(&mut display.workspaces).first_mut().unwrap();
+            Arc::make_mut(&mut workspace.columns)[0].tab_bar_height = 28;
+            let lua = mlua::Lua::new();
+            lua.globals().set("ws", set).unwrap();
+            lua.load("local info = ws:column_info(); local cols = ws:columns(); assert(#info == #cols); for i, col in ipairs(info) do assert(col.windows[1].id == cols[i][1]) end; assert(info[1].tab_bar_height == 28); assert(info[2].tab_bar_height == 0); assert(#ws:column_info(2) == 0); assert(#ws:column_info(99) == 0)").exec().unwrap();
         }
     }
 

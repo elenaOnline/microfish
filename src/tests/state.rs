@@ -100,6 +100,7 @@ fn test_state_serialization() {
             display_id: Some(TEST_DISPLAY_ID),
             active_virtual_index: Some(0),
             strips: vec![SavedStrip {
+                side_tabs: false,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Single(window)],
             }],
@@ -135,6 +136,7 @@ fn test_state_restoration() {
             display_id: None,
             active_virtual_index: Some(1),
             strips: vec![SavedStrip {
+                side_tabs: false,
                 virtual_index: 1,
                 columns: vec![SavedColumn::Single(window)],
             }],
@@ -355,6 +357,7 @@ fn restore_plan_compacts_missing_windows_and_preserves_active_virtual_row() {
         active_virtual_index: Some(1),
         strips: vec![
             SavedStrip {
+                side_tabs: false,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Single(saved_window(
                     10,
@@ -364,6 +367,7 @@ fn restore_plan_compacts_missing_windows_and_preserves_active_virtual_row() {
                 ))],
             },
             SavedStrip {
+                side_tabs: false,
                 virtual_index: 1,
                 columns: vec![
                     SavedColumn::Tabs(vec![
@@ -436,10 +440,12 @@ fn restore_plan_prefers_later_hard_match_over_earlier_fallback_match() {
         active_virtual_index: Some(0),
         strips: vec![
             SavedStrip {
+                side_tabs: false,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Single(saved_a)],
             },
             SavedStrip {
+                side_tabs: false,
                 virtual_index: 1,
                 columns: vec![SavedColumn::Single(saved_b)],
             },
@@ -479,6 +485,7 @@ fn restore_plan_skips_ambiguous_fallback_match() {
         display_id: None,
         active_virtual_index: Some(0),
         strips: vec![SavedStrip {
+            side_tabs: false,
             virtual_index: 0,
             columns: vec![SavedColumn::Single(saved)],
         }],
@@ -1009,4 +1016,80 @@ fn test_set_frame_places_a_floating_window() {
         Some(placed),
         "and sitting exactly where it was put"
     );
+}
+
+#[test]
+fn tabbed_stack_session_round_trip() {
+    use crate::ecs::restore::{PlannedColumn, RestorePlanner};
+    use crate::tests::harness::TestHarness;
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.app.update();
+    let world = harness.world();
+    let members = {
+        let mut query = world.query::<&mut LayoutStrip>();
+        let mut strip = query.single_mut(world).unwrap();
+        let members = strip.all_columns();
+        strip.stack(members[1]).unwrap();
+        strip.toggle_tabbed_display(members[0]);
+        members
+    };
+    let mut extraction: StateExtractionState<'_, '_> = SystemState::new(world);
+    let (workspaces, displays, windows, apps) = extraction.get(world).unwrap();
+    let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
+    let encoded = serde_json::to_string(&state).unwrap();
+    let decoded: PaneruState = serde_json::from_str(&encoded).unwrap();
+    let SavedColumn::TabbedStack(items) = &decoded.workspaces[0].strips[0].columns[0] else {
+        panic!("tab presentation not saved");
+    };
+    let current: Vec<_> = items
+        .iter()
+        .zip(&members)
+        .map(|(item, &entity)| {
+            let SavedStackItem::Single(w) = item else {
+                panic!("expected single");
+            };
+            current_window(entity, w.window_id, w.pid, &w.bundle_id, &w.title)
+        })
+        .collect();
+    let plan = RestorePlanner::new(&decoded).plan(&current);
+    assert!(matches!(
+        plan.strips[0].columns[0],
+        PlannedColumn::TabbedStack(_)
+    ));
+    // A closed member safely degrades to one ordinary window.
+    let partial = RestorePlanner::new(&decoded).plan(&current[..1]);
+    assert!(matches!(
+        partial.strips[0].columns[0],
+        PlannedColumn::Single(_)
+    ));
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn addressed_focus_reveals_already_focused_window_after_scroll() {
+    use crate::commands::Command;
+    use crate::ecs::Position;
+    use crate::tests::harness::TestHarness;
+    use crate::types::windowset::LayoutOp;
+    let mut h = TestHarness::new().with_windows(4);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+    assert_eq!(extract_window_set(h.world()).unwrap().focused(), Some(0));
+    {
+        let world = h.world();
+        let mut q = world.query_filtered::<&mut Position, With<ActiveWorkspaceMarker>>();
+        q.single_mut(world).unwrap().0.x = -600;
+    }
+    h.run(vec![Event::Command {
+        command: Command::PrintState,
+    }]);
+    let before = extract_window_set(h.world()).unwrap();
+    assert_eq!(before.focused(), Some(0));
+    assert!(before.window(0).unwrap().frame.unwrap().x < 0);
+    h.run(vec![Event::Command {
+        command: Command::Layout(vec![LayoutOp::Focus(0)]),
+    }]);
+    let after = extract_window_set(h.world()).unwrap();
+    let frame = after.window(0).unwrap().frame.unwrap();
+    assert_eq!(after.focused(), Some(0));
+    assert!(frame.x >= 0 && frame.x + frame.width <= TEST_DISPLAY_WIDTH);
 }

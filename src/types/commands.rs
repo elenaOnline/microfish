@@ -217,6 +217,16 @@ pub fn parse_virtual_workspace_number(input: &str) -> Result<u32, ParseError> {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
+    /// Undo the last compatible layout mutation.
+    UndoMove,
+    /// Save or recall a numbered viewport.
+    ViewPin(u8),
+    /// Replace a numbered viewport.
+    ViewSave(u8),
+    /// Return to the viewport before navigation.
+    ViewBack,
+    /// Ends a modifier-held navigation sequence.
+    ViewEnd,
     /// Focuses on a window in the specified `Direction`.
     Focus(Direction),
     /// Swaps the current window with another in the specified `Direction`.
@@ -264,6 +274,12 @@ pub enum Operation {
     /// Creates a new empty virtual strip after the highest existing one for
     /// the current workspace, and switches to it.
     VirtualAdd,
+    /// Moves only the selected window to an existing adjacent row.
+    RowMove(Direction),
+    /// Navigates existing rows; north from a populated top row prepends one.
+    Row(Direction),
+    /// Moves its complete column, preserving stack and tab display state.
+    RowColumnMove(Direction),
     /// Moves the focused window to the virtual strip.
     VirtualMove(Direction, MoveFocus),
     /// Moves the focused window to a virtual strip by its zero-based index.

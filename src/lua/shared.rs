@@ -220,6 +220,23 @@ fn workspace_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
         })?
     };
     workspace.set("select", select)?;
+    workspace.set(
+        "row",
+        directional(lua, dispatch, "workspace.row", Operation::Row)?,
+    )?;
+    workspace.set(
+        "rowmove",
+        directional(lua, dispatch, "workspace.rowmove", Operation::RowMove)?,
+    )?;
+    workspace.set(
+        "rowcolumnmove",
+        directional(
+            lua,
+            dispatch,
+            "workspace.rowcolumnmove",
+            Operation::RowColumnMove,
+        )?,
+    )?;
 
     let move_window = {
         let dispatch = Rc::clone(dispatch);

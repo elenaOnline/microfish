@@ -144,3 +144,386 @@ fn test_plain_virtual_south_switches_workspace_even_with_a_stack_sibling() {
         })
         .run(commands);
 }
+
+#[test]
+fn rowmove_detaches_only_selected_display_tab_and_stops_at_last_row() {
+    let command = |operation| Event::Command {
+        command: Command::Window(operation),
+    };
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |world, _| {
+            world.insert_resource(
+                crate::config::Config::try_from("default_workspaces=2\n[options]\n[bindings]\n")
+                    .unwrap(),
+            );
+        })
+        .on_iteration(6, |world, _| {
+            let selected = find_window_entity(1, world);
+            let sibling = find_window_entity(0, world);
+            let mut strips = world.query::<&LayoutStrip>();
+            let source = strips.iter(world).find(|s| s.virtual_index == 0).unwrap();
+            assert!(source.contains(sibling));
+            assert!(!source.contains(selected));
+            let destination = strips.iter(world).find(|s| s.virtual_index == 1).unwrap();
+            assert!(destination.contains(selected));
+            assert!(!destination.contains(sibling));
+            assert_focused!(world, 1);
+        })
+        .on_iteration(7, |world, _| {
+            assert_eq!(active_virtual_index(world), 1);
+            let mut strips = world.query::<&LayoutStrip>();
+            assert_eq!(strips.iter(world).count(), 2);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            command(Operation::Focus(Direction::East)),
+            command(Operation::Stack(true)),
+            command(Operation::ToggleTabbedDisplay),
+            command(Operation::VirtualNumber(1)),
+            command(Operation::VirtualNumber(0)),
+            command(Operation::RowMove(Direction::South)),
+            command(Operation::RowMove(Direction::South)),
+        ]);
+}
+
+#[test]
+fn rowcolumnmove_preserves_display_tab_column() {
+    let command = |operation| Event::Command {
+        command: Command::Window(operation),
+    };
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |world, _| {
+            world.insert_resource(
+                crate::config::Config::try_from("default_workspaces=2\n[options]\n[bindings]\n")
+                    .unwrap(),
+            );
+        })
+        .on_iteration(6, |world, _| {
+            let selected = find_window_entity(1, world);
+            let sibling = find_window_entity(0, world);
+            let mut strips = world.query::<&LayoutStrip>();
+            let destination = strips.iter(world).find(|s| s.virtual_index == 1).unwrap();
+            assert!(destination.contains(selected));
+            assert!(destination.contains(sibling));
+            assert!(destination.is_tabbed_display(selected));
+            assert!(destination.is_tabbed_display(sibling));
+            assert_eq!(destination.len(), 1);
+            assert_focused!(world, 1);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            command(Operation::Focus(Direction::East)),
+            command(Operation::Stack(true)),
+            command(Operation::ToggleTabbedDisplay),
+            command(Operation::VirtualNumber(1)),
+            command(Operation::VirtualNumber(0)),
+            command(Operation::RowColumnMove(Direction::South)),
+        ]);
+}
+
+#[test]
+fn row_count_reload_seeds_missing_rows_without_duplicates_or_deleting_occupied_rows() {
+    use crate::config::Config;
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(0, |world, _| {
+            world.insert_resource(
+                Config::try_from("default_workspaces=3\n[options]\n[bindings]\n").unwrap(),
+            );
+        })
+        .on_iteration(1, |world, _| {
+            let mut strips = world.query::<&LayoutStrip>();
+            let indexes: std::collections::HashSet<_> =
+                strips.iter(world).map(|s| s.virtual_index).collect();
+            assert_eq!(indexes, [0, 1, 2].into_iter().collect());
+            assert_eq!(strips.iter(world).count(), 3);
+            world.insert_resource(
+                Config::try_from("default_workspaces=3\n[options]\n[bindings]\n").unwrap(),
+            );
+        })
+        .on_iteration(2, |world, _| {
+            let mut strips = world.query::<&LayoutStrip>();
+            assert_eq!(strips.iter(world).count(), 3);
+            world.insert_resource(
+                Config::try_from("default_workspaces=1\n[options]\n[bindings]\n").unwrap(),
+            );
+        })
+        .on_iteration(3, |world, _| {
+            let mut strips = world.query::<&LayoutStrip>();
+            assert_eq!(strips.iter(world).count(), 3);
+            assert_focused!(world, 0);
+        })
+        .run(vec![Event::MenuOpened { window_id: 0 }; 4]);
+}
+
+#[test]
+fn preseeded_rows_do_not_duplicate_physical_windows_on_startup() {
+    TestHarness::new()
+        .with_windows(3)
+        .with_config(
+            crate::config::Config::try_from("default_workspaces=2\n[options]\n[bindings]\n")
+                .unwrap(),
+        )
+        .on_iteration(0, |world, _| {
+            let mut strips = world.query::<&LayoutStrip>();
+            assert_eq!(
+                strips
+                    .iter(world)
+                    .find(|s| s.virtual_index == 0)
+                    .unwrap()
+                    .all_windows()
+                    .len(),
+                3
+            );
+            assert!(
+                strips
+                    .iter(world)
+                    .find(|s| s.virtual_index == 1)
+                    .unwrap()
+                    .all_windows()
+                    .is_empty()
+            );
+        })
+        .run(vec![Event::MenuOpened { window_id: 0 }]);
+}
+
+#[test]
+fn row_north_prepends_once_preserving_existing_group_and_entity() {
+    let command = |operation| Event::Command {
+        command: Command::Window(operation),
+    };
+    TestHarness::new()
+        .with_windows(3)
+        .with_config(
+            crate::config::Config::try_from("default_workspaces=2\n[options]\n[bindings]\n")
+                .unwrap(),
+        )
+        .on_iteration(3, |world, _| {
+            let first = find_window_entity(0, world);
+            let mut strips = world.query::<(Entity, &mut LayoutStrip)>();
+            let (entity, _) = strips
+                .iter_mut(world)
+                .find(|(_, s)| s.contains(first))
+                .unwrap();
+            let origin = world.get::<crate::ecs::Position>(entity).unwrap().0;
+            world.insert_resource(OriginalRowEntity(entity, origin));
+        })
+        .on_iteration(4, |world, _| {
+            let entity = world.resource::<OriginalRowEntity>().0;
+            let source = world.get::<LayoutStrip>(entity).unwrap();
+            assert_eq!(source.virtual_index, 1);
+            let previous = world
+                .get::<crate::ecs::workspace::PreviousStripPosition>(entity)
+                .unwrap();
+            assert_eq!(previous.origin, world.resource::<OriginalRowEntity>().1);
+            let first = find_window_entity(0, world);
+            let selected = find_window_entity(1, world);
+            assert!(
+                world
+                    .get::<LayoutStrip>(entity)
+                    .unwrap()
+                    .is_tabbed_display(first)
+            );
+            assert!(
+                world
+                    .get::<LayoutStrip>(entity)
+                    .unwrap()
+                    .is_tabbed_display(selected)
+            );
+            assert_eq!(active_virtual_index(world), 0);
+        })
+        .on_iteration(6, |world, _| {
+            let mut strips = world.query::<&LayoutStrip>();
+            assert_eq!(
+                strips.iter(world).count(),
+                3,
+                "repeated north on empty top cannot grow"
+            );
+        })
+        .on_iteration(7, |world, _| {
+            assert_eq!(active_virtual_index(world), 1);
+            assert_focused!(world, 1);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            command(Operation::Focus(Direction::East)),
+            command(Operation::Stack(true)),
+            command(Operation::ToggleTabbedDisplay),
+            command(Operation::Row(Direction::North)),
+            command(Operation::Row(Direction::North)),
+            command(Operation::Row(Direction::North)),
+            command(Operation::Row(Direction::South)),
+        ]);
+}
+
+#[derive(Resource)]
+struct OriginalRowEntity(Entity, crate::manager::Origin);
+
+#[test]
+fn row_prepend_obeys_nine_row_cap() {
+    TestHarness::new()
+        .with_windows(1)
+        .with_config(
+            crate::config::Config::try_from("default_workspaces=9\n[options]\n[bindings]\n")
+                .unwrap(),
+        )
+        .on_iteration(1, |world, _| {
+            assert_eq!(active_virtual_index(world), 0);
+            assert_eq!(world.query::<&LayoutStrip>().iter(world).count(), 9);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::Window(Operation::Row(Direction::North)),
+            },
+        ]);
+}
+
+#[test]
+fn addressed_stack_replay_uses_right_destination() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(1, |world, _| {
+            let left = find_window_entity(0, world);
+            let middle = find_window_entity(1, world);
+            let right = find_window_entity(2, world);
+            let mut strips = world.query::<&LayoutStrip>();
+            let strip = strips.single(world).unwrap();
+            assert_eq!(
+                strip.index_of(middle).unwrap(),
+                strip.index_of(right).unwrap()
+            );
+            assert_ne!(
+                strip.index_of(left).unwrap(),
+                strip.index_of(middle).unwrap()
+            );
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::Layout(vec![crate::types::windowset::LayoutOp::Stack {
+                    window: 1,
+                    onto: 2,
+                    tabs: false,
+                }]),
+            },
+        ]);
+}
+
+#[test]
+fn empty_top_row_is_reaped_after_leaving_and_indices_compact() {
+    let command = |operation| Event::Command {
+        command: Command::Window(operation),
+    };
+    TestHarness::new()
+        .with_windows(2)
+        .with_config(
+            crate::config::Config::try_from("[options]\nreap_empty_workspaces=true\n[bindings]\n")
+                .unwrap(),
+        )
+        .on_iteration(1, |world, _| {
+            assert_eq!(active_virtual_index(world), 0);
+            let mut strips = world.query::<&LayoutStrip>();
+            assert_eq!(strips.iter(world).count(), 2);
+        })
+        .on_iteration(2, |world, _| {
+            assert_eq!(active_virtual_index(world), 0);
+            let mut strips = world.query::<&LayoutStrip>();
+            assert_eq!(strips.iter(world).count(), 1);
+            assert_eq!(strips.iter(world).next().unwrap().len(), 2);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            command(Operation::Row(Direction::North)),
+            command(Operation::Row(Direction::South)),
+        ]);
+}
+
+#[test]
+fn addressed_focus_reveals_inactive_row_before_focusing() {
+    let command = |operation| Event::Command {
+        command: Command::Window(operation),
+    };
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(3, |world, _| {
+            assert_eq!(active_virtual_index(world), 1);
+            assert_focused!(world, 0);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            command(Operation::VirtualMoveNumber(
+                1,
+                crate::commands::MoveFocus::Follow,
+            )),
+            command(Operation::VirtualNumber(0)),
+            Event::Command {
+                command: Command::Layout(vec![crate::types::windowset::LayoutOp::Focus(0)]),
+            },
+            Event::MenuOpened { window_id: 0 },
+        ]);
+}
+
+#[test]
+fn row_south_appends_once_and_returns_to_existing_windows() {
+    let command = |op| Event::Command {
+        command: Command::Window(op),
+    };
+    TestHarness::new()
+        .with_windows(2)
+        .with_config(
+            crate::config::Config::try_from("default_workspaces=1\n[options]\n[bindings]\n")
+                .unwrap(),
+        )
+        .on_iteration(1, |world, _| {
+            assert_eq!(active_virtual_index(world), 1);
+            assert_eq!(world.query::<&LayoutStrip>().iter(world).count(), 2);
+        })
+        .on_iteration(3, |world, _| {
+            assert_eq!(active_virtual_index(world), 1);
+            assert_eq!(
+                world.query::<&LayoutStrip>().iter(world).count(),
+                2,
+                "empty bottom row must stop repeat growth"
+            );
+        })
+        .on_iteration(4, |world, _| {
+            assert_eq!(active_virtual_index(world), 0);
+            assert_focused!(world, 0);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            command(Operation::Row(Direction::South)),
+            command(Operation::Row(Direction::South)),
+            command(Operation::Row(Direction::South)),
+            command(Operation::Row(Direction::North)),
+        ]);
+}
+
+#[test]
+fn row_south_obeys_nine_row_cap() {
+    TestHarness::new()
+        .with_windows(1)
+        .with_config(
+            crate::config::Config::try_from("default_workspaces=9\n[options]\n[bindings]\n")
+                .unwrap(),
+        )
+        .on_iteration(2, |world, _| {
+            assert_eq!(active_virtual_index(world), 8);
+            assert_eq!(world.query::<&LayoutStrip>().iter(world).count(), 9);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::Window(Operation::VirtualMoveNumber(
+                    8,
+                    crate::commands::MoveFocus::Follow,
+                )),
+            },
+            Event::Command {
+                command: Command::Window(Operation::Row(Direction::South)),
+            },
+        ]);
+}

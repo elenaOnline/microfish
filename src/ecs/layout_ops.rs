@@ -13,6 +13,7 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, Without};
 use bevy::ecs::system::{Commands, Query};
 use bevy::platform::collections::HashSet;
+use bevy::prelude::World;
 use tracing::debug;
 
 use crate::commands::{Command, MoveFocus, Operation};
@@ -80,9 +81,32 @@ fn apply(
     match op {
         LayoutOp::Focus(_) => {
             let entity = entity.expect("Focus names a window");
-            commands.trigger(FocusWindow {
-                entity,
-                raise: true,
+            commands.queue(move |world: &mut World| {
+                let target = world
+                    .query::<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>()
+                    .iter(world)
+                    .find(|(_, strip, _)| strip.contains(entity))
+                    .map(|(row, _, active)| (row, active));
+                if let Some((row, false)) = target {
+                    if let Some(mut previous) =
+                        world.get_mut::<crate::ecs::workspace::PreviousStripPosition>(row)
+                    {
+                        previous.focus = Some(entity);
+                    }
+                    world.entity_mut(row).insert(ActiveWorkspaceMarker);
+                    // Retry the addressed focus after workspace restoration; never focus
+                    // a parked window before its row has been revealed.
+                    world.trigger(SendMessageTrigger(Event::Command {
+                        command: Command::Layout(vec![op]),
+                    }));
+                } else {
+                    world.trigger(FocusWindow {
+                        entity,
+                        raise: true,
+                        source: None,
+                    });
+                    world.commands().reshuffle_around(entity);
+                }
             });
         }
 
@@ -119,6 +143,7 @@ fn apply(
             };
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_insert(VirtualMoveMarker {
+                    whole_column: false,
                     target_virtual_index,
                     move_focus: if follow {
                         MoveFocus::Follow
@@ -224,7 +249,7 @@ fn apply(
             commands.resize_entity(entity, size);
         }
 
-        LayoutOp::Stack { onto, .. } => {
+        LayoutOp::Stack { onto, tabs, .. } => {
             let entity = entity.expect("Stack names a window");
             let Some((_, onto_entity)) = windows.find(onto) else {
                 debug!(target: "paneru::lua", "skipping {op:?}: window {onto} is gone");
@@ -237,7 +262,7 @@ fn apply(
                 debug!(target: "paneru::lua", "skipping {op:?}: the two windows share no strip");
                 return;
             };
-            if strip.stack(entity).is_err() {
+            if strip.stack_onto(entity, onto_entity, tabs).is_err() {
                 debug!(target: "paneru::lua", "skipping {op:?}: the layout refused the stack");
                 return;
             }

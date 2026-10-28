@@ -11,6 +11,7 @@ use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res, ResMut, Single};
 use bevy::ecs::world::World;
+use bevy::prelude::{Changed, Or};
 use bevy::time::common_conditions::on_timer;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -89,7 +90,12 @@ impl Plugin for WorkspaceEventsPlugin {
 
         app.add_systems(
             PreUpdate,
-            (switch_virtual_workspace_bind, move_virtual_workspace_bind),
+            (
+                navigate_row_bind,
+                switch_virtual_workspace_bind,
+                move_virtual_workspace_bind,
+            )
+                .after(super::view_history::observe),
         );
         app.add_systems(
             PreUpdate,
@@ -101,7 +107,11 @@ impl Plugin for WorkspaceEventsPlugin {
             Update,
             (
                 renumber_virtual_indexes,
-                reap_empty_virtual_workspaces.run_if(reap_workspaces),
+                reap_empty_virtual_workspaces
+                    .after(super::layout::configure_tab_presentation)
+                    .run_if(reap_workspaces)
+                    .run_if(rows_need_reaping)
+                    .run_if(not(resource_exists::<Initializing>)),
                 workspace_change_handler,
                 workspace_created_handler,
                 show_active_workspace,
@@ -120,6 +130,7 @@ impl Plugin for WorkspaceEventsPlugin {
 pub(super) struct VirtualMoveMarker {
     pub target_virtual_index: u32,
     pub move_focus: MoveFocus,
+    pub whole_column: bool,
 }
 
 #[derive(Component, Debug)]
@@ -676,11 +687,25 @@ fn handle_virtual_window_moves(
     let (display_entity, active_display, dock) = *active_display;
     let viewport = active_display.actual_display_bounds(dock, &config);
     for (window_entity, move_marker) in &moved_windows {
-        let moving_entities = workspaces
-            .get(source_entity)
-            .ok()
-            .and_then(|(_, strip, _, _, _)| strip.tab_group(window_entity))
-            .unwrap_or_else(|| vec![window_entity]);
+        let mut column = move_marker
+            .whole_column
+            .then(|| {
+                workspaces
+                    .get(source_entity)
+                    .ok()?
+                    .1
+                    .column_strip(window_entity)
+            })
+            .flatten();
+        let moving_entities = if let Some(column) = &column {
+            column.all_windows()
+        } else {
+            workspaces
+                .get(source_entity)
+                .ok()
+                .and_then(|(_, strip, _, _, _)| strip.tab_group(window_entity))
+                .unwrap_or_else(|| vec![window_entity])
+        };
         for moving_entity in &moving_entities {
             if let Ok(mut entity_commands) = commands.get_entity(*moving_entity) {
                 entity_commands.try_remove::<VirtualMoveMarker>();
@@ -711,8 +736,7 @@ fn handle_virtual_window_moves(
         // x. For an existing destination, work out the column slot nearest that x
         // and the scroll offset that lands it there; for a new strip the lone
         // window just sits at that x.
-        let moved_left = config
-            .insert_windows_mid_strip()
+        let moved_left = (!move_marker.whole_column && config.insert_windows_mid_strip())
             .then(|| windows.moving_frame(window_entity).map(|frame| frame.min.x))
             .flatten();
         let mid_placement = moved_left.and_then(|moved_left| {
@@ -769,7 +793,13 @@ fn handle_virtual_window_moves(
             if entity == target_entity {
                 match mid_placement {
                     Some((slot, _)) => strip.insert_tab_group_at(slot, &moving_entities),
-                    None => strip.append_tab_group(&moving_entities),
+                    None => {
+                        if let Some(column) = &mut column {
+                            strip.append_strip(column);
+                        } else {
+                            strip.append_tab_group(&moving_entities);
+                        }
+                    }
                 }
             } else {
                 for moving_entity in &moving_entities {
@@ -873,6 +903,84 @@ fn mid_strip_slot(
         }
     }
     (index, moved_left - chosen_layout_x)
+}
+
+/// Explicit growable row navigation. An empty boundary row is the growth stop,
+/// so repeating a held Up or Down key cannot allocate an unbounded sequence of rows.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn navigate_row_bind(
+    mut messages: MessageReader<Event>,
+    active_display: ActiveDisplay,
+    workspaces: Query<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    mut commands: Commands,
+) {
+    let Some(Operation::Row(direction)) =
+        filter_window_operations(&mut messages, |op| matches!(op, Operation::Row(_))).next()
+    else {
+        return;
+    };
+    let mut rows = workspaces
+        .iter()
+        .filter(|(_, strip, _)| strip.id() == active_display.active_strip().id())
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(_, strip, _)| strip.virtual_index);
+    let Some(current) = rows.iter().position(|(_, _, active)| *active) else {
+        return;
+    };
+    let next = match direction {
+        Direction::North if current > 0 => Some(current - 1),
+        Direction::South if current + 1 < rows.len() => Some(current + 1),
+        Direction::North
+            if rows[current].1.len() != 0
+                && rows
+                    .last()
+                    .is_some_and(|(_, strip, _)| strip.virtual_index < 8) =>
+        {
+            let entities = rows
+                .iter()
+                .map(|(entity, _, _)| *entity)
+                .collect::<Vec<_>>();
+            // Keep strip identities, group membership and saved viewport/focus
+            // components. Only their ordinal row labels change.
+            commands.queue(move |world: &mut bevy::ecs::world::World| {
+                for entity in entities {
+                    if let Some(mut strip) = world.get_mut::<LayoutStrip>(entity) {
+                        strip.virtual_index += 1;
+                    }
+                }
+            });
+            commands.spawn_layout_strip(
+                LayoutStrip::new(active_display.active_strip().id(), 0),
+                active_display.bounds().min,
+                active_display.entity(),
+                true,
+            );
+            None
+        }
+        Direction::South
+            if rows[current].1.len() != 0
+                && rows
+                    .last()
+                    .is_some_and(|(_, strip, _)| strip.virtual_index < 8) =>
+        {
+            commands.spawn_layout_strip(
+                LayoutStrip::new(
+                    active_display.active_strip().id(),
+                    rows[current].1.virtual_index + 1,
+                ),
+                active_display.bounds().min,
+                active_display.entity(),
+                true,
+            );
+            None
+        }
+        _ => None,
+    };
+    if let Some(next) = next
+        && let Ok(mut entity_commands) = commands.get_entity(rows[next].0)
+    {
+        entity_commands.try_insert(ActiveWorkspaceMarker);
+    }
 }
 
 /// Handles the keybinding for switching between virtual workspaces. Moving South
@@ -1048,7 +1156,10 @@ fn move_virtual_workspace_bind(
     let Some(operation) = filter_window_operations(&mut messages, |op| {
         matches!(
             op,
-            Operation::VirtualMove(_, _) | Operation::VirtualMoveNumber(_, _)
+            Operation::VirtualMove(_, _)
+                | Operation::VirtualMoveNumber(_, _)
+                | Operation::RowMove(_)
+                | Operation::RowColumnMove(_)
         )
     })
     .next() else {
@@ -1058,6 +1169,14 @@ fn move_virtual_workspace_bind(
     let Some((_, focused_entity)) = windows.focused() else {
         return;
     };
+
+    if matches!(
+        operation,
+        Operation::RowMove(_) | Operation::RowColumnMove(_)
+    ) && !active_display.active_strip().contains(focused_entity)
+    {
+        return;
+    }
 
     let mut rows = workspaces
         .iter()
@@ -1069,6 +1188,17 @@ fn move_virtual_workspace_bind(
     let current_index = rows.iter().position(|(_, _, active)| *active).unwrap_or(0);
 
     let (target_virtual_index, move_focus) = match operation {
+        Operation::RowMove(direction) | Operation::RowColumnMove(direction) => {
+            let target = match direction {
+                Direction::North => current_index.checked_sub(1),
+                Direction::South => (current_index + 1 < rows.len()).then_some(current_index + 1),
+                _ => None,
+            };
+            let Some(target) = target else {
+                return;
+            };
+            (rows[target].1.virtual_index, MoveFocus::Follow)
+        }
         Operation::VirtualMove(Direction::South | Direction::East, move_focus)
             if active_display.active_strip().len() > 1 =>
         {
@@ -1110,6 +1240,7 @@ fn move_virtual_workspace_bind(
         entity_commands.try_insert(VirtualMoveMarker {
             target_virtual_index,
             move_focus,
+            whole_column: matches!(operation, Operation::RowColumnMove(_)),
         });
     }
 
@@ -1348,12 +1479,18 @@ fn renumber_virtual_indexes(mut set: RenumberStrips) {
     }
 }
 
+type ReapChanges = Or<(Changed<LayoutStrip>, Added<ActiveWorkspaceMarker>)>;
+
+fn rows_need_reaping(dirty: Query<(), ReapChanges>) -> bool {
+    !dirty.is_empty()
+}
+
 fn reap_empty_virtual_workspaces(
-    changed: Single<Entity, Added<ActiveWorkspaceMarker>>,
+    active: Single<Entity, With<ActiveWorkspaceMarker>>,
     strips: Populated<(Entity, &LayoutStrip)>,
     mut commands: Commands,
 ) {
-    let changed_entity = *changed;
+    let changed_entity = *active;
     let Some(workspace_id) = strips.get(changed_entity).ok().map(|(_, strip)| strip.id()) else {
         return;
     };
@@ -1371,13 +1508,69 @@ fn reap_empty_virtual_workspaces(
     // Do not reap the strip that just became active. Switching/creating onto an
     // empty virtual workspace is intentional (e.g. South auto-create); only
     // empty rows left behind should be removed.
-    for (entity, strip) in rows {
-        if entity != changed_entity
-            && strip.virtual_index > 0
-            && strip.len() == 0
-            && let Ok(mut entity_commands) = commands.get_entity(entity)
-        {
-            entity_commands.try_despawn();
+    let remove = rows
+        .iter()
+        .filter(|(entity, strip)| *entity != changed_entity && strip.len() == 0)
+        .map(|(entity, _)| *entity)
+        .collect::<Vec<_>>();
+    let keep = rows
+        .iter()
+        .filter(|(entity, _)| !remove.contains(entity))
+        .map(|(entity, _)| *entity)
+        .collect::<Vec<_>>();
+    if remove.is_empty()
+        && rows
+            .iter()
+            .zip(0u32..)
+            .all(|((_, strip), index)| strip.virtual_index == index)
+    {
+        return;
+    }
+    // Despawn and renumber together. Exposing compacted survivors alongside
+    // not-yet-despawned empty rows lets duplicate-index repair reorder them.
+    commands.queue(move |world: &mut World| {
+        for entity in remove {
+            world.despawn(entity);
         }
+        for (entity, index) in keep.into_iter().zip(0u32..) {
+            if let Some(mut strip) = world.get_mut::<LayoutStrip>(entity) {
+                strip.virtual_index = index;
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod reaping_tests {
+    use super::*;
+    #[test]
+    fn reaping_does_not_expose_duplicate_indices_to_repair() {
+        let mut app = App::new();
+        app.add_systems(
+            Update,
+            (reap_empty_virtual_workspaces, renumber_virtual_indexes).chain_ignore_deferred(),
+        );
+        let a = app.world_mut().spawn_empty().id();
+        let b = app.world_mut().spawn_empty().id();
+        let empty = app.world_mut().spawn(LayoutStrip::new(1, 0)).id();
+        let mut first = LayoutStrip::new(1, 2);
+        first.append(a);
+        let first = app.world_mut().spawn(first).id();
+        let mut second = LayoutStrip::new(1, 3);
+        second.append(b);
+        let second = app.world_mut().spawn((second, ActiveWorkspaceMarker)).id();
+        app.update();
+        assert!(app.world().get_entity(empty).is_err());
+        assert_eq!(
+            app.world().get::<LayoutStrip>(first).unwrap().virtual_index,
+            0
+        );
+        assert_eq!(
+            app.world()
+                .get::<LayoutStrip>(second)
+                .unwrap()
+                .virtual_index,
+            1
+        );
     }
 }

@@ -508,11 +508,17 @@ impl InputHandler {
                 && let Some(events) = &self.events
             {
                 _ = events.send(Event::TouchpadUp);
+                self.finger_position = None;
                 return false;
             }
 
             let fingers = Touch::sample(&ns_event.allTouches());
             if !gesture_should_intercept(Some(configured_fingers), fingers.len()) {
+                if self.finger_position.take().is_some()
+                    && let Some(events) = &self.events
+                {
+                    _ = events.send(Event::TouchpadUp);
+                }
                 return false;
             }
             if fingers.iter().any(|finger| finger.began) {
@@ -546,7 +552,7 @@ impl InputHandler {
 
                     if x_sum.abs() >= y_sum.abs() {
                         // Horizontal dominant: use existing swipe path
-                        if x_deltas.iter().all(|p| p.abs() > SWIPE_THRESHOLD) {
+                        if horizontal_motion_is_meaningful(&x_deltas) {
                             _ = events.send(Event::Swipe {
                                 delta: x_sum,
                                 fingers: x_deltas.len(),
@@ -587,10 +593,18 @@ impl InputHandler {
     ///
     /// `true` if the key press was handled and should be intercepted, `false` otherwise.
     fn handle_keypress(&self, keycode: i64, eventflags: CGEventFlags) -> bool {
+        if crate::platform::recording::active() {
+            return false;
+        }
         let Some(events) = &self.events else {
             return false;
         };
 
+        if keycode == 53
+            || ((keycode == 48 || keycode == 50) && eventflags.contains(CGEventFlags::MaskCommand))
+        {
+            let _ = events.send(Event::CancelKeyboardFocusHandoff);
+        }
         let mask = get_modifiers(eventflags);
 
         // On a native fullscreen space, keybindings are still intercepted so
@@ -988,5 +1002,24 @@ mod tests {
         assert!(gesture_should_intercept(Some(3), 3));
         assert!(!gesture_should_intercept(Some(4), 3));
         assert!(gesture_should_intercept(Some(4), 4));
+    }
+}
+
+/// Preserve small coherent movements even if one finger barely moves. The
+/// per-event baseline is updated below, so dropping these loses travel forever.
+fn horizontal_motion_is_meaningful(deltas: &[f64]) -> bool {
+    !deltas.is_empty() && deltas.iter().sum::<f64>().abs() > 0.000_001
+}
+
+#[cfg(test)]
+mod slow_swipe_tests {
+    use super::horizontal_motion_is_meaningful;
+    #[test]
+    fn slow_or_uneven_fingers_still_move() {
+        assert!(horizontal_motion_is_meaningful(&[0.0002, 0.0003, 0.0]));
+        assert!(horizontal_motion_is_meaningful(&[-0.0002, -0.0003, 0.0]));
+        assert!(!horizontal_motion_is_meaningful(&[0.0, 0.0, 0.0]));
+        assert!(!horizontal_motion_is_meaningful(&[0.1, -0.1, 0.0]));
+        assert!(!horizontal_motion_is_meaningful(&[]));
     }
 }

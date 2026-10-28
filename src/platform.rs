@@ -1,3 +1,4 @@
+pub(crate) mod recording;
 use std::sync::OnceLock;
 
 use accessibility_sys::{AXError, AXObserverRef, AXUIElementRef};

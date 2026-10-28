@@ -693,17 +693,17 @@ fn active_strip_first_id(world: &mut World) -> i32 {
     entity_to_window_id(world, entity)
 }
 
-fn active_strip_last_id(world: &mut World) -> i32 {
-    let entity = {
-        let mut q = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
-        let strip = q.single(world).expect("a single active strip");
-        strip
-            .last()
-            .expect("strip should have a column")
-            .top()
-            .expect("column should have a top entity")
+fn active_strip_visible_id(world: &mut World) -> i32 {
+    let entities = {
+        let mut query = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+        query.single(world).unwrap().all_columns()
     };
-    entity_to_window_id(world, entity)
+    entities
+        .into_iter()
+        .filter_map(|entity| world.get::<Window>(entity))
+        .min_by_key(|window| window.frame().center().x.abs_diff(TEST_DISPLAY_WIDTH / 2))
+        .expect("a tiled recovery candidate")
+        .id()
 }
 
 // Strip the currently focused entity out of every LayoutStrip so the
@@ -915,7 +915,7 @@ fn test_focus_event_follows_the_window_the_app_says_is_focused() {
 }
 
 #[test]
-fn test_focus_west_from_outside_strip_enters_at_last_column() {
+fn test_focus_west_from_outside_strip_enters_visible_column() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
@@ -927,14 +927,19 @@ fn test_focus_west_from_outside_strip_enters_at_last_column() {
         .with_windows(3)
         .on_iteration(0, |world, _state| {
             remove_focused_from_all_strips(world);
+            assert_eq!(
+                active_strip_visible_id(world),
+                1,
+                "the nearest visible entry before navigation"
+            );
         })
         .on_iteration(1, |world, _state| {
             let focused = focused_window_id(world);
-            let expected = active_strip_last_id(world);
+            let expected = 1;
             assert_ne!(focused, 0);
             assert_eq!(
                 focused, expected,
-                "West from outside the strip enters at the last (rightmost) column",
+                "West from outside the strip recovers the visible column closest to center",
             );
         })
         .run(commands);
@@ -3396,5 +3401,81 @@ fn test_virtual_move_number_recreates_missing_baseline_row() {
         recreated,
         vec![true],
         "the moved window should land on a single recreated row 0"
+    );
+}
+
+#[test]
+fn stationary_touch_preserves_deliberate_centering() {
+    use crate::ecs::{ManualStripOffset, Scrolling};
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(2, |world, _| {
+            assert!(world.query::<&Scrolling>().iter(world).next().is_none());
+            assert!(
+                world
+                    .query::<&ManualStripOffset>()
+                    .iter(world)
+                    .next()
+                    .is_some()
+            );
+        })
+        .on_iteration(3, |world, _| {
+            assert!(world.query::<&Scrolling>().iter(world).next().is_none());
+            assert!(
+                world
+                    .query::<&ManualStripOffset>()
+                    .iter(world)
+                    .next()
+                    .is_some()
+            );
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::Window(Operation::Center),
+            },
+            Event::TouchpadDown,
+            Event::TouchpadUp,
+        ]);
+}
+
+#[test]
+fn hidden_row_rejects_app_driven_move_back_onscreen() {
+    use bevy::ecs::system::RunSystemOnce as _;
+    let mut h = TestHarness::new().with_windows(2);
+    h.app.update();
+    let state = h.mock_state.clone();
+    let world = h.world();
+    let entity = find_window_entity(0, world);
+    let strip = world
+        .query::<(Entity, &LayoutStrip)>()
+        .iter(world)
+        .find(|(_, strip)| strip.all_windows().contains(&entity))
+        .unwrap()
+        .0;
+    world.entity_mut(strip).remove::<ActiveWorkspaceMarker>();
+    world.entity_mut(entity).remove::<RepositionMarker>();
+    let parked = Origin::new(1500, 970);
+    world.get_mut::<Position>(entity).unwrap().0 = parked;
+    world.get_mut::<Window>(entity).unwrap().reposition(parked);
+    state.os_move_window(0, Origin::new(16, 50));
+    world.write_message(Event::WindowMoved { window_id: 0 });
+    world
+        .run_system_once(crate::ecs::systems::window_moved_update_frame)
+        .unwrap();
+    assert_eq!(
+        world.get::<Position>(entity).unwrap().0,
+        parked,
+        "a hidden row must not adopt an app's onscreen correction"
+    );
+    assert_eq!(
+        world
+            .get_mut::<Window>(entity)
+            .unwrap()
+            .update_frame()
+            .unwrap()
+            .min,
+        parked,
+        "the actual window must be parked again"
     );
 }

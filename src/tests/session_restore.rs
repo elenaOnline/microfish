@@ -7,7 +7,8 @@ use crate::commands::Command;
 use crate::config::{Config, MainOptions, WindowParams};
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::state::{
-    PaneruState, SavedColumn, SavedDisplay, SavedRect, SavedStrip, SavedWindow, SavedWorkspace,
+    PaneruState, SavedColumn, SavedDisplay, SavedRect, SavedStackItem, SavedStrip, SavedWindow,
+    SavedWorkspace,
 };
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{SpawnWindowTrigger, Unmanaged};
@@ -42,6 +43,7 @@ fn test_startup_restore_rebuilds_virtual_workspace_layout() {
             display_id: Some(TEST_DISPLAY_ID),
             active_virtual_index: Some(1),
             strips: vec![SavedStrip {
+                side_tabs: false,
                 virtual_index: 1,
                 columns: vec![
                     SavedColumn::Single(saved_window(0)),
@@ -94,6 +96,7 @@ fn test_startup_restore_keeps_unmatched_windows_on_the_restored_row() {
             display_id: Some(TEST_DISPLAY_ID),
             active_virtual_index: Some(0),
             strips: vec![SavedStrip {
+                side_tabs: false,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Single(saved_window(0))],
             }],
@@ -144,6 +147,7 @@ fn test_startup_restore_keeps_fullscreen_separate_from_unmatched_windows() {
             display_id: Some(TEST_DISPLAY_ID),
             active_virtual_index: Some(0),
             strips: vec![SavedStrip {
+                side_tabs: false,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Fullscreen(saved_window(0))],
             }],
@@ -201,6 +205,7 @@ fn test_startup_restore_prefers_existing_workspace_parent_before_saved_or_active
             display_id: Some(EXT_DISPLAY_ID),
             active_virtual_index: Some(0),
             strips: vec![SavedStrip {
+                side_tabs: false,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Single(saved_window(200))],
             }],
@@ -273,6 +278,7 @@ fn test_startup_restore_preserves_saved_display_when_present() {
             display_id: Some(EXT_DISPLAY_ID),
             active_virtual_index: Some(0),
             strips: vec![SavedStrip {
+                side_tabs: false,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Single(saved_window(300))],
             }],
@@ -343,6 +349,7 @@ fn test_startup_restore_keeps_current_native_workspace_active_across_multiple_wo
                 display_id: Some(TEST_DISPLAY_ID),
                 active_virtual_index: Some(0),
                 strips: vec![SavedStrip {
+                    side_tabs: false,
                     virtual_index: 0,
                     columns: vec![SavedColumn::Single(saved_window(100))],
                 }],
@@ -352,6 +359,7 @@ fn test_startup_restore_keeps_current_native_workspace_active_across_multiple_wo
                 display_id: Some(EXT_DISPLAY_ID),
                 active_virtual_index: Some(0),
                 strips: vec![SavedStrip {
+                    side_tabs: false,
                     virtual_index: 0,
                     columns: vec![SavedColumn::Single(saved_window(300))],
                 }],
@@ -412,6 +420,7 @@ fn test_restore_resource_is_removed_after_grace_period() {
         .app
         .world_mut()
         .insert_resource(state_with_strips(vec![SavedStrip {
+            side_tabs: false,
             virtual_index: 0,
             columns: vec![SavedColumn::Single(saved_window(0))],
         }]));
@@ -456,6 +465,7 @@ enabled = false
         .app
         .world_mut()
         .insert_resource(state_with_strips(vec![SavedStrip {
+            side_tabs: false,
             virtual_index: 1,
             columns: vec![SavedColumn::Single(saved_window(0))],
         }]));
@@ -490,6 +500,7 @@ enabled = false
 fn test_startup_restore_uses_first_restored_row_when_active_metadata_is_missing() {
     let mut harness = TestHarness::new().with_windows(1);
     let mut state = state_with_strips(vec![SavedStrip {
+        side_tabs: false,
         virtual_index: 2,
         columns: vec![SavedColumn::Single(saved_window(0))],
     }]);
@@ -522,6 +533,7 @@ fn test_startup_restore_overrides_floating_config_for_matched_window() {
         .app
         .world_mut()
         .insert_resource(state_with_strips(vec![SavedStrip {
+            side_tabs: false,
             virtual_index: 0,
             columns: vec![SavedColumn::Single(saved_window(0))],
         }]));
@@ -545,6 +557,7 @@ fn test_late_startup_window_restores_during_grace_period() {
         .app
         .world_mut()
         .insert_resource(state_with_strips(vec![SavedStrip {
+            side_tabs: false,
             virtual_index: 1,
             columns: vec![SavedColumn::Single(saved_window(99))],
         }]));
@@ -608,10 +621,12 @@ fn test_startup_restore_keeps_one_selected_row_and_hides_inactive_rows() {
             active_virtual_index: Some(1),
             strips: vec![
                 SavedStrip {
+                    side_tabs: false,
                     virtual_index: 0,
                     columns: vec![SavedColumn::Single(saved_window(0))],
                 },
                 SavedStrip {
+                    side_tabs: false,
                     virtual_index: 1,
                     columns: vec![SavedColumn::Single(saved_window(1))],
                 },
@@ -670,6 +685,7 @@ fn test_startup_restore_keeps_emptied_baseline_row() {
             display_id: Some(TEST_DISPLAY_ID),
             active_virtual_index: Some(1),
             strips: vec![SavedStrip {
+                side_tabs: false,
                 virtual_index: 1,
                 columns: vec![
                     SavedColumn::Single(saved_window(0)),
@@ -762,4 +778,117 @@ fn saved_window(window_id: i32) -> SavedWindow {
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
     }
+}
+
+#[test]
+fn restore_preserves_intentional_empty_rows_and_groups() {
+    let state = state_with_strips(vec![
+        SavedStrip {
+            side_tabs: false,
+            virtual_index: 0,
+            columns: vec![],
+        },
+        SavedStrip {
+            side_tabs: false,
+            virtual_index: 1,
+            columns: vec![SavedColumn::TabbedStack(vec![
+                SavedStackItem::Single(saved_window(0)),
+                SavedStackItem::Single(saved_window(1)),
+            ])],
+        },
+        SavedStrip {
+            side_tabs: false,
+            virtual_index: 2,
+            columns: vec![],
+        },
+    ]);
+    TestHarness::new()
+        .with_windows(2)
+        .with_state(state)
+        .on_iteration(0, |world, _| {
+            let mut strips =
+                world.query::<(&LayoutStrip, Has<crate::ecs::ActiveWorkspaceMarker>)>();
+            let mut rows = strips
+                .iter(world)
+                .map(|(s, active)| (s.virtual_index, s.all_windows().len(), active))
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            // Native startup focus may select the populated row; the saved
+            // empty capacity and group membership must still survive.
+            assert_eq!(
+                rows.iter()
+                    .map(|(index, count, _)| (*index, *count))
+                    .collect::<Vec<_>>(),
+                vec![(0, 0), (1, 2), (2, 0)]
+            );
+            let selected = find_window_entity(0, world);
+            assert!(
+                world
+                    .query::<&LayoutStrip>()
+                    .iter(world)
+                    .find(|s| s.virtual_index == 1)
+                    .unwrap()
+                    .is_tabbed_display(selected)
+            );
+        })
+        .run(vec![Event::MenuOpened { window_id: 0 }]);
+}
+
+#[test]
+fn restore_preserves_empty_row_capacity_without_matching_windows() {
+    let state = state_with_strips(
+        (0..3)
+            .map(|virtual_index| SavedStrip {
+                side_tabs: false,
+                virtual_index,
+                columns: vec![],
+            })
+            .collect(),
+    );
+    TestHarness::new()
+        .with_windows(0)
+        .with_state(state)
+        .on_iteration(0, |world, _| {
+            assert_eq!(world.query::<&LayoutStrip>().iter(world).count(), 3);
+        })
+        .run(vec![Event::MenuOpened { window_id: 0 }]);
+}
+
+#[test]
+fn side_presentation_restore_does_not_reserve_twice() {
+    let state = state_with_strips(vec![SavedStrip {
+        side_tabs: true,
+        virtual_index: 0,
+        columns: vec![SavedColumn::TabbedStack(vec![
+            SavedStackItem::Single(saved_window(0)),
+            SavedStackItem::Single(saved_window(1)),
+        ])],
+    }]);
+    let config: Config = (
+        MainOptions {
+            tab_style: Some("side".into()),
+            tab_height: Some(34),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .with_state(state)
+        .on_iteration(0, |world, _| {
+            let entity = find_window_entity(0, world);
+            assert_eq!(
+                world.get::<crate::ecs::Bounds>(entity).unwrap().0.x,
+                TEST_WINDOW_WIDTH
+            );
+            assert!(
+                world
+                    .query::<&LayoutStrip>()
+                    .iter(world)
+                    .any(LayoutStrip::has_side_tabs)
+            );
+        })
+        .run(vec![Event::MenuOpened { window_id: 0 }]);
 }

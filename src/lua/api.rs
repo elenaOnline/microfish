@@ -638,6 +638,9 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     // Exhaustive destructure: adding any field to `MainOptions` triggers a
     // compile error until it is explicitly mapped onto `options` below.
     let MainOptions {
+        tab_style: _,
+        tab_height: _,
+        drag_reorder: _,
         focus_follows_mouse: _,
         mouse_follows_focus: _,
         horizontal_mouse_warp: _,
@@ -675,6 +678,12 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         create_virtual_workspace_automatically: _,
     } = &raw_opts;
 
+    options.set(
+        "tab_style",
+        raw_opts.tab_style.as_deref().unwrap_or("folder"),
+    )?;
+    options.set("tab_height", config.tab_height().unwrap_or(28))?;
+    options.set("drag_reorder", config.drag_reorder())?;
     options.set("focus_follows_mouse", config.focus_follows_mouse())?;
     options.set("mouse_follows_focus", config.mouse_follows_focus())?;
     options.set("horizontal_mouse_warp", config.horizontal_mouse_warp())?;

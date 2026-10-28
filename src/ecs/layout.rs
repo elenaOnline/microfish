@@ -18,7 +18,7 @@ use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
     ManualStripOffset, Position, RepositionMarker, ReshuffleAroundMarker, Scrolling,
-    SpawnCommandsExt,
+    SpawnCommandsExt, Unmanaged,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -79,10 +79,13 @@ type ResizedWindows<'w, 's> = Populated<
     'w,
     's,
     Entity,
-    Or<(
-        (Changed<Bounds>, With<Window>),
-        (Changed<Position>, With<Window>),
-    )>,
+    (
+        Or<(
+            (Changed<Bounds>, With<Window>),
+            (Changed<Position>, With<Window>),
+        )>,
+        Without<super::drag::NativeColumnDrag>,
+    ),
 >;
 
 /// Window frames as the layout writes them: the current origin, and the size and
@@ -110,7 +113,12 @@ type RepositionedWindows<'w, 's> = Populated<
         &'static mut Position,
         &'static mut Bounds,
     ),
-    (Changed<LayoutPosition>, With<Window>, Without<LayoutStrip>),
+    (
+        Changed<LayoutPosition>,
+        With<Window>,
+        Without<LayoutStrip>,
+        Without<super::drag::NativeColumnDrag>,
+    ),
 >;
 
 /// Clamp a window origin to the range where it still touches both viewport
@@ -168,6 +176,12 @@ pub(crate) fn origin_exposing(
     clamp_origin_to_viewport(layout + origin, size, viewport) - layout
 }
 
+// Keep correction markers queued while fingers drive the strip and while
+// release snapping settles it. Positioning still runs to render the gesture.
+fn no_active_scroll(scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>) -> bool {
+    !super::scroll::edge_snap_enabled() || scrolling.is_empty()
+}
+
 impl Plugin for LayoutEventsPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
@@ -176,10 +190,12 @@ impl Plugin for LayoutEventsPlugin {
                 // Wait for finish_setup before tiling: until then every window
                 // sits in the active strip regardless of its real display.
                 (
+                    configure_tab_presentation,
+                    constrain_tabbed_window_frames.run_if(no_active_scroll),
                     layout_sizes_changed,
                     layout_strip_changed,
-                    reshuffle_layout_strip,
-                    ensure_visible_in_strip,
+                    reshuffle_layout_strip.run_if(no_active_scroll),
+                    ensure_visible_in_strip.run_if(no_active_scroll),
                     position_layout_strips,
                     position_layout_windows,
                 )
@@ -369,7 +385,7 @@ impl Iterator for ColumnWindowIter<'_> {
 
 /// `LayoutStrip` manages a horizontal strip of `Panel`s, where each panel can contain a single window or a stack of windows.
 /// It provides methods for manipulating the arrangement and access to windows within the pane.
-#[derive(Component, Debug, Default)]
+#[derive(Component, Clone, Debug, Default)]
 pub struct LayoutStrip {
     id: WorkspaceId,
     pub virtual_index: u32,
@@ -383,15 +399,38 @@ pub struct LayoutStrip {
     /// and of `LayoutStrip::tabbed()`, which callers like
     /// `apply_window_positions`/`give_away_focus` already key off for that unrelated feature.
     tabbed_stacks: EntityHashSet,
+    selected_tabs: EntityHashSet,
+    side_tabs: bool,
+    side_reserved: EntityHashSet,
+    tab_height: Option<i32>,
 }
 
 impl LayoutStrip {
+    pub fn has_side_tabs(&self) -> bool {
+        self.side_tabs
+    }
+    pub fn restore_side_tabs(&mut self, side: bool) {
+        self.side_tabs = side;
+        self.side_reserved = if side {
+            self.all_windows()
+                .into_iter()
+                .filter(|e| self.is_tabbed_display(*e))
+                .collect()
+        } else {
+            EntityHashSet::default()
+        };
+    }
+
     pub fn new(id: WorkspaceId, virtual_index: u32) -> Self {
         Self {
             id,
             virtual_index,
             columns: VecDeque::new(),
             tabbed_stacks: EntityHashSet::default(),
+            selected_tabs: EntityHashSet::default(),
+            side_tabs: false,
+            side_reserved: EntityHashSet::default(),
+            tab_height: None,
         }
     }
 
@@ -403,6 +442,10 @@ impl LayoutStrip {
             virtual_index: 0,
             columns,
             tabbed_stacks: EntityHashSet::default(),
+            selected_tabs: EntityHashSet::default(),
+            side_tabs: false,
+            side_reserved: EntityHashSet::default(),
+            tab_height: None,
         }
     }
 
@@ -468,7 +511,63 @@ impl LayoutStrip {
     }
 
     pub(crate) fn append_strip(&mut self, other: &mut Self) {
+        let transferred = other
+            .columns
+            .iter()
+            .flat_map(Column::window_iter)
+            .collect::<EntityHashSet>();
+        self.side_reserved.extend(
+            other
+                .side_reserved
+                .iter()
+                .copied()
+                .filter(|entity| transferred.contains(entity)),
+        );
+        other
+            .side_reserved
+            .retain(|entity| !transferred.contains(entity));
+        self.tabbed_stacks.extend(
+            other
+                .tabbed_stacks
+                .iter()
+                .copied()
+                .filter(|entity| transferred.contains(entity)),
+        );
+        self.selected_tabs.extend(
+            other
+                .selected_tabs
+                .iter()
+                .copied()
+                .filter(|entity| transferred.contains(entity)),
+        );
+        other
+            .tabbed_stacks
+            .retain(|entity| !transferred.contains(entity));
+        other
+            .selected_tabs
+            .retain(|entity| !transferred.contains(entity));
         self.columns.append(&mut other.columns);
+    }
+
+    /// Copies one complete column and its display state into a detached strip.
+    pub(crate) fn column_strip(&self, entity: Entity) -> Option<Self> {
+        let column = self.get(self.index_of(entity).ok()?).ok()?;
+        let members: EntityHashSet = column.window_iter().collect();
+        let mut result = Self::new(self.id(), self.virtual_index);
+        result.columns.push_back(column);
+        result.tabbed_stacks.extend(
+            self.tabbed_stacks
+                .iter()
+                .copied()
+                .filter(|e| members.contains(e)),
+        );
+        result.selected_tabs.extend(
+            self.selected_tabs
+                .iter()
+                .copied()
+                .filter(|e| members.contains(e)),
+        );
+        Some(result)
     }
 
     pub fn append_tab_group(&mut self, entities: &[Entity]) {
@@ -554,6 +653,7 @@ impl LayoutStrip {
     ///
     /// * `entity` - Entity of the window to remove.
     pub fn remove(&mut self, entity: Entity) {
+        self.selected_tabs.remove(&entity);
         let removed = self
             .index_of(entity)
             .ok()
@@ -566,6 +666,7 @@ impl LayoutStrip {
                 }
                 Column::Stack(mut stack) => {
                     self.tabbed_stacks.remove(&entity);
+                    self.selected_tabs.remove(&entity);
                     for item in &mut stack {
                         match item {
                             StackItem::Single(_) => {}
@@ -628,6 +729,103 @@ impl LayoutStrip {
             )))
     }
 
+    /// Reinsert a whole column without altering any stack/tab metadata.
+    pub(crate) fn move_column(&mut self, entity: Entity, slot: usize) -> Result<()> {
+        let index = self.index_of(entity)?;
+        if let Some(column) = self.columns.remove(index) {
+            self.columns.insert(slot.min(self.columns.len()), column);
+        }
+        Ok(())
+    }
+
+    /// Apply an addressed helper drop. Validation completes before mutation;
+    /// native OS tab siblings always move as one `StackItem`.
+    pub(crate) fn apply_drop(
+        &mut self,
+        source: Entity,
+        target: Entity,
+        kind: crate::types::wire::DropKind,
+        side: crate::types::wire::DropSide,
+    ) -> std::result::Result<(), String> {
+        use crate::types::wire::{DropKind, DropSide};
+        let source_index = self.index_of(source).map_err(|e| e.to_string())?;
+        let target_index = self.index_of(target).map_err(|e| e.to_string())?;
+        if matches!(self.columns[source_index], Column::Fullscren(_))
+            || matches!(self.columns[target_index], Column::Fullscren(_))
+        {
+            return Err("fullscreen columns cannot be rearranged".into());
+        }
+        let after = usize::from(side == DropSide::After);
+        if kind == DropKind::Column {
+            if source_index != target_index {
+                let slot = target_index - usize::from(source_index < target_index) + after;
+                self.move_column(source, slot).map_err(|e| e.to_string())?;
+            }
+            return Ok(());
+        }
+        let group = self.tab_group(source).unwrap_or_else(|| vec![source]);
+        if kind == DropKind::Tab && group.contains(&target) {
+            return Ok(());
+        }
+        if kind == DropKind::Tab
+            && matches!(self.columns[target_index], Column::Stack(_))
+            && !self.is_tabbed_display(target)
+        {
+            return Err("drop target is a split stack, not a tab group".into());
+        }
+        let target = if kind == DropKind::Detach && group.contains(&target) {
+            // A self-target means beside the source column's surviving tabs.
+            let Some(remainder) = self.columns[source_index]
+                .window_iter()
+                .find(|member| !group.contains(member))
+            else {
+                return Ok(());
+            };
+            remainder
+        } else {
+            target
+        };
+        if kind == DropKind::Detach && !self.is_tabbed_display(source) {
+            return Err("only a displayed tab can be detached".into());
+        }
+        for member in &group {
+            self.remove(*member);
+        }
+        let index = self
+            .index_of(target)
+            .expect("validated target survives source extraction");
+        let item = if group.len() == 1 {
+            StackItem::Single(source)
+        } else {
+            StackItem::Tabs(group.clone())
+        };
+        if kind == DropKind::Detach {
+            let column = match item {
+                StackItem::Single(id) => Column::Single(id),
+                StackItem::Tabs(ids) => Column::Tabs(ids),
+            };
+            self.columns.insert(index + after, column);
+        } else {
+            let column = self.columns.remove(index).expect("validated target column");
+            let mut items = match column {
+                Column::Single(id) => vec![StackItem::Single(id)],
+                Column::Tabs(ids) => vec![StackItem::Tabs(ids)],
+                Column::Stack(items) => items,
+                Column::Fullscren(_) => unreachable!("fullscreen rejected before mutation"),
+            };
+            let position = items
+                .iter()
+                .position(|item| item.contains(target))
+                .expect("validated target item survives");
+            items.insert(position + after, item);
+            self.tabbed_stacks
+                .extend(items.iter().flat_map(StackItem::window_iter));
+            self.columns.insert(index, Column::Stack(items));
+            self.remember_selected_tab(source);
+        }
+        Ok(())
+    }
+
     /// Swaps the positions of two panels within the pane.
     ///
     /// # Arguments
@@ -671,13 +869,33 @@ impl LayoutStrip {
         )))
     }
 
+    /// Keep presentation order stable while remembering the visible synthetic tab.
+    pub fn remember_selected_tab(&mut self, entity: Entity) {
+        if !self.is_tabbed_display(entity) {
+            return;
+        }
+        let Ok(index) = self.index_of(entity) else {
+            return;
+        };
+        let members: Vec<_> = self.columns[index].window_iter().collect();
+        self.selected_tabs
+            .retain(|selected| !members.contains(selected));
+        self.selected_tabs.insert(entity);
+    }
+
+    pub fn selected_tab(&self, column: &Column) -> Option<Entity> {
+        column
+            .window_iter()
+            .find(|entity| self.is_tabbed_display(*entity) && self.selected_tabs.contains(entity))
+    }
+
     pub fn right_neighbour(&self, entity: Entity) -> Option<Entity> {
         let index = self.index_of(entity).ok()?;
         let stack_pos = self.columns.get(index)?.position_of(entity)?;
         (index < self.columns.len())
             .then_some(index + 1)
             .and_then(|i| self.columns.get(i))
-            .and_then(|col| col.at_or_last(stack_pos))
+            .and_then(|col| self.selected_tab(col).or_else(|| col.at_or_last(stack_pos)))
     }
 
     pub fn left_neighbour(&self, entity: Entity) -> Option<Entity> {
@@ -686,7 +904,7 @@ impl LayoutStrip {
         (index > 0)
             .then(|| index - 1)
             .and_then(|i| self.columns.get(i))
-            .and_then(|col| col.at_or_last(stack_pos))
+            .and_then(|col| self.selected_tab(col).or_else(|| col.at_or_last(stack_pos)))
     }
 
     /// Stacks the window with the given ID onto the panel to its left.
@@ -742,6 +960,50 @@ impl LayoutStrip {
         };
 
         self.columns.insert(index - 1, new_column);
+        Ok(())
+    }
+
+    /// Moves a selected item (or inseparable native tab group) into the
+    /// explicitly named destination, independent of horizontal direction.
+    pub(crate) fn stack_onto(&mut self, entity: Entity, onto: Entity, tabs: bool) -> Result<()> {
+        let source_index = self.index_of(entity)?;
+        let target_index = self.index_of(onto)?;
+        if matches!(self.get(source_index)?, Column::Fullscren(_))
+            || matches!(self.get(target_index)?, Column::Fullscren(_))
+        {
+            return Ok(());
+        }
+        let group = self.tab_group(entity).unwrap_or_else(|| vec![entity]);
+        if group.contains(&onto) {
+            return Ok(());
+        }
+        let tabbed = tabs || self.is_tabbed_display(onto);
+        for member in &group {
+            self.remove(*member);
+        }
+        let index = self.index_of(onto)?;
+        let target = self
+            .columns
+            .remove(index)
+            .ok_or_else(|| Error::NotFound(format!("Entity {onto} has no column")))?;
+        let mut items = match target {
+            Column::Single(id) | Column::Fullscren(id) => vec![StackItem::Single(id)],
+            Column::Tabs(group) => vec![StackItem::Tabs(group)],
+            Column::Stack(items) => items,
+        };
+        items.push(if group.len() == 1 {
+            StackItem::Single(group[0])
+        } else {
+            StackItem::Tabs(group)
+        });
+        if tabbed {
+            self.tabbed_stacks
+                .extend(items.iter().flat_map(StackItem::window_iter));
+        }
+        self.columns.insert(index, Column::Stack(items));
+        if tabbed {
+            self.remember_selected_tab(entity);
+        }
         Ok(())
     }
 
@@ -847,6 +1109,45 @@ impl LayoutStrip {
     where
         W: Fn(Entity) -> Option<IRect>,
     {
+        self.relative_positions_with_tab_bar_height(
+            layout_strip_height,
+            get_window_frame,
+            Self::configured_tab_bar_height(),
+        )
+    }
+
+    pub fn configured_tab_bar_height() -> i32 {
+        std::env::var("PANERU_TRIAL_TAB_BAR_HEIGHT")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(0)
+            .max(0)
+    }
+
+    /// Reserve only Paneru's synthetic tabbed-stack header, never native tabs.
+    pub fn tab_bar_height(&self, column: &Column, height: i32, requested: i32) -> i32 {
+        if matches!(column, Column::Stack(_))
+            && column
+                .window_iter()
+                .any(|entity| self.is_tabbed_display(entity))
+        {
+            self.tab_height
+                .unwrap_or(requested)
+                .clamp(0, height.saturating_sub(1).max(0))
+        } else {
+            0
+        }
+    }
+
+    fn relative_positions_with_tab_bar_height<W>(
+        &self,
+        layout_strip_height: i32,
+        get_window_frame: &W,
+        requested_tab_bar_height: i32,
+    ) -> impl Iterator<Item = (Entity, IRect)>
+    where
+        W: Fn(Entity) -> Option<IRect>,
+    {
         self.column_positions(get_window_frame)
             .filter_map(move |(column, position)| {
                 let items: Vec<StackItem> = match column {
@@ -869,8 +1170,13 @@ impl LayoutStrip {
                         .flat_map(StackItem::window_iter)
                         .any(|e| self.tabbed_stacks.contains(&e));
 
+                let tab_bar_height = if self.side_tabs {
+                    0
+                } else {
+                    self.tab_bar_height(column, layout_strip_height, requested_tab_bar_height)
+                };
                 let heights = if is_tabbed_column {
-                    vec![layout_strip_height; items.len()]
+                    vec![(layout_strip_height - tab_bar_height).max(0); items.len()]
                 } else {
                     let current_heights = items
                         .iter()
@@ -891,14 +1197,19 @@ impl LayoutStrip {
                     .and_then(&get_window_frame)
                     .map(|frame| frame.width())?;
 
-                let mut next_y = 0;
+                let mut next_y = tab_bar_height;
                 let frames = items
                     .into_iter()
                     .zip(heights)
                     .filter_map(|(item, height)| {
                         let entity = item.top()?;
                         let mut frame = get_window_frame(entity)?;
-                        frame.min.x = position;
+                        frame.min.x = position
+                            + if is_tabbed_column && self.side_tabs {
+                                40
+                            } else {
+                                0
+                            };
                         frame.max.x = frame.min.x + column_width;
 
                         frame.min.y = next_y;
@@ -932,7 +1243,12 @@ impl LayoutStrip {
 
             width.map(|width| {
                 let temp = left_edge;
-                left_edge += width;
+                left_edge += width
+                    + if self.side_tabs && column.window_iter().any(|e| self.is_tabbed_display(e)) {
+                        40
+                    } else {
+                        0
+                    };
                 (column, temp)
             })
         })
@@ -1013,6 +1329,9 @@ impl LayoutStrip {
             for member in members {
                 self.tabbed_stacks.remove(&member);
             }
+        }
+        if now_tabbed {
+            self.remember_selected_tab(entity);
         }
         Some(now_tabbed)
     }
@@ -1117,6 +1436,109 @@ fn binpack_heights(heights: &[i32], min_height: i32, total_height: i32) -> Optio
     Some(output)
 }
 
+// User-driven top-edge resize/move updates Position independently of LayoutPosition.
+// Invalidate placement even if the logical slot itself is unchanged, so the
+// reserved tab header is restored during the drag rather than on mouse release.
+#[allow(clippy::type_complexity)]
+fn constrain_tabbed_window_frames(
+    mut changed: Populated<
+        (Entity, &mut Position, &mut Bounds, &mut LayoutPosition),
+        (
+            With<Window>,
+            Without<Unmanaged>,
+            Without<LayoutStrip>,
+            Without<super::drag::NativeColumnDrag>,
+            Or<(Changed<Position>, Changed<Bounds>)>,
+        ),
+    >,
+    strips: Query<
+        (&LayoutStrip, &ChildOf, &Position),
+        (With<ActiveWorkspaceMarker>, Without<Window>),
+    >,
+    displays: DisplayViewports,
+    config: Res<Config>,
+) {
+    let requested = LayoutStrip::configured_tab_bar_height();
+    if requested == 0 && config.tab_height().is_none() {
+        return;
+    }
+    for (entity, mut position, mut bounds, mut layout) in &mut changed {
+        let Some((strip, child, strip_position)) = strips
+            .iter()
+            .find(|(strip, _, _)| strip.is_tabbed_display(entity))
+        else {
+            continue;
+        };
+        let Ok((display, dock)) = displays.get(child.parent()) else {
+            continue;
+        };
+        let viewport = display.actual_display_bounds(dock, &config);
+        if strip_position.0.y >= viewport.max.y - PARKED_STRIP_SLIVER {
+            continue;
+        }
+        let Ok(column) = strip.index_of(entity).and_then(|index| strip.get(index)) else {
+            continue;
+        };
+        let header = if strip.side_tabs {
+            0
+        } else {
+            strip.tab_bar_height(&column, viewport.height(), requested)
+        };
+        let (y, height) = tabbed_vertical_frame(position.0.y, bounds.0.y, viewport, header);
+        if position.0.y != y || bounds.0.y != height {
+            position.0.y = y;
+            bounds.0.y = height;
+            layout.set_changed();
+        }
+    }
+}
+
+// Reserve the side rail once per member, including groups created at runtime.
+pub(super) fn configure_tab_presentation(
+    config: Res<Config>,
+    mut strips: Query<&mut LayoutStrip>,
+    mut windows: Query<&mut Bounds, With<Window>>,
+    mut commands: Commands,
+) {
+    for mut strip in &mut strips {
+        let side = config.side_tabs();
+        let height = config.tab_height();
+        let desired: EntityHashSet = if side {
+            strip
+                .all_windows()
+                .into_iter()
+                .filter(|e| strip.is_tabbed_display(*e))
+                .collect()
+        } else {
+            EntityHashSet::default()
+        };
+        if strip.side_tabs == side && strip.tab_height == height && strip.side_reserved == desired {
+            continue;
+        }
+        for entity in desired.symmetric_difference(&strip.side_reserved) {
+            // A removed member may now belong to a different strip: its bounds
+            // still need the old reservation released before that strip reserves it.
+            if let Ok(mut bounds) = windows.get_mut(*entity) {
+                let delta = if desired.contains(entity) { -40 } else { 40 };
+                bounds.0.x = (bounds.0.x + delta).max(80);
+                commands.resize_entity(*entity, bounds.0);
+            }
+        }
+        strip.side_reserved = desired;
+        strip.side_tabs = side;
+        strip.tab_height = height;
+    }
+}
+
+fn tabbed_vertical_frame(y: i32, height: i32, viewport: IRect, header: i32) -> (i32, i32) {
+    let top = viewport.min.y.saturating_add(header);
+    let height = height.clamp(0, viewport.max.y.saturating_sub(top).max(0));
+    (
+        y.clamp(top, viewport.max.y.saturating_sub(height).max(top)),
+        height,
+    )
+}
+
 /// Watches for size changes to windows and if they are changed, signals to the layout strip.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn layout_sizes_changed(changed_sizes: ResizedWindows, workspaces: Query<&mut LayoutStrip>) {
@@ -1198,11 +1620,23 @@ fn layout_strip_changed(
     }
 }
 
+type ReshuffleCandidates<'w, 's> = Query<
+    'w,
+    's,
+    (Entity, &'static LayoutPosition),
+    (
+        With<ReshuffleAroundMarker>,
+        Without<super::drag::NativeColumnDrag>,
+    ),
+>;
+
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_arguments)]
 fn reshuffle_layout_strip(
-    markers: Query<(Entity, &LayoutPosition), With<ReshuffleAroundMarker>>,
+    markers: ReshuffleCandidates,
     strips: StripPlacements,
     manual_offsets: Query<&ManualStripOffset>,
+    pinned: Query<(), With<super::view_history::ViewLock>>,
     displays: DisplayViewports,
     windows: Windows,
     config: Res<Config>,
@@ -1218,6 +1652,9 @@ fn reshuffle_layout_strip(
             return;
         };
 
+        if pinned.contains(strip_entity) {
+            return;
+        }
         if active_marker.is_some_and(|m| m.is_added()) {
             trace!("reshuffle_layout_strip: skipping newly active workspace {strip_entity}");
             return;
@@ -1259,7 +1696,11 @@ fn reshuffle_layout_strip(
         }
 
         // Expose the window by clamping it into the viewport.
-        frame.min = clamp_origin_to_viewport(frame.min, size, display_bounds);
+        let mut window_viewport = display_bounds;
+        if strip.side_tabs && strip.is_tabbed_display(entity) {
+            window_viewport.min.x += 40;
+        }
+        frame.min = clamp_origin_to_viewport(frame.min, size, window_viewport);
         frame.max = frame.min + size;
 
         let mut strip_position = (frame.min - layout_position.0).with_y(display_bounds.min.y);
@@ -1323,7 +1764,11 @@ fn reshuffle_layout_strip(
 #[allow(clippy::type_complexity)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn ensure_visible_in_strip(
-    markers: Query<(Entity, &LayoutPosition, &EnsureVisibleMarker)>,
+    pinned: Query<(), With<super::view_history::ViewLock>>,
+    markers: Query<
+        (Entity, &LayoutPosition, &EnsureVisibleMarker),
+        Without<super::drag::NativeColumnDrag>,
+    >,
     mut strip_params: ParamSet<(
         StripPlacements,
         Query<&mut Position, (With<LayoutStrip>, Without<Window>)>,
@@ -1343,25 +1788,41 @@ fn ensure_visible_in_strip(
         // before the `&mut Position` query below is touched — Bevy treats
         // the two queries as conflicting system params even though they're
         // never live at the same time here.
-        let Some((strip_entity, display_entity, strip_target, is_new_activation)) = strip_params
-            .p0()
-            .into_iter()
-            .find(|s| s.0.contains(entity))
-            .map(
-                |(_, strip_entity, strip_position, child, active_marker, strip_reposition)| {
-                    let target = strip_reposition.map_or(strip_position.0, |r| r.0);
-                    (
+        let Some((strip_entity, display_entity, strip_target, is_new_activation, side_rail)) =
+            strip_params
+                .p0()
+                .into_iter()
+                .find(|s| s.0.contains(entity))
+                .map(
+                    |(
+                        strip,
                         strip_entity,
-                        child.parent(),
-                        target,
-                        active_marker.is_some_and(|m| m.is_added()),
-                    )
-                },
-            )
+                        strip_position,
+                        child,
+                        active_marker,
+                        strip_reposition,
+                    )| {
+                        let target = strip_reposition.map_or(strip_position.0, |r| r.0);
+                        (
+                            strip_entity,
+                            child.parent(),
+                            target,
+                            active_marker.is_some_and(|m| m.is_added()),
+                            if strip.side_tabs && strip.is_tabbed_display(entity) {
+                                40
+                            } else {
+                                0
+                            },
+                        )
+                    },
+                )
         else {
             continue;
         };
 
+        if pinned.contains(strip_entity) {
+            continue;
+        }
         if is_new_activation {
             trace!("ensure_visible_in_strip: skipping newly active workspace {strip_entity}");
             continue;
@@ -1372,7 +1833,8 @@ fn ensure_visible_in_strip(
         let Some(size) = windows.size(entity) else {
             continue;
         };
-        let viewport = display.actual_display_bounds(dock, &config);
+        let mut viewport = display.actual_display_bounds(dock, &config);
+        viewport.min.x += side_rail;
 
         // Where the entity would appear once the strip settles. Mid-animation
         // the strip's current position is on its way somewhere else, so the
@@ -1698,6 +2160,56 @@ fn position_layout_windows(
 mod tests {
     use super::*;
     use bevy::prelude::*;
+
+    #[test]
+    fn helper_drop_split_rejection_is_atomic_and_cross_group_order_is_explicit() {
+        use crate::types::wire::{DropKind, DropSide};
+        let mut world = World::new();
+        let ids: Vec<_> = (0..5).map(|_| world.spawn_empty().id()).collect();
+        let mut strip = LayoutStrip::new(1, 0);
+        for id in &ids {
+            strip.append(*id);
+        }
+        strip.stack_onto(ids[0], ids[1], false).unwrap();
+        let original: Vec<_> = strip
+            .columns()
+            .map(|c| c.window_iter().collect::<Vec<_>>())
+            .collect();
+        assert!(
+            strip
+                .apply_drop(ids[2], ids[1], DropKind::Tab, DropSide::Before)
+                .is_err()
+        );
+        assert_eq!(
+            strip
+                .columns()
+                .map(|c| c.window_iter().collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            original
+        );
+        strip.toggle_tabbed_display(ids[1]);
+        strip.stack_onto(ids[3], ids[4], true).unwrap();
+        strip
+            .apply_drop(ids[0], ids[3], DropKind::Tab, DropSide::Before)
+            .unwrap();
+        let target = strip.get(strip.index_of(ids[3]).unwrap()).unwrap();
+        assert_eq!(
+            target.window_iter().collect::<Vec<_>>(),
+            vec![ids[4], ids[0], ids[3]]
+        );
+        assert!(matches!(strip.get(0).unwrap(), Column::Single(id) if id == ids[1]));
+        strip
+            .apply_drop(ids[0], ids[4], DropKind::Tab, DropSide::After)
+            .unwrap();
+        assert_eq!(
+            strip
+                .get(strip.index_of(ids[0]).unwrap())
+                .unwrap()
+                .window_iter()
+                .collect::<Vec<_>>(),
+            vec![ids[4], ids[0], ids[3]]
+        );
+    }
 
     #[test]
     fn signature_tolerates_pixel_drift_but_not_a_reshape() {
@@ -2085,6 +2597,157 @@ mod tests {
         // All three must be at the identical x too (same column slot).
         let xs: std::collections::HashSet<_> = out.iter().map(|(_, f)| f.min.x).collect();
         assert_eq!(xs.len(), 1, "every tab must share the same column x");
+    }
+
+    #[test]
+    fn append_strip_transfers_only_member_tab_metadata() {
+        let mut world = World::new();
+        let members: Vec<_> = world.spawn_batch(vec![(); 8]).collect();
+        let mut destination = LayoutStrip::default();
+        destination.append(members[0]);
+        destination.append(members[1]);
+        destination.stack(members[1]).unwrap();
+        destination.toggle_tabbed_display(members[1]);
+        let mut source = LayoutStrip::default();
+        source.append(members[2]);
+        source.append(members[3]);
+        source.stack(members[3]).unwrap();
+        source.toggle_tabbed_display(members[3]);
+        source.append(members[4]);
+        source.append_tab_group(&members[5..7]);
+        // Historical entries not belonging to transferred columns must stay out
+        // of the destination, without changing unrelated source metadata.
+        source.tabbed_stacks.insert(members[7]);
+        source.selected_tabs.insert(members[7]);
+        destination.append_strip(&mut source);
+        assert_eq!(destination.len(), 4);
+        assert!(source.columns().next().is_none());
+        assert_eq!(
+            destination.selected_tab(&destination.get(0).unwrap()),
+            Some(members[1])
+        );
+        assert_eq!(
+            destination.selected_tab(&destination.get(1).unwrap()),
+            Some(members[3])
+        );
+        assert_eq!(destination.right_neighbour(members[0]), Some(members[3]));
+        assert!(destination.is_tabbed_display(members[2]));
+        assert!(destination.is_tabbed_display(members[3]));
+        for &entity in &members[4..] {
+            assert!(!destination.is_tabbed_display(entity));
+            assert!(!destination.selected_tabs.contains(&entity));
+        }
+        assert!(matches!(destination.get(2).unwrap(), Column::Single(_)));
+        assert!(matches!(destination.get(3).unwrap(), Column::Tabs(_)));
+        assert!(!source.is_tabbed_display(members[2]));
+        assert!(!source.selected_tabs.contains(&members[3]));
+        assert!(source.tabbed_stacks.contains(&members[7]));
+        assert!(source.selected_tabs.contains(&members[7]));
+    }
+
+    #[test]
+    fn tab_header_constraint_leaves_parked_and_inactive_strips_alone() {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut harness = crate::tests::TestHarness::new().with_windows(2);
+        harness.app.update();
+        let world = harness.world();
+        let (strip_entity, member) = {
+            let mut query = world.query::<(Entity, &mut LayoutStrip)>();
+            let (entity, mut strip) = query.single_mut(world).unwrap();
+            let members = strip.all_columns();
+            strip.stack(members[1]).unwrap();
+            strip.toggle_tabbed_display(members[0]);
+            (entity, members[0])
+        };
+        let parked = crate::tests::TEST_DISPLAY_HEIGHT - PARKED_STRIP_SLIVER;
+        world.get_mut::<Position>(strip_entity).unwrap().0.y = parked;
+        world.get_mut::<Position>(member).unwrap().0.y = parked;
+        world
+            .run_system_once(constrain_tabbed_window_frames)
+            .unwrap();
+        assert_eq!(world.get::<Position>(member).unwrap().0.y, parked);
+        world
+            .entity_mut(strip_entity)
+            .remove::<ActiveWorkspaceMarker>();
+        world.get_mut::<Position>(strip_entity).unwrap().0.y = 0;
+        world.get_mut::<Position>(member).unwrap().0.y = parked;
+        world
+            .run_system_once(constrain_tabbed_window_frames)
+            .unwrap();
+        assert_eq!(world.get::<Position>(member).unwrap().0.y, parked);
+    }
+
+    #[test]
+    fn selected_tab_removal_and_split_navigation_remain_valid() {
+        let mut world = World::new();
+        let members: Vec<_> = world.spawn_batch(vec![(), (), (), ()]).collect();
+        let mut strip = LayoutStrip::default();
+        for &entity in &members {
+            strip.append(entity);
+        }
+        strip.stack(members[2]).unwrap();
+        strip.toggle_tabbed_display(members[2]);
+        strip.remember_selected_tab(members[2]);
+        assert_eq!(strip.right_neighbour(members[0]), Some(members[2]));
+        strip.toggle_tabbed_display(members[2]);
+        assert_eq!(strip.right_neighbour(members[0]), Some(members[1]));
+        strip.toggle_tabbed_display(members[2]);
+        strip.unstack(members[2]).unwrap();
+        assert_eq!(strip.right_neighbour(members[0]), Some(members[1]));
+        strip.stack(members[2]).unwrap();
+        strip.toggle_tabbed_display(members[2]);
+        strip.remove(members[2]);
+        assert_eq!(strip.right_neighbour(members[0]), Some(members[1]));
+    }
+
+    #[test]
+    fn test_tabbed_header_geometry_and_split_restoration() {
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(), ()]).collect::<Vec<Entity>>();
+        let mut strip = LayoutStrip::default();
+        for &entity in &entities {
+            strip.append(entity);
+        }
+        strip.stack(entities[1]).unwrap();
+        let frame = |_| Some(IRect::new(0, 0, 400, 300));
+        let split: Vec<_> = strip
+            .relative_positions_with_tab_bar_height(700, &frame, 28)
+            .collect();
+        strip.toggle_tabbed_display(entities[0]);
+        for (_, rect) in strip.relative_positions_with_tab_bar_height(700, &frame, 28) {
+            assert_eq!(rect, IRect::new(0, 28, 400, 700));
+        }
+        for (_, rect) in strip.relative_positions_with_tab_bar_height(20, &frame, 28) {
+            assert_eq!(rect, IRect::new(0, 19, 400, 20));
+        }
+        let shortened = |_| Some(IRect::new(0, 28, 400, 700));
+        for (_, rect) in strip.relative_positions_with_tab_bar_height(700, &shortened, 28) {
+            assert_eq!(rect, IRect::new(0, 28, 400, 700));
+        }
+        strip.toggle_tabbed_display(entities[0]);
+        let restored: Vec<_> = strip
+            .relative_positions_with_tab_bar_height(700, &shortened, 28)
+            .collect();
+        assert_eq!(restored.first().unwrap().1.min.y, 0);
+        assert_eq!(restored.last().unwrap().1.max.y, 700);
+        assert_eq!(
+            split,
+            strip
+                .relative_positions_with_tab_bar_height(700, &frame, 28)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            strip.tab_bar_height(strip.columns().next().unwrap(), 700, 28),
+            0
+        );
+        assert_eq!(
+            strip.tab_bar_height(&Column::Tabs(entities.clone()), 700, 28),
+            0
+        );
+        assert_eq!(
+            strip.tab_bar_height(&Column::Single(entities[0]), 700, 28),
+            0
+        );
     }
 
     #[test]
@@ -2632,5 +3295,52 @@ mod tests {
         }
         assert_eq!(strip.right_neighbour(leader), Some(b));
         assert_eq!(strip.right_neighbour(follower), Some(b));
+    }
+    #[test]
+    fn explicit_stack_destination_works_left_and_right_without_moving_siblings() {
+        for right in [true, false] {
+            let mut world = World::new();
+            let members = (0..4).map(|_| world.spawn_empty().id()).collect::<Vec<_>>();
+            let mut strip = LayoutStrip::default();
+            for member in &members {
+                strip.append(*member);
+            }
+            strip.stack(members[1]).unwrap();
+            strip.toggle_tabbed_display(members[1]);
+            let onto = if right { members[2] } else { members[0] };
+            strip.stack_onto(members[1], onto, false).unwrap();
+            assert_eq!(
+                strip.index_of(members[1]).unwrap(),
+                strip.index_of(onto).unwrap()
+            );
+            if right {
+                assert_ne!(
+                    strip.index_of(members[0]).unwrap(),
+                    strip.index_of(members[1]).unwrap()
+                );
+            }
+            assert!(strip.contains(members[3]));
+        }
+    }
+
+    #[test]
+    fn explicit_stack_preserves_native_group_and_honors_tab_display() {
+        let mut world = World::new();
+        let members = (0..4).map(|_| world.spawn_empty().id()).collect::<Vec<_>>();
+        let mut strip = LayoutStrip::default();
+        for member in &members {
+            strip.append(*member);
+        }
+        strip.convert_to_tabs(members[1], members[2]).unwrap();
+        strip.stack_onto(members[1], members[3], true).unwrap();
+        let native = strip.tab_group(members[1]).unwrap();
+        assert_eq!(native.len(), 2);
+        assert!(native.contains(&members[2]));
+        assert_ne!(
+            strip.index_of(members[0]).unwrap(),
+            strip.index_of(members[1]).unwrap()
+        );
+        assert!(strip.is_tabbed_display(members[1]));
+        assert!(strip.is_tabbed_display(members[3]));
     }
 }

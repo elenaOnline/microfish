@@ -15,8 +15,8 @@ use crate::config::swipe::SwipeGestureDirection;
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, ManualStripOffset, MissionControlActive, Position, Scrolling,
-    SendMessageTrigger,
+    ActiveWorkspaceMarker, ManualStripOffset, MissionControlActive, Position, RepositionMarker,
+    Scrolling, SendMessageTrigger,
 };
 use crate::errors::Result;
 use bevy::ecs::schedule::common_conditions::on_message;
@@ -27,6 +27,46 @@ use crate::platform::Modifiers;
 use crate::util::round_px;
 
 pub struct ScrollEventsPlugin;
+
+pub(super) fn edge_snap_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("PANERU_TRIAL_EDGE_SNAP").is_ok_and(|value| value == "1")
+    });
+    *ENABLED
+}
+
+/// Choose the closest legal left, center, or right alignment after a short
+/// velocity projection. Oversized columns contribute only their two edges.
+fn landing_offset(
+    current: f64,
+    velocity_px: f64,
+    left: i32,
+    right: i32,
+    columns: &[(i32, i32)],
+) -> Option<f64> {
+    let first = columns.first()?;
+    let last = columns.last()?;
+    let upper = f64::from(left - first.0);
+    let lower = f64::from(right - last.0 - last.1).min(upper);
+    let projected = (current + velocity_px * 0.12).clamp(lower, upper);
+    columns
+        .iter()
+        .flat_map(|&(x, width)| {
+            let l = f64::from(left - x);
+            let r = f64::from(right - x - width);
+            let c = if width <= right - left {
+                l.midpoint(r)
+            } else {
+                l
+            };
+            [
+                l.clamp(lower, upper),
+                c.clamp(lower, upper),
+                r.clamp(lower, upper),
+            ]
+        })
+        .min_by(|a, b| (a - projected).abs().total_cmp(&(b - projected).abs()))
+}
 
 /// Upper bound on the timestep used to *advance* the strip.
 ///
@@ -106,6 +146,7 @@ fn swipe_gesture(
     let mut total_delta = 0.0;
     let mut gesture_delta = 0.0;
     let mut touchpad_down = false;
+    let mut contact = None;
     let mut has_scroll_event = false;
     let mut has_gesture_event = false;
 
@@ -122,7 +163,11 @@ fn swipe_gesture(
         match event {
             Event::TouchpadDown => {
                 touchpad_down = true;
+                contact = Some(true);
                 total_delta = 0.0;
+            }
+            Event::TouchpadUp | Event::MouseDown { .. } => {
+                contact = Some(false);
             }
             Event::Scroll { delta } => {
                 total_delta += *delta * scroll_scale;
@@ -133,6 +178,7 @@ fn swipe_gesture(
                     .swipe_gesture_fingers()
                     .is_some_and(|fingers_configured| fingers_configured == *fingers) =>
             {
+                contact = Some(true);
                 total_delta += delta;
                 gesture_delta += delta;
                 has_scroll_event = true;
@@ -142,7 +188,7 @@ fn swipe_gesture(
         }
     }
 
-    if !touchpad_down && !has_scroll_event {
+    if !touchpad_down && !has_scroll_event && contact.is_none() {
         return;
     }
 
@@ -150,17 +196,28 @@ fn swipe_gesture(
 
     // The user is driving the strip by hand now, so an earlier deliberate
     // placement (center, snap) no longer describes where they want it.
-    if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+    if has_scroll_event
+        && total_delta.abs() > f64::EPSILON
+        && let Ok(mut entity_commands) = commands.get_entity(*entity)
+    {
         entity_commands.try_remove::<ManualStripOffset>();
+        entity_commands.try_remove::<RepositionMarker>();
     }
 
     if touchpad_down && let Some(scrolling) = scrolling.as_mut() {
+        scrolling.snap_target = None;
         scrolling.velocity = 0.0;
         scrolling.is_user_swiping = true;
         scrolling.last_event = time.elapsed();
     }
 
-    if has_scroll_event {
+    if let Some(held) = contact
+        && let Some(scroll) = scrolling.as_mut()
+    {
+        update_contact(scroll, held, time.elapsed());
+    }
+
+    if has_scroll_event && total_delta.abs() > f64::EPSILON {
         let viewport_width = f64::from(active_display.bounds().width());
         let direction_modifier = match config.swipe_gesture_direction() {
             SwipeGestureDirection::Natural => -1.0,
@@ -177,6 +234,7 @@ fn swipe_gesture(
         };
 
         if let Some(scrolling) = scrolling.as_mut() {
+            scrolling.snap_target = None;
             // Native modifier-scroll events already include macOS momentum.
             // Add synthetic inertia only for raw multi-finger gestures.
             scrolling.velocity = if has_gesture_event {
@@ -185,20 +243,43 @@ fn swipe_gesture(
             } else {
                 0.0
             };
-            scrolling.is_user_swiping = true;
+            scrolling.is_user_swiping = contact != Some(false);
             scrolling.last_event = time.elapsed();
             scrolling.position +=
                 total_delta * viewport_width * direction_modifier * swipe_sensitivity;
         } else if let Ok(mut entity_commands) = commands.get_entity(*entity) {
             entity_commands.try_insert(Scrolling {
+                touch_held: contact == Some(true),
+                snap_target: None,
                 velocity: new_velocity,
                 position: f64::from(position.0.x)
                     + total_delta * viewport_width * direction_modifier * swipe_sensitivity,
-                is_user_swiping: true,
+                is_user_swiping: contact != Some(false),
                 last_event: time.elapsed(),
             });
         }
     }
+}
+
+fn update_contact(scroll: &mut Scrolling, held: bool, now: Duration) {
+    scroll.touch_held = held;
+    if !held {
+        if now.saturating_sub(scroll.last_event) > Duration::from_millis(50) {
+            scroll.velocity = 0.0;
+        }
+        scroll.is_user_swiping = false;
+    }
+}
+
+// Pausing with fingers down keeps layout reconciliation and snapping blocked.
+fn hold_touch(scroll: &mut Scrolling, quiet: Duration) -> bool {
+    if !scroll.touch_held {
+        return false;
+    }
+    if quiet > Duration::from_millis(50) {
+        scroll.velocity = 0.0;
+    }
+    true
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
@@ -217,10 +298,22 @@ pub(super) fn swiping_timeout(
     let viewport_width = f64::from(active_display.bounds().width());
 
     for (entity, mut scroll) in strips {
-        if time.elapsed().abs_diff(scroll.last_event) > FINGER_LIFT_THRESHOLD {
+        let quiet = time.elapsed().abs_diff(scroll.last_event);
+        if edge_snap_enabled() && hold_touch(&mut scroll, quiet) {
+            continue;
+        }
+        if !scroll.is_user_swiping || quiet > FINGER_LIFT_THRESHOLD {
             scroll.is_user_swiping = false;
 
-            if scroll.velocity.abs() * dt * viewport_width < MIN_VELOCITY_PX
+            let landed = if edge_snap_enabled() {
+                scroll
+                    .snap_target
+                    .is_some_and(|target| (scroll.position - target).abs() <= 1.0)
+            } else {
+                true
+            };
+            if landed
+                && scroll.velocity.abs() * dt * viewport_width < MIN_VELOCITY_PX
                 && let Ok(mut entity_commands) = commands.get_entity(entity)
             {
                 entity_commands.try_remove::<Scrolling>();
@@ -270,6 +363,49 @@ fn apply_snap_force(
     const CENTER_MAGNETIC_FORCE: f64 = 10.0;
     const SNAP_DISPLAY_RATIO: f64 = 0.45;
 
+    if edge_snap_enabled() {
+        let viewport = active_display.actual_bounds(&config);
+        let (layout, _, ref mut scroll) = *strip;
+        if scroll.is_user_swiping {
+            return;
+        }
+        if scroll.snap_target.is_none() {
+            let columns: Vec<_> = layout
+                .all_columns()
+                .into_iter()
+                .filter_map(|entity| {
+                    Some((
+                        windows.layout_position(entity)?.0.x,
+                        windows.moving_frame(entity)?.width(),
+                    ))
+                })
+                .collect();
+            let direction = match config.swipe_gesture_direction() {
+                SwipeGestureDirection::Natural => -1.0,
+                SwipeGestureDirection::Reversed => 1.0,
+            };
+            scroll.snap_target = landing_offset(
+                scroll.position,
+                scroll.velocity * f64::from(viewport.width()) * direction,
+                viewport.min.x,
+                viewport.max.x,
+                &columns,
+            )
+            .or(Some(scroll.position));
+        }
+        scroll.velocity = 0.0;
+        if let Some(target) = scroll.snap_target {
+            let delta = target - scroll.position;
+            let step = delta * (1.0 - (-18.0 * time.delta_secs_f64().min(MAX_STEP_SECS)).exp());
+            // Constraints quantize each frame: finish subpixel tails explicitly.
+            scroll.position = if delta.abs() <= 2.0 {
+                target
+            } else {
+                scroll.position + step
+            };
+        }
+        return;
+    }
     if !config.auto_center() {
         return;
     }
@@ -329,6 +465,9 @@ fn scrolling_integrator(
     };
 
     let scroll = &mut *strip;
+    if edge_snap_enabled() && scroll.is_user_swiping {
+        return;
+    }
     if scroll.velocity.abs() > 0.0001 {
         scroll.position += scroll.velocity * dt * viewport_width * direction_modifier;
     }
@@ -354,7 +493,11 @@ fn apply_scrolling_constraints(
         &config,
     ) {
         position.x = clamped_offset;
-        scroll.position = f64::from(clamped_offset);
+        // Keep fractional progress during the snap tail; rounding it away on
+        // every fast tick would stall before reaching the target.
+        if !edge_snap_enabled() || clamped_offset != round_px(scroll.position) {
+            scroll.position = f64::from(clamped_offset);
+        }
     } else {
         scroll.velocity = 0.0;
     }
@@ -481,4 +624,64 @@ fn switch_virtual_workspace(delta: f64, config: &Config, commands: &mut Commands
     commands.trigger(SendMessageTrigger(Event::Command {
         command: Command::Window(Operation::Virtual(direction)),
     }));
+}
+
+#[cfg(test)]
+mod landing_tests {
+    use super::landing_offset;
+    #[test]
+    fn edges_and_center_are_distinct_landings() {
+        let cols = [(0, 600), (600, 600), (1200, 600)];
+        assert_eq!(landing_offset(-590.0, 0.0, 0, 1000, &cols), Some(-600.0));
+        assert_eq!(landing_offset(-390.0, 0.0, 0, 1000, &cols), Some(-400.0));
+        assert_eq!(landing_offset(-210.0, 0.0, 0, 1000, &cols), Some(-200.0));
+    }
+    #[test]
+    fn projection_and_bounds() {
+        let cols = [(0, 600), (600, 600), (1200, 600)];
+        assert_eq!(
+            landing_offset(-200.0, -1800.0, 0, 1000, &cols),
+            Some(-400.0)
+        );
+        assert_eq!(landing_offset(50.0, 5000.0, 0, 1000, &cols), Some(0.0));
+        assert_eq!(
+            landing_offset(-790.0, -5000.0, 0, 1000, &cols),
+            Some(-800.0)
+        );
+        assert_eq!(landing_offset(0.0, 0.0, 0, 1000, &[]), None);
+    }
+    #[test]
+    fn short_strip_and_oversized_column() {
+        assert_eq!(landing_offset(-100.0, 0.0, 0, 1000, &[(0, 600)]), Some(0.0));
+        assert_eq!(
+            landing_offset(-180.0, 0.0, 0, 1000, &[(0, 1400)]),
+            Some(0.0)
+        );
+        assert_eq!(
+            landing_offset(-300.0, 0.0, 0, 1000, &[(0, 1400)]),
+            Some(-400.0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod contact_tests {
+    use super::{Duration, Scrolling, hold_touch};
+    #[test]
+    fn a_long_stationary_hold_is_not_a_release() {
+        let mut scroll = Scrolling {
+            touch_held: true,
+            snap_target: None,
+            velocity: 2.0,
+            position: 100.0,
+            is_user_swiping: true,
+            last_event: Duration::ZERO,
+        };
+        assert!(hold_touch(&mut scroll, Duration::from_secs(10)));
+        assert!(scroll.is_user_swiping);
+        assert!(scroll.snap_target.is_none());
+        assert!(scroll.velocity.abs() < f64::EPSILON);
+        scroll.touch_held = false;
+        assert!(!hold_touch(&mut scroll, Duration::from_secs(10)));
+    }
 }

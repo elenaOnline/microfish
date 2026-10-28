@@ -62,6 +62,8 @@ pub struct SavedWorkspace {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SavedStrip {
+    #[serde(default)]
+    pub side_tabs: bool,
     pub virtual_index: u32,
     pub columns: Vec<SavedColumn>,
 }
@@ -70,6 +72,7 @@ pub struct SavedStrip {
 pub enum SavedColumn {
     Single(SavedWindow),
     Stack(Vec<SavedStackItem>),
+    TabbedStack(Vec<SavedStackItem>),
     Tabs(Vec<SavedWindow>),
     Fullscreen(SavedWindow),
 }
@@ -224,7 +227,11 @@ impl PaneruState {
                         if saved_items.is_empty() {
                             None
                         } else {
-                            Some(SavedColumn::Stack(saved_items))
+                            Some(if col.window_iter().any(|e| strip.is_tabbed_display(e)) {
+                                SavedColumn::TabbedStack(saved_items)
+                            } else {
+                                SavedColumn::Stack(saved_items)
+                            })
                         }
                     }
                     Column::Tabs(tabs) => {
@@ -262,6 +269,7 @@ impl PaneruState {
                 workspace.active_virtual_index = Some(strip.virtual_index);
             }
             workspace.strips.push(SavedStrip {
+                side_tabs: strip.has_side_tabs(),
                 virtual_index: strip.virtual_index,
                 columns: saved_columns,
             });
@@ -352,7 +360,7 @@ impl PaneruState {
                                 ));
                             }
                         }
-                        SavedColumn::Stack(items) => {
+                        SavedColumn::Stack(items) | SavedColumn::TabbedStack(items) => {
                             for item in items {
                                 match item {
                                     SavedStackItem::Single(sw) => {
@@ -423,6 +431,7 @@ pub struct QueryStateParams<'w, 's> {
         ),
     >,
     displays: Query<'w, 's, (&'static Display, Entity, Has<ActiveDisplayMarker>)>,
+    docks: Query<'w, 's, &'static crate::ecs::DockPosition>,
     windows: Windows<'w, 's>,
     apps: Query<'w, 's, &'static Application>,
     window_manager: Res<'w, WindowManager>,
@@ -458,6 +467,36 @@ impl QueryStateParams<'_, '_> {
 /// windows, this keeps the strip's column structure — needed for `ws:swap`,
 /// `ws:east`, `ws:stack` and friends to know what is beside what.
 impl QueryStateParams<'_, '_> {
+    fn column_selected(
+        &self,
+        strip: &LayoutStrip,
+        column: &Column,
+        windows: &[crate::types::windowset::WindowRec],
+    ) -> usize {
+        windows
+            .iter()
+            .position(|window| window.focused)
+            .or_else(|| {
+                strip
+                    .selected_tab(column)
+                    .or_else(|| column.top())
+                    .and_then(|top| self.windows.get(top).map(|window| window.id()))
+                    .and_then(|id| windows.iter().position(|window| window.id == id))
+            })
+            .unwrap_or(0)
+    }
+
+    fn column_tab_bar_height(&self, parent: Entity, strip: &LayoutStrip, column: &Column) -> i32 {
+        self.displays.get(parent).map_or(0, |(display, _, _)| {
+            let dock = self.docks.get(parent).ok();
+            strip.tab_bar_height(
+                column,
+                display.actual_display_bounds(dock, &self.config).height(),
+                LayoutStrip::configured_tab_bar_height(),
+            )
+        })
+    }
+
     pub fn extract_window_set(&self) -> crate::errors::Result<WindowSet> {
         use crate::types::windowset::{ColumnSet, DisplaySet, WorkspaceSet};
 
@@ -507,15 +546,13 @@ impl QueryStateParams<'_, '_> {
                     .window_iter()
                     .find_map(|entity| self.windows.width_ratio(entity))
                     .unwrap_or(1.0);
-                let selected = column
-                    .top()
-                    .and_then(|top| self.windows.get(top).map(|window| window.id()))
-                    .and_then(|id| tiled.iter().position(|window| window.id == id))
-                    .unwrap_or(0);
+                let selected = self.column_selected(strip, column, &tiled);
+                let tab_bar_height = self.column_tab_bar_height(child.parent(), strip, column);
                 columns.push(ColumnSet {
                     kind: column_kind(column),
                     width_ratio,
                     selected,
+                    tab_bar_height,
                     windows: std::sync::Arc::new(tiled),
                 });
             }
@@ -825,5 +862,50 @@ pub fn cleanup_on_exit(
         if let Err(e) = state.save_to_file(&path) {
             error!("Failed to save state on exit: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tab_header_tests {
+    use super::*;
+    use crate::tests::TestHarness;
+    use bevy::ecs::system::SystemState;
+
+    #[test]
+    fn window_set_selected_follows_focused_stack_member() {
+        let mut harness = TestHarness::new().with_windows(3);
+        harness.app.update();
+        let world = harness.world();
+        let focused = {
+            let mut query =
+                world.query_filtered::<Entity, bevy::ecs::query::With<crate::ecs::FocusedMarker>>();
+            query.single(world).unwrap()
+        };
+        {
+            let mut query = world.query::<&mut LayoutStrip>();
+            let mut strip = query.single_mut(world).unwrap();
+            // Put the focused entity last without changing focus.
+            let mut members = strip.all_columns();
+            members.sort_by_key(|entity| *entity == focused);
+            let mut replacement = LayoutStrip::default();
+            for &member in &members {
+                replacement.append(member);
+            }
+            replacement.stack(members[1]).unwrap();
+            replacement.stack(members[2]).unwrap();
+            replacement.toggle_tabbed_display(focused);
+            *strip = replacement;
+        }
+        let mut state: SystemState<QueryStateParams> = SystemState::new(world);
+        let params = state.get(world).unwrap();
+        let snapshot = params.extract_window_set().unwrap();
+        let column = &snapshot.displays()[0].workspaces[0].columns[0];
+        assert_eq!(column.selected, 2);
+        assert!(column.windows[column.selected].focused);
+        assert_eq!(
+            column.tab_bar_height,
+            LayoutStrip::configured_tab_bar_height()
+                .min(crate::tests::TEST_DISPLAY_HEIGHT - crate::tests::TEST_MENUBAR_HEIGHT - 1)
+        );
     }
 }

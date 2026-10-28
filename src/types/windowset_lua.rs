@@ -74,6 +74,34 @@ impl UserData for WindowSet {
             Ok(this.current().map(|workspace| workspace.number))
         });
 
+        // Rows on the active native Space of the active display; row numbers
+        // are local to a native Space and must never resolve globally here.
+        methods.add_method("overview", |lua, this, ()| {
+            let Some(display) = this.displays().iter().find(|display| display.active) else {
+                return Ok(Value::Nil);
+            };
+            let Some(current) = display.workspaces.iter().find(|workspace| workspace.active) else {
+                return Ok(Value::Nil);
+            };
+            let result = lua.create_table()?;
+            let frame = lua.create_table()?;
+            frame.set("id", display.id)?;
+            frame.set("x", display.frame.x)?;
+            frame.set("y", display.frame.y)?;
+            frame.set("width", display.frame.width)?;
+            frame.set("height", display.frame.height)?;
+            result.set("display", frame)?;
+            result.set("native_id", current.native_id)?;
+            let mut rows = display
+                .workspaces
+                .iter()
+                .filter(|workspace| workspace.native_id == current.native_id)
+                .collect::<Vec<_>>();
+            rows.sort_by_key(|workspace| workspace.number);
+            result.set("rows", lua.to_value(&rows)?)?;
+            Ok(Value::Table(result))
+        });
+
         methods.add_method("workspaces", |_, this, ()| {
             Ok(this
                 .workspaces()
@@ -106,6 +134,18 @@ impl UserData for WindowSet {
                 .iter()
                 .map(|column| column.windows.iter().map(|window| window.id).collect())
                 .collect::<Vec<Vec<WinID>>>())
+        });
+
+        // Serialized column records in the same left-to-right order as columns().
+        methods.add_method("column_info", |lua, this, number: Option<u32>| {
+            let workspace = match number {
+                Some(number) => this.workspace(number),
+                None => this.current(),
+            };
+            workspace.map_or_else(
+                || lua.to_value(&Vec::<crate::types::windowset::ColumnSet>::new()),
+                |workspace| lua.to_value(workspace.columns.as_ref()),
+            )
         });
 
         // One-based, like every other index a Lua script handles.
@@ -214,5 +254,59 @@ impl UserData for WindowSet {
         });
 
         methods.add_method("unstack", |_, this, id: WinID| Ok(this.unstack(id)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::state::Frame;
+    use crate::types::windowset::{DisplaySet, WorkspaceSet};
+    use std::sync::Arc;
+    #[test]
+    fn overview_keeps_row_numbers_local_to_active_native_space_and_display() {
+        let lua = mlua::Lua::new();
+        let row = |number, native_id, active| WorkspaceSet {
+            number,
+            native_id,
+            active,
+            columns: Arc::new(vec![]),
+            floating: Arc::new(vec![]),
+        };
+        let display = |id, active, rows| DisplaySet {
+            id,
+            active,
+            frame: Frame {
+                x: 7,
+                y: 8,
+                width: 1000,
+                height: 800,
+            },
+            workspaces: Arc::new(rows),
+        };
+        let set = WindowSet::new(
+            vec![
+                display(1, false, vec![row(1, 30, true)]),
+                display(
+                    2,
+                    true,
+                    vec![row(1, 10, false), row(2, 20, false), row(1, 20, true)],
+                ),
+            ],
+            None,
+        );
+        lua.globals().set("ws", set).unwrap();
+        lua.load(
+            r"
+            local o=ws:overview()
+            assert(o.display.id==2 and o.display.x==7 and o.display.width==1000)
+            assert(o.native_id==20 and #o.rows==2)
+            assert(o.rows[1].number==1 and o.rows[1].active)
+            assert(o.rows[2].number==2 and not o.rows[2].active)
+            for _, row in ipairs(o.rows) do assert(row.native_id==20) end
+        ",
+        )
+        .exec()
+        .unwrap();
     }
 }

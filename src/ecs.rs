@@ -4,12 +4,13 @@ use std::time::Duration;
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
 use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
+use bevy::ecs::change_detection::DetectChanges;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::query::{Added, Changed, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::SystemCondition;
-use bevy::ecs::schedule::common_conditions::{not, resource_exists};
+use bevy::ecs::schedule::common_conditions::{not, resource_changed, resource_exists};
 use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor};
 use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
 use bevy::prelude::Event as BevyEvent;
@@ -41,6 +42,7 @@ use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
 pub mod display;
+pub(super) mod drag;
 pub mod focus;
 pub mod layout;
 #[cfg(feature = "lua")]
@@ -53,6 +55,7 @@ pub mod scroll;
 pub mod state;
 pub(crate) mod systems;
 mod triggers;
+pub(crate) mod view_history;
 pub mod workspace;
 
 // Shared by the Lua reload system so a `paneru.setup{...}` reload applies the
@@ -73,6 +76,11 @@ pub fn register_systems(app: &mut bevy::app::App) {
     const LOW_POWER_MODE_CHECK: Duration = Duration::from_mins(1);
     const APP_OBSERVABILITY_CHECK_FREQ: Duration = Duration::from_millis(200);
 
+    app.init_resource::<view_history::History>();
+    app.add_systems(Startup, view_history::initialize);
+    app.add_systems(PreUpdate, view_history::observe.after(systems::pump_events));
+    app.add_systems(Last, view_history::finish);
+
     let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
         scrolling
             .iter()
@@ -88,6 +96,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // an empty virtual workspace), which otherwise leaves a stale outline.
     // Position changes on the focused window also dirty the overlay so that
     // dragging a floating window moves the highlight with it.
+    let config_dirty = |config: Res<Config>| config.is_changed();
     let vw_indicator_dirty =
         |strip_changed: Query<(), (With<ActiveWorkspaceMarker>, Changed<LayoutStrip>)>,
          focus_gained: Query<(), Added<FocusedMarker>>,
@@ -129,12 +138,16 @@ pub fn register_systems(app: &mut bevy::app::App) {
             // the first resize of a newly visible window.
             systems::window_creation_event.after(systems::pump_events),
             systems::demux_input_events.after(systems::pump_events),
+            systems::initialise_workspaces.run_if(config_dirty),
         ),
     );
     app.add_systems(
         Update,
         (
             (
+                triggers::refresh_window_layout_config
+                    .after(triggers::refresh_configuration_trigger)
+                    .run_if(resource_changed::<Config>),
                 triggers::apply_window_defaults,
                 systems::detect_tabbed_windows.run_if(native_tabs_enabled),
                 triggers::apply_window_positions,
@@ -170,6 +183,10 @@ pub fn register_systems(app: &mut bevy::app::App) {
             )
                 .chain()
                 .run_if(not_swiping),
+            systems::finish_native_mouse_resize.run_if(not_swiping),
+            systems::verify_native_sibling_resize
+                .after(systems::window_resized_update_frame)
+                .run_if(not_swiping),
             systems::cleanup_on_exit,
             restore::tick_restore_grace,
             state::periodic_state_save.run_if(on_timer(Duration::from_mins(5))),
@@ -196,8 +213,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 systems::update_overlays
                     .after(systems::animate_entities)
                     .after(systems::animate_resize_entities)
-                    .run_if(dimming_enabled)
-                    .run_if(vw_indicator_dirty),
+                    .run_if(dimming_enabled.or_eager(config_dirty))
+                    .run_if(vw_indicator_dirty.or_eager(config_dirty)),
                 systems::update_flash_messages,
             )
                 .chain(),
@@ -309,6 +326,10 @@ pub struct ManualStripOffset {
 
 #[derive(Component, Debug)]
 pub struct Scrolling {
+    /// Actual multi-finger contact, independent of pauses in movement.
+    pub touch_held: bool,
+    /// Fixed landing offset for the opt-in three-position snap trial.
+    pub snap_target: Option<f64>,
     pub velocity: f64,
     pub position: f64,
     /// When true, the user's fingers are on the trackpad.
@@ -492,6 +513,42 @@ pub struct SkipReshuffle(pub bool);
 #[derive(Component)]
 pub struct MouseHeldMarker(pub Entity);
 
+/// The held button has produced native drag input.
+#[derive(Component)]
+pub struct MouseDraggingMarker;
+
+/// Native horizontal geometry owned by the pointer until release (or the
+/// bounded mouse-held timeout). Vertical layout still protects tab headers.
+#[derive(Component)]
+pub struct NativeMouseResize {
+    pub x: i32,
+    pub width: i32,
+}
+
+/// Latest physical sibling resize target; retries are paced and finite.
+#[derive(Component)]
+pub struct NativeSiblingResize {
+    pub owner: Entity,
+    pub width: i32,
+    pub timer: Timer,
+    pub remaining: u8,
+    pub exhausted: bool,
+    pub released: bool,
+}
+
+impl NativeSiblingResize {
+    pub fn new(owner: Entity, width: i32) -> Self {
+        Self {
+            owner,
+            width,
+            timer: Timer::from_seconds(0.1, bevy::time::TimerMode::Repeating),
+            remaining: 6,
+            exhausted: false,
+            released: false,
+        }
+    }
+}
+
 /// Resource indicating whether Mission Control is currently active.
 #[derive(Resource)]
 pub struct MissionControlActive(pub bool);
@@ -592,7 +649,11 @@ impl SpawnCommandsExt for Commands<'_, '_> {
     fn focus_entity(&mut self, entity: Entity, raise: bool) {
         if let Ok(mut entity_commands) = self.get_entity(entity) {
             entity_commands.try_insert(FocusedMarker);
-            self.trigger(focus::FocusWindow { entity, raise });
+            self.trigger(focus::FocusWindow {
+                entity,
+                raise,
+                source: None,
+            });
         }
     }
 

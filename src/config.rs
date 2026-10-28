@@ -495,6 +495,10 @@ impl Config {
         self.options().preset_column_widths
     }
 
+    pub fn drag_reorder(&self) -> bool {
+        self.options().drag_reorder.unwrap_or(false)
+    }
+
     pub fn preset_stack_heights(&self) -> Vec<f64> {
         self.options().preset_stack_heights
     }
@@ -819,6 +823,21 @@ impl Config {
             .is_some_and(|reap| reap)
     }
 
+    pub fn side_tabs(&self) -> bool {
+        self.options().tab_style.as_deref() == Some("side")
+    }
+    pub fn tab_height(&self) -> Option<i32> {
+        self.options()
+            .tab_height
+            .filter(|h| [28, 34].contains(h))
+            .map(|h| {
+                if self.options().tab_style.as_deref() == Some("folder-compact") {
+                    if h == 34 { 25 } else { 20 }
+                } else {
+                    h
+                }
+            })
+    }
     pub fn native_tabs_enabled(&self) -> bool {
         // Default is enabled.
         !self
@@ -1180,6 +1199,8 @@ pub struct RestoreOptions {
 #[derive(Deserialize, Clone, Debug, Default)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct MainOptions {
+    /// Enable whole-column reordering by dragging a native title bar. Default false.
+    pub drag_reorder: Option<bool>,
     /// Enables or disables focus follows mouse behavior.
     pub focus_follows_mouse: Option<bool>,
     /// Enables or disables mouse follows focus behavior.
@@ -1256,6 +1277,8 @@ pub struct MainOptions {
     /// If enabled, an empty virtual workspace will be removed.
     /// Default: true.
     pub reap_empty_workspaces: Option<bool>,
+    pub tab_style: Option<String>,
+    pub tab_height: Option<i32>,
 
     /// Disable detection of native macOS tabs. When set, newly-spawned windows are
     /// never auto-merged into a tab group with an existing same-app sibling.
@@ -2523,6 +2546,14 @@ mod lua_setup_tests {
         let lua = Lua::new();
         let value: mlua::Value = lua.load(source).eval().expect("lua chunk should evaluate");
         config_from_lua(&lua, value).expect("config_from_lua should succeed")
+    }
+
+    #[test]
+    #[ignore = "requires PANERU_TEST_SETTINGS_FILE pointing to generated settings Lua"]
+    fn generated_settings_file_uses_real_rust_config_parser() {
+        let path = std::env::var("PANERU_TEST_SETTINGS_FILE").expect("settings fixture path");
+        let source = std::fs::read_to_string(path).expect("read generated settings");
+        let _ = config_from_source(&source);
     }
 
     #[test]

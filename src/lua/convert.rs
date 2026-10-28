@@ -78,6 +78,7 @@ pub enum LuaEvent {
     SystemWoke { message: String },
 
     ThemeChanged,
+    LayoutChanged,
 }
 
 /// Pointer position and modifier state, flattened into the event table.
@@ -254,8 +255,11 @@ impl TryFrom<&Event> for LuaEvent {
             | Event::Command { .. }
             | Event::StateQuery { .. }
             | Event::WindowSetQuery { .. }
+            | Event::LayoutDrop { .. }
+            | Event::RowDrop { .. }
             | Event::StateSubscribe { .. }
-            | Event::ScriptState { .. } => return Err(NotMarshallable),
+            | Event::ScriptState { .. }
+            | Event::CancelKeyboardFocusHandoff => return Err(NotMarshallable),
         })
     }
 }
@@ -309,6 +313,7 @@ impl LuaEvent {
         "menu_bar_hidden_changed",
         "system_woke",
         "theme_changed",
+        "layout_changed",
     ];
 
     /// Whether `name` is an event the runtime can actually emit.
@@ -363,6 +368,7 @@ impl LuaEvent {
             Self::MenuBarHiddenChanged { .. } => "menu_bar_hidden_changed",
             Self::SystemWoke { .. } => "system_woke",
             Self::ThemeChanged => "theme_changed",
+            Self::LayoutChanged => "layout_changed",
         }
     }
 
@@ -475,6 +481,7 @@ mod tests {
                 message: "m".into(),
             },
             LuaEvent::ThemeChanged,
+            LuaEvent::LayoutChanged,
         ]
     }
 

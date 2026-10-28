@@ -1154,6 +1154,34 @@ pub(super) fn spawn_window_trigger(
     }
 }
 
+/// Reflow existing tiled windows after a settings reload, retaining their widths.
+/// Floating windows retain their padding and native frames.
+#[allow(clippy::type_complexity)]
+pub(super) fn refresh_window_layout_config(
+    config: Res<Config>,
+    apps: Query<&Application>,
+    mut windows: Query<(&mut Window, &mut Position, &mut Bounds, &ChildOf), Without<Unmanaged>>,
+    mut strips: Query<&mut LayoutStrip>,
+) {
+    for (mut window, mut position, mut bounds, child) in &mut windows {
+        let Ok(app) = apps.get(child.parent()) else {
+            continue;
+        };
+        let properties = WindowProperties::new(app, &window, &config);
+        let vertical = properties.vertical_padding().clamp(0, 50);
+        let horizontal = properties.horizontal_padding().clamp(0, 50);
+        if window.vertical_padding() != vertical || window.horizontal_padding() != horizontal {
+            window.set_padding(WindowPadding::Vertical(vertical));
+            window.set_padding(WindowPadding::Horizontal(horizontal));
+            bounds.set_changed();
+            position.set_changed();
+        }
+    }
+    for mut strip in &mut strips {
+        strip.set_changed();
+    }
+}
+
 pub(super) fn apply_window_defaults(
     mut windows: WindowDefaultsQueries,
     apps: Query<(Entity, &Application)>,

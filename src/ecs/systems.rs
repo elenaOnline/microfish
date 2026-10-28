@@ -5,7 +5,7 @@ use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
 use bevy::ecs::system::{
-    Commands, Local, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single,
+    Commands, Local, NonSend, NonSendMut, ParamSet, Populated, Query, Res, ResMut, Single,
 };
 use bevy::math::IRect;
 use bevy::tasks::AsyncComputeTaskPool;
@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, BProcess, ExistingMarker, FreshMarker, RepositionMarker, ResizeMarker,
+    ActiveDisplayMarker, BProcess, ExistingMarker, FreshMarker, MouseDraggingMarker,
+    MouseHeldMarker, NativeMouseResize, NativeSiblingResize, RepositionMarker, ResizeMarker,
     RetryFrontSwitch, SpawnWindowTrigger, Timeout, VerifyWindowPosition,
 };
 
@@ -55,13 +56,14 @@ type MovableWindows<'w, 's> = Query<
     'w,
     's,
     (
+        Entity,
         &'static mut Window,
         &'static mut Position,
         &'static Bounds,
         Option<&'static Unmanaged>,
         Has<RepositionMarker>,
     ),
-    Without<LayoutStrip>,
+    (Without<LayoutStrip>, Without<super::drag::NativeColumnDrag>),
 >;
 
 /// Windows as the resize handler rewrites them: the OS handle to re-read the
@@ -79,6 +81,53 @@ type ResizableWindows<'w, 's> = Query<
         Has<ResizeMarker>,
     ),
     Without<LayoutStrip>,
+>;
+
+type SizeCommits<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        &'static mut Window,
+        &'static Bounds,
+        &'static mut WidthRatio,
+        Option<&'static NativeMouseResize>,
+        Option<&'static NativeSiblingResize>,
+    ),
+    (Changed<Bounds>, Without<super::drag::NativeColumnDrag>),
+>;
+
+type ProgrammaticGeometry = (
+    Without<NativeMouseResize>,
+    Without<super::drag::NativeColumnDrag>,
+);
+type MoveAnimations<'w, 's> = Populated<
+    'w,
+    's,
+    (&'static mut Position, Entity, &'static RepositionMarker),
+    ProgrammaticGeometry,
+>;
+type SizeAnimations<'w, 's> =
+    Populated<'w, 's, (&'static mut Bounds, Entity, &'static ResizeMarker), ProgrammaticGeometry>;
+type PositionCommits<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        &'static mut Window,
+        &'static Position,
+        Option<&'static NativeMouseResize>,
+    ),
+    (Changed<Position>, Without<super::drag::NativeColumnDrag>),
+>;
+type PositionVerifications<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut Window,
+        &'static Position,
+        &'static mut VerifyWindowPosition,
+    ),
+    ProgrammaticGeometry,
 >;
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
@@ -162,6 +211,13 @@ pub fn initialise_workspaces(
             continue;
         }
         for virtual_index in 1..wanted {
+            if strips.iter().any(|(candidate, parent, _)| {
+                candidate.id() == strip.id()
+                    && parent.parent() == child_of.parent()
+                    && candidate.virtual_index == virtual_index
+            }) {
+                continue;
+            }
             commands.spawn_layout_strip(
                 LayoutStrip::new(strip.id(), virtual_index),
                 origin.0,
@@ -296,6 +352,11 @@ pub(crate) fn finish_setup(
 
     let mut focused_managed_window = false;
     for (mut strip, active_strip, _) in &mut workspaces {
+        // macOS reports physical Space membership, not our virtual rows.
+        // Seed physical windows once; the restore pass redistributes saved rows.
+        if strip.virtual_index != 0 {
+            continue;
+        }
         debug!("space {}: before refresh {strip:?}", strip.id());
         let workspace_windows = window_manager
             .windows_in_workspace(strip.id())
@@ -587,7 +648,7 @@ fn ease_out_factor(rate: f64, delta: f64) -> f32 {
 /// * `commands` - Bevy commands to remove the `RepositionMarker` when animation is complete.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
-    animate: Populated<(&mut Position, Entity, &RepositionMarker)>,
+    animate: MoveAnimations,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
@@ -635,7 +696,7 @@ pub(super) fn animate_entities(
 /// * `commands` - Bevy commands to remove the `ResizeMarker` when resizing is complete.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_resize_entities(
-    animate: Populated<(&mut Bounds, Entity, &ResizeMarker)>,
+    animate: SizeAnimations,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
@@ -787,6 +848,10 @@ pub(super) fn window_resized_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: ResizableWindows,
     mut workspaces: Query<(&LayoutStrip, &mut Position)>,
+    held: Query<&MouseHeldMarker, With<MouseDraggingMarker>>,
+    native_resizes: Query<(Entity, &NativeMouseResize)>,
+    pending_siblings: Query<&NativeSiblingResize>,
+    mut commands: Commands,
 ) {
     for event in messages.read() {
         let Event::WindowResized { window_id } = event else {
@@ -806,7 +871,16 @@ pub(super) fn window_resized_update_frame(
         // and `animate_resize_entities` is still stepping toward it, so reading
         // the echo in here would fight the animation producing that difference.
         // Only a resize we did not initiate is new information.
-        if resizing {
+        // Pending direct writes remain requests until physically verified.
+        // Their delayed echoes must never become column width authorities.
+        let pointer_owned = held.iter().any(|marker| marker.0 == entity);
+        if pending_siblings.contains(entity) {
+            if !pointer_owned {
+                continue;
+            }
+            commands.entity(entity).remove::<NativeSiblingResize>();
+        }
+        if resizing && !pointer_owned {
             continue;
         }
         let Ok(new_frame) = window.update_frame() else {
@@ -815,17 +889,41 @@ pub(super) fn window_resized_update_frame(
         let active_strip = workspaces
             .iter_mut()
             .find(|(strip, _)| strip.contains(entity));
-        let tabbed = active_strip
-            .as_ref()
-            .is_some_and(|strip| strip.0.tabbed(entity));
-
+        // Echoes from sibling AX writes may arrive after the pointer has
+        // already changed width again. Only the owning member may replace
+        // the column's width until release.
+        if !pointer_owned
+            && let Some((strip, _)) = active_strip.as_ref()
+            && let Some(owner) = native_resizes
+                .iter()
+                .map(|(owner, _)| owner)
+                .chain(held.iter().map(|marker| marker.0))
+                .find(|owner| {
+                    *owner != entity && strip.index_of(*owner).ok() == strip.index_of(entity).ok()
+                })
+        {
+            // Reassert the latest logical sibling size without adopting its
+            // lagging native frame as fresh column geometry.
+            if new_frame.size() != bounds.0 {
+                commands
+                    .entity(entity)
+                    .insert(NativeSiblingResize::new(owner, bounds.0.x));
+                bounds.set_changed();
+            }
+            continue;
+        }
+        if pointer_owned && active_strip.is_some() {
+            commands
+                .entity(entity)
+                .insert(NativeMouseResize {
+                    x: new_frame.min.x,
+                    width: new_frame.width(),
+                })
+                .remove::<(ResizeMarker, RepositionMarker, VerifyWindowPosition)>();
+        }
         let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
         if old_frame.size() != new_frame.size() {
-            if tabbed {
-                bounds.bypass_change_detection().0 = new_frame.size();
-            } else {
-                bounds.0 = new_frame.size();
-            }
+            bounds.0 = new_frame.size();
         }
 
         // If the window was resized, shift LayoutStrip slightly to avoid moving right corner.
@@ -833,10 +931,27 @@ pub(super) fn window_resized_update_frame(
             // Floating window, don't nudge the strip.
             continue;
         };
-        if tabbed {
-            // Native tabs share a single layout slot. Keep the strip anchored
-            // and let the tab sync/layout systems propagate the new size.
-            continue;
+        // The member under the pointer owns the width, including a lower
+        // split member or an inactive synthetic/native tab. Update every
+        // member before layout reads its stable first-member representative.
+        let siblings = strip
+            .index_of(entity)
+            .ok()
+            .and_then(|index| strip.get(index).ok())
+            .map(|column| column.window_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for sibling in siblings {
+            if pointer_owned && sibling != entity {
+                commands
+                    .entity(sibling)
+                    .remove::<NativeMouseResize>()
+                    .insert(NativeSiblingResize::new(entity, new_frame.width()));
+            }
+            if let Ok((_, _, _, mut sibling_bounds, _, _)) = windows.get_mut(sibling)
+                && sibling_bounds.0.x != new_frame.width()
+            {
+                sibling_bounds.0.x = new_frame.width();
+            }
         }
 
         if old_frame.min.x != new_frame.min.x {
@@ -858,19 +973,59 @@ pub(super) fn window_resized_update_frame(
     }
 }
 
+/// A parking correction must not become a feedback loop with an app's own
+/// frame constraints. Keep a finite budget until the row is shown again or
+/// layout chooses a different target. Successful echoes do not reset it.
+#[derive(Default)]
+pub(crate) struct ParkingCorrections(EntityHashMap<(crate::manager::Origin, u8)>);
+
+impl ParkingCorrections {
+    fn allows(
+        &mut self,
+        entity: Entity,
+        target: crate::manager::Origin,
+        actual: crate::manager::Origin,
+    ) -> bool {
+        let entry = self.0.entry(entity).or_insert((target, 0));
+        if entry.0 != target {
+            *entry = (target, 0);
+        }
+        // Small edge clamps are harmless; fighting them exposes flickering slivers.
+        if (target.x - actual.x).abs() <= 8 && (target.y - actual.y).abs() <= 8 {
+            return false;
+        }
+        if entry.1 >= 2 {
+            return false;
+        }
+        entry.1 += 1;
+        true
+    }
+}
+
 #[instrument(level = Level::TRACE, skip_all)]
 pub(crate) fn window_moved_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: MovableWindows,
+    strips: Query<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    mut corrections: Local<ParkingCorrections>,
 ) {
+    corrections.0.retain(|entity, _| {
+        strips
+            .iter()
+            .any(|(strip, active)| !active && strip.contains(*entity))
+    });
+    let mut handled = HashSet::new();
     for event in messages.read() {
         let Event::WindowMoved { window_id } = event else {
             continue;
         };
 
-        let Some((mut window, mut position, bounds, unmanaged, repositioning)) = windows
+        if !handled.insert(*window_id) {
+            continue;
+        }
+        let Some((entity, mut window, mut position, bounds, unmanaged, repositioning)) = windows
             .iter_mut()
-            .find(|window| window.0.id() == *window_id)
+            .find(|window| window.1.id() == *window_id)
         else {
             continue;
         };
@@ -887,6 +1042,21 @@ pub(crate) fn window_moved_update_frame(
             continue;
         };
 
+        // Background apps can restore/constrain their own frames after our
+        // parking move. Accepting that echo strands the window on screen:
+        // the strip did not change, so layout has no reason to place it again.
+        // A real focus event activates the row separately; a move alone must
+        // never make a hidden row visible. Keep visible-row mouse moves intact.
+        let hidden_row = strips
+            .iter()
+            .any(|(strip, active)| !active && strip.all_windows().contains(&entity));
+        if hidden_row {
+            if corrections.allows(entity, position.0, new_frame.min) {
+                window.reposition(position.0);
+            }
+            // Preserve the layout target even if an app refuses correction.
+            continue;
+        }
         let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
         if old_frame.min != new_frame.min {
             position.0 = new_frame.min;
@@ -1102,23 +1272,25 @@ pub(super) fn update_overlays(
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn commit_window_position(
-    mut moved_windows: Populated<(&mut Window, &Position), Changed<Position>>,
-) {
+pub(super) fn commit_window_position(mut moved_windows: PositionCommits) {
     // `par_iter_mut` runs on `ComputeTaskPool` worker threads, which have no
     // `CFRunLoop` of their own to drain thread-local autorelease pools.
     moved_windows
         .par_iter_mut()
-        .for_each(|(mut window, position)| {
-            objc2::rc::autoreleasepool(|_| window.reposition(position.0));
+        .for_each(|(mut window, position, native)| {
+            let mut origin = position.0;
+            if let Some(native) = native {
+                origin.x = native.x;
+                if window.frame().min == origin {
+                    return;
+                }
+            }
+            objc2::rc::autoreleasepool(|_| window.reposition(origin));
         });
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn verify_window_position(
-    mut windows: Populated<(Entity, &mut Window, &Position, &mut VerifyWindowPosition)>,
-    mut commands: Commands,
-) {
+pub(super) fn verify_window_position(mut windows: PositionVerifications, mut commands: Commands) {
     for (entity, mut window, position, mut verification) in &mut windows {
         if window
             .update_frame()
@@ -1140,17 +1312,139 @@ pub(super) fn verify_window_position(
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn commit_window_size(
-    active_display: ActiveDisplay,
-    mut resized_windows: Populated<(&mut Window, &Bounds, &mut WidthRatio), Changed<Bounds>>,
-) {
+pub(super) fn commit_window_size(active_display: ActiveDisplay, mut resized_windows: SizeCommits) {
     let display_bounds = active_display.bounds();
-    resized_windows
-        .par_iter_mut()
-        .for_each(|(mut window, size, mut width_ratio)| {
+    resized_windows.par_iter_mut().for_each(
+        |(mut window, size, mut width_ratio, native, sibling)| {
             width_ratio.0 = f64::from(size.0.x) / f64::from(display_bounds.width());
-            objc2::rc::autoreleasepool(|_| window.resize(size.0));
-        });
+            let mut target = size.0;
+            if let Some(native) = native {
+                target.x = native.width;
+                if window.frame().size() == target {
+                    return;
+                }
+            }
+            objc2::rc::autoreleasepool(|_| {
+                if sibling.is_some() {
+                    window.request_native_sibling_size(target);
+                } else {
+                    window.resize(target);
+                }
+            });
+        },
+    );
+}
+
+/// Check actual sibling frames, not optimistic cache or logical Bounds. The
+/// latest target replaces the previous retry budget; no retry touches owner.
+#[allow(clippy::type_complexity)]
+pub(super) fn verify_native_sibling_resize(
+    mut windows: ParamSet<(
+        Populated<(Entity, &mut Window, &Bounds, &mut NativeSiblingResize)>,
+        Query<&mut Bounds>,
+    )>,
+    held: Query<&MouseHeldMarker>,
+    strips: Query<&LayoutStrip>,
+    time: Res<Time>,
+    mut commands: Commands,
+) {
+    let mut constraints = Vec::new();
+    for (entity, mut window, bounds, mut pending) in &mut windows.p0() {
+        if held.iter().any(|marker| marker.0 == entity) {
+            // A new physical gesture outranks every older sibling request.
+            commands.entity(entity).remove::<NativeSiblingResize>();
+            continue;
+        }
+        let tracking = held.iter().any(|marker| marker.0 == pending.owner);
+        if !tracking && !pending.released {
+            // Tracking itself may make background AX requests unavailable.
+            // Give the final target one fresh bounded budget after release
+            // before treating an observed width as an application constraint.
+            pending.released = true;
+            pending.exhausted = false;
+            pending.remaining = 6;
+            pending.timer.reset();
+        }
+        if pending.exhausted && tracking {
+            continue;
+        }
+        pending.timer.tick(time.delta());
+        if !pending.timer.just_finished() {
+            continue;
+        }
+        let frame = window.native_sibling_frame();
+        if let Ok(frame) = frame
+            && (frame.width() - pending.width).abs() <= 1
+        {
+            commands.entity(entity).remove::<NativeSiblingResize>();
+            continue;
+        }
+        if pending.remaining > 0 {
+            pending.remaining -= 1;
+            let target = bounds.0.with_x(pending.width);
+            window.request_native_sibling_size(target);
+            continue;
+        }
+        if tracking {
+            pending.exhausted = true;
+            continue;
+        }
+        // A persistent minimum or rejection cannot be made smaller by ECS.
+        // Reconcile a wider physical constraint only after the pointer releases.
+        if let Ok(frame) = frame {
+            let width = frame.width().max(pending.width);
+            if let Some(column) = strips.iter().find_map(|strip| {
+                strip
+                    .index_of(entity)
+                    .ok()
+                    .and_then(|index| strip.get(index).ok())
+            }) {
+                constraints.push((column.window_iter().collect::<Vec<_>>(), width));
+            }
+            warn!(
+                window_id = window.id(),
+                requested_width = pending.width,
+                actual_width = frame.width(),
+                "native sibling resize exhausted bounded retries"
+            );
+        } else {
+            warn!(
+                window_id = window.id(),
+                "native sibling frame unavailable after bounded retries"
+            );
+        }
+        commands.entity(entity).remove::<NativeSiblingResize>();
+    }
+    for (members, width) in constraints {
+        for member in members {
+            if let Ok(mut bounds) = windows.p1().get_mut(member) {
+                bounds.0.x = bounds.0.x.max(width);
+            }
+        }
+    }
+}
+
+/// Reconcile once after release or a lost-release timeout. Populated keeps
+/// this dormant whenever no native drag owns a window.
+pub(super) fn finish_native_mouse_resize(
+    resized: Populated<(Entity, &mut Position, &mut Bounds), With<NativeMouseResize>>,
+    held: Query<&MouseHeldMarker>,
+    mut strips: Query<&mut LayoutStrip>,
+    mut commands: Commands,
+) {
+    for (entity, mut position, mut bounds) in resized {
+        if held.iter().any(|marker| marker.0 == entity) {
+            continue;
+        }
+        commands.entity(entity).remove::<NativeMouseResize>();
+        position.set_changed();
+        bounds.set_changed();
+        for mut strip in &mut strips {
+            if strip.contains(entity) {
+                strip.set_changed();
+            }
+        }
+    }
 }
 
 /// Restores user-visible window state before Paneru shuts down: clears any
@@ -1624,5 +1918,35 @@ mod tests {
         app.update();
 
         assert_eq!(tap_config.swipe_gesture_fingers(), Some(3));
+    }
+}
+
+#[cfg(test)]
+mod parking_correction_tests {
+    use super::*;
+    use crate::manager::Origin;
+    #[test]
+    fn corrections_are_bounded_and_successful_echoes_do_not_rearm() {
+        let mut budget = ParkingCorrections::default();
+        let entity = Entity::from_bits(123);
+        let target = Origin::new(1500, 970);
+        let escaped = Origin::new(16, 50);
+        for attempt in 0..20 {
+            assert_eq!(budget.allows(entity, target, escaped), attempt < 2);
+            assert!(!budget.allows(entity, target, target));
+        }
+        assert!(budget.allows(entity, target + Origin::new(10, 0), escaped));
+        budget.0.remove(&entity); // Showing the row starts a new parking episode.
+        assert!(budget.allows(entity, target, escaped));
+    }
+    #[test]
+    fn small_edge_clamps_do_not_trigger_correction() {
+        let mut budget = ParkingCorrections::default();
+        let entity = Entity::from_bits(123);
+        let target = Origin::new(1500, 970);
+        for _ in 0..100 {
+            assert!(!budget.allows(entity, target, target + Origin::new(-2, -4)));
+        }
+        assert!(budget.allows(entity, target, Origin::new(16, 50)));
     }
 }

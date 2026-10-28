@@ -74,6 +74,25 @@ impl CommandReader {
         } = delivery;
 
         match value {
+            Request::RowDrop(drop) => {
+                answer(events, reply, "row drop", move |respond_to| {
+                    Event::RowDrop { drop, respond_to }
+                });
+            }
+            Request::LayoutDrop(drop) => {
+                answer(events, reply, "layout drop", move |respond_to| {
+                    Event::LayoutDrop { drop, respond_to }
+                });
+            }
+            Request::Recording { token, begin } => {
+                let response = match crate::platform::recording::update(&token, begin) {
+                    Ok(()) => crate::types::wire::Response::Recording,
+                    Err(error) => crate::types::wire::Response::Error(error),
+                };
+                if let Some(reply) = reply {
+                    let _ = reply.send(&response);
+                }
+            }
             // Fire-and-forget: no reply is sent for this request.
             Request::Command(command) => {
                 send(&events, Event::Command { command });

@@ -1,8 +1,8 @@
 use accessibility_sys::{
-    AXUIElementCreateApplication, AXUIElementRef, AXValueCreate, AXValueGetValue,
-    kAXFloatingWindowSubrole, kAXPositionAttribute, kAXRaiseAction, kAXSizeAttribute,
-    kAXStandardWindowSubrole, kAXUnknownSubrole, kAXValueTypeCGPoint, kAXValueTypeCGSize,
-    kAXWindowRole,
+    AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout, AXValueCreate,
+    AXValueGetValue, kAXFloatingWindowSubrole, kAXPositionAttribute, kAXRaiseAction,
+    kAXSizeAttribute, kAXStandardWindowSubrole, kAXUnknownSubrole, kAXValueTypeCGPoint,
+    kAXValueTypeCGSize, kAXWindowRole,
 };
 use bevy::ecs::component::Component;
 use bevy::math::IRect;
@@ -92,6 +92,10 @@ pub trait WindowApi: Send + Sync {
     fn is_full_screen(&self) -> bool;
     fn reposition(&mut self, origin: Origin);
     fn resize(&mut self, size: Size);
+    /// One bounded AX request while another window is in native tracking.
+    fn request_native_sibling_size(&mut self, size: Size);
+    /// Read physical geometry with a short per-element AX timeout.
+    fn native_sibling_frame(&mut self) -> Result<IRect>;
     fn update_frame(&mut self) -> Result<IRect>;
     fn focus_without_raise(
         &self,
@@ -632,6 +636,30 @@ impl WindowApi for WindowOS {
             self.set_ax_position(target_origin);
         }
         self.reenable_enhanced_ui();
+    }
+
+    fn request_native_sibling_size(&mut self, size: Size) {
+        // Background apps can defer AX work during another app's native drag.
+        // Never enter the normal multi-read/staging loop on this path. Zero
+        // restores the element's default timeout after this one request.
+        unsafe {
+            AXUIElementSetMessagingTimeout(self.ax_element.as_ptr(), 0.01);
+        }
+        self.set_ax_size(size);
+        unsafe {
+            AXUIElementSetMessagingTimeout(self.ax_element.as_ptr(), 0.0);
+        }
+    }
+
+    fn native_sibling_frame(&mut self) -> Result<IRect> {
+        unsafe {
+            AXUIElementSetMessagingTimeout(self.ax_element.as_ptr(), 0.01);
+        }
+        let frame = self.update_frame();
+        unsafe {
+            AXUIElementSetMessagingTimeout(self.ax_element.as_ptr(), 0.0);
+        }
+        frame
     }
 
     /// Updates the internal `frame` of the window by querying its current position and size from the Accessibility API.

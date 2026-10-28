@@ -112,6 +112,7 @@ impl WindowHardMatchKey {
 pub(crate) enum PlannedColumn {
     Single(Entity),
     Stack(Vec<PlannedStackItem>),
+    TabbedStack(Vec<PlannedStackItem>),
     Tabs(Vec<Entity>),
     Fullscreen(Entity),
 }
@@ -124,6 +125,7 @@ pub(crate) enum PlannedStackItem {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlannedStrip {
+    pub side_tabs: bool,
     pub workspace_id: WorkspaceId,
     pub display_id: Option<CGDirectDisplayID>,
     pub virtual_index: u32,
@@ -190,7 +192,10 @@ impl<'a> RestorePlanner<'a> {
             .filter_map(|column| self.plan_column(column, current, plan))
             .collect::<Vec<_>>();
 
-        (!columns.is_empty()).then_some(PlannedStrip {
+        // Empty saved rows are intentional capacity. A nonempty saved row
+        // whose windows disappeared still drops out of the restore plan.
+        (!columns.is_empty() || strip.columns.is_empty()).then_some(PlannedStrip {
+            side_tabs: strip.side_tabs,
             workspace_id: workspace.workspace_id,
             display_id: workspace.display_id,
             virtual_index: strip.virtual_index,
@@ -216,12 +221,22 @@ impl<'a> RestorePlanner<'a> {
                     .filter_map(|saved| self.match_window(saved, current, plan))
                     .collect(),
             ),
-            SavedColumn::Stack(items) => compact_stack_items(
-                items
-                    .iter()
-                    .filter_map(|item| self.plan_stack_item(item, current, plan))
-                    .collect(),
-            ),
+            SavedColumn::Stack(items) | SavedColumn::TabbedStack(items) => {
+                let compacted = compact_stack_items(
+                    items
+                        .iter()
+                        .filter_map(|item| self.plan_stack_item(item, current, plan))
+                        .collect(),
+                );
+                compacted.map(|planned| match planned {
+                    PlannedColumn::Stack(items)
+                        if matches!(column, SavedColumn::TabbedStack(_)) =>
+                    {
+                        PlannedColumn::TabbedStack(items)
+                    }
+                    other => other,
+                })
+            }
         }
     }
 
@@ -330,7 +345,9 @@ fn saved_windows_in_column(column: &SavedColumn) -> Box<dyn Iterator<Item = &Sav
             Box::new(std::iter::once(saved))
         }
         SavedColumn::Tabs(tabs) => Box::new(tabs.iter()),
-        SavedColumn::Stack(items) => Box::new(items.iter().flat_map(saved_windows_in_stack_item)),
+        SavedColumn::Stack(items) | SavedColumn::TabbedStack(items) => {
+            Box::new(items.iter().flat_map(saved_windows_in_stack_item))
+        }
     }
 }
 
@@ -435,7 +452,7 @@ pub(super) fn restore_window_state(
     let current = current_window_identities(&ctx.windows, &apps, restoration);
     let plan = RestorePlanner::new(restoration).plan(&current);
 
-    if plan.consumed_entities.is_empty() {
+    if plan.strips.is_empty() {
         info!(
             "Session restore matched 0 windows; missing={}, ambiguous={}",
             plan.ignored_missing_windows, plan.skipped_ambiguous_matches
@@ -501,10 +518,6 @@ pub(super) fn restore_window_state(
         };
 
         let mut strip = layout_strip_from_plan(planned);
-        if strip.all_windows().is_empty() {
-            continue;
-        }
-
         // Keep unmatched startup windows on the same normal row. Fullscreen
         // strips must remain single-column, so leave those rows separate.
         if !strip.is_fullscreen()
@@ -578,6 +591,7 @@ fn layout_strip_from_plan(planned: &PlannedStrip) -> LayoutStrip {
 
     let mut strip = LayoutStrip::new(planned.workspace_id, planned.virtual_index);
     apply_planned_columns(&mut strip, &planned.columns);
+    strip.restore_side_tabs(planned.side_tabs);
     strip
 }
 
@@ -687,8 +701,19 @@ fn apply_planned_columns(strip: &mut LayoutStrip, columns: &[PlannedColumn]) {
             PlannedColumn::Tabs(entities) => {
                 append_tabs(strip, entities);
             }
-            PlannedColumn::Stack(items) => {
+            PlannedColumn::Stack(items) | PlannedColumn::TabbedStack(items) => {
                 append_stack(strip, items);
+                if matches!(column, PlannedColumn::TabbedStack(_))
+                    && let Some(first) = items.first()
+                {
+                    let leader = match first {
+                        PlannedStackItem::Single(entity) => Some(*entity),
+                        PlannedStackItem::Tabs(entities) => entities.first().copied(),
+                    };
+                    if let Some(leader) = leader {
+                        strip.toggle_tabbed_display(leader);
+                    }
+                }
             }
         }
     }
@@ -749,5 +774,35 @@ fn compact_stack_items(items: Vec<PlannedStackItem>) -> Option<PlannedColumn> {
         [PlannedStackItem::Single(entity)] => Some(PlannedColumn::Single(*entity)),
         [PlannedStackItem::Tabs(entities)] => Some(PlannedColumn::Tabs(entities.clone())),
         _ => Some(PlannedColumn::Stack(items)),
+    }
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+    #[test]
+    fn restored_presentation_distinguishes_split_and_tabbed_stacks() {
+        let mut world = bevy::prelude::World::new();
+        let a = world.spawn_empty().id();
+        let b = world.spawn_empty().id();
+        let items = vec![PlannedStackItem::Single(a), PlannedStackItem::Single(b)];
+        for tabbed in [false, true] {
+            let mut strip = LayoutStrip::default();
+            let col = if tabbed {
+                PlannedColumn::TabbedStack(items.clone())
+            } else {
+                PlannedColumn::Stack(items.clone())
+            };
+            apply_planned_columns(&mut strip, &[col]);
+            assert_eq!(strip.is_tabbed_display(a), tabbed);
+            assert_eq!(strip.is_tabbed_display(b), tabbed);
+            assert_eq!(
+                strip
+                    .columns()
+                    .flat_map(|col| col.window_iter())
+                    .collect::<Vec<_>>(),
+                vec![a, b]
+            );
+        }
     }
 }

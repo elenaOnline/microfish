@@ -50,6 +50,8 @@ pub struct InputEvent(pub Event);
 #[cfg_attr(not(feature = "lua"), allow(dead_code))]
 #[derive(Clone, Debug, Message)]
 pub enum Event {
+    /// A deliberate app switch or Escape cancels pending keyboard focus retries.
+    CancelKeyboardFocusHandoff,
     /// Signals the application to exit.
     Exit,
     /// Indicates that the initial set of processes has been loaded.
@@ -209,6 +211,16 @@ pub enum Event {
     /// A client has asked for the window set: the same layout value a
     /// `paneru.windows` handler is given inside the daemon.
     WindowSetQuery { respond_to: Reply },
+
+    RowDrop {
+        drop: crate::types::wire::RowDrop,
+        respond_to: Reply,
+    },
+
+    LayoutDrop {
+        drop: crate::types::wire::LayoutDrop,
+        respond_to: Reply,
+    },
 
     /// A client has subscribed to state events. Carries the channel they are
     /// pushed to, which outlives the request that delivered it.

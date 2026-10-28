@@ -16,8 +16,8 @@ use crate::{
     config::Config,
     ecs::{
         ActiveWorkspaceMarker, Bounds, DockPosition, FlashMessage, FocusedMarker, FullWidthMarker,
-        Initializing, LayoutPosition, NativeFullscreenMarker, Position, RepositionMarker,
-        ResizeMarker, Scrolling, Unmanaged, WidthRatio, layout::LayoutStrip,
+        Initializing, LayoutPosition, NativeFullscreenMarker, NativeSiblingResize, Position,
+        RepositionMarker, ResizeMarker, Scrolling, Unmanaged, WidthRatio, layout::LayoutStrip,
     },
     manager::{Application, Display, Origin, Size, Window},
     platform::{ProcessSerialNumber, WinID},
@@ -201,8 +201,10 @@ impl ActiveDisplayMut<'_, '_> {
 /// event pump to decide how long it may sleep.
 #[derive(SystemParam)]
 pub struct FrameActivity<'w, 's> {
+    keyboard_focus: Option<Res<'w, crate::ecs::focus::KeyboardFocusHandoff>>,
     repositioning: Query<'w, 's, (), With<RepositionMarker>>,
     resizing: Query<'w, 's, (), With<ResizeMarker>>,
+    native_siblings: Query<'w, 's, &'static NativeSiblingResize>,
     scrolling: Query<'w, 's, (), With<Scrolling>>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
 }
@@ -211,8 +213,15 @@ impl FrameActivity<'_, '_> {
     /// Returns `true` while any window is being moved, resized or scrolled, or
     /// a flash message is on screen — i.e. while frames still need drawing.
     pub fn mid_frame(&self) -> bool {
-        !self.repositioning.is_empty()
+        self.keyboard_focus
+            .as_ref()
+            .is_some_and(|pending| pending.active())
+            || !self.repositioning.is_empty()
             || !self.resizing.is_empty()
+            || self
+                .native_siblings
+                .iter()
+                .any(|pending| !pending.exhausted)
             || !self.scrolling.is_empty()
             || !self.flash_messages.is_empty()
     }

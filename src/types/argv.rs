@@ -77,6 +77,19 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
             argv.get(1)
                 .map_or(Ok(ResizeDirection::Grow), |arg| ResizeDirection::parse(arg))?,
         ),
+        "undo" => Operation::UndoMove,
+        "viewback" => Operation::ViewBack,
+        "viewend" => Operation::ViewEnd,
+        "viewpin" => Operation::ViewPin(
+            argument()?
+                .parse()
+                .map_err(|_| ParseError::new("invalid view slot"))?,
+        ),
+        "viewsave" => Operation::ViewSave(
+            argument()?
+                .parse()
+                .map_err(|_| ParseError::new("invalid view slot"))?,
+        ),
         "grow" => Operation::Resize(ResizeDirection::Grow),
         "shrink" => Operation::Resize(ResizeDirection::Shrink),
         // `window_vertical_resize` / `_grow` / `_shrink`, plus the explicit
@@ -106,6 +119,9 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "virtualfocus" => Operation::FocusOrVirtual(Direction::parse(argument()?)?),
         "virtualnum" => Operation::VirtualNumber(parse_virtual_workspace_number(argument()?)?),
         "virtualadd" => Operation::VirtualAdd,
+        "row" => Operation::Row(Direction::parse(argument()?)?),
+        "rowmove" => Operation::RowMove(Direction::parse(argument()?)?),
+        "rowcolumnmove" => Operation::RowColumnMove(Direction::parse(argument()?)?),
         "virtualmove" => virtual_target(
             argument()?,
             |direction| Operation::VirtualMove(direction, MoveFocus::Follow),
@@ -179,6 +195,11 @@ impl Operation {
     fn to_argv(&self) -> Vec<String> {
         let owned = |args: &[&str]| args.iter().map(|arg| (*arg).to_string()).collect();
         match self {
+            Operation::UndoMove => owned(&["undo"]),
+            Operation::ViewBack => owned(&["viewback"]),
+            Operation::ViewEnd => owned(&["viewend"]),
+            Operation::ViewPin(slot) => vec!["viewpin".into(), slot.to_string()],
+            Operation::ViewSave(slot) => vec!["viewsave".into(), slot.to_string()],
             Operation::Focus(direction) => vec!["focus".to_string(), direction.token()],
             Operation::Swap(direction) => vec!["swap".to_string(), direction.token()],
             Operation::Center => owned(&["center"]),
@@ -206,6 +227,9 @@ impl Operation {
                 vec!["virtualnum".to_string(), (index + 1).to_string()]
             }
             Operation::VirtualAdd => owned(&["virtualadd"]),
+            Operation::Row(direction) => vec!["row".into(), direction.token()],
+            Operation::RowMove(direction) => vec!["rowmove".into(), direction.token()],
+            Operation::RowColumnMove(direction) => vec!["rowcolumnmove".into(), direction.token()],
             Operation::VirtualMove(direction, MoveFocus::Follow) => {
                 vec!["virtualmove".to_string(), direction.token()]
             }
@@ -261,6 +285,12 @@ mod tests {
             Operation::FocusOrVirtual(Direction::North),
             Operation::FocusOrVirtual(Direction::South),
             Operation::VirtualNumber(2),
+            Operation::Row(Direction::North),
+            Operation::Row(Direction::South),
+            Operation::RowMove(Direction::North),
+            Operation::RowMove(Direction::South),
+            Operation::RowColumnMove(Direction::North),
+            Operation::RowColumnMove(Direction::South),
             Operation::VirtualMove(Direction::East, MoveFocus::Follow),
             Operation::VirtualMove(Direction::East, MoveFocus::Stay),
             Operation::VirtualMoveNumber(0, MoveFocus::Follow),

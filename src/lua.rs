@@ -22,13 +22,16 @@ mod runtime;
 mod worker;
 mod world;
 
+use bevy::ecs::change_detection::DetectChangesMut;
 pub(crate) use paneru::lua::shared;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use bevy::app::{App, Plugin, PostUpdate, PreUpdate, Update};
+use crate::ecs::layout::LayoutStrip;
+use bevy::app::{App, Last, Plugin, PostUpdate, PreUpdate, Update};
 use bevy::ecs::message::MessageReader;
+use bevy::ecs::query::Changed;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::{Commands, NonSendMut, Query, Res, ResMut};
@@ -78,6 +81,24 @@ impl Plugin for LuaPlugin {
         // `Update` dispatch.
         app.add_systems(PostUpdate, (serve_lua_queries, serve_lua_store));
         app.add_systems(Update, (dispatch_lua_events, lua_reload_system));
+        app.add_systems(Last, dispatch_layout_changed);
+    }
+}
+
+// Publish structural changes after command processing and layout reconciliation.
+// Inactive rows are included because the spatial overview displays them too.
+// No frame polling or synthetic focus events; hidden overlays remain hidden.
+fn dispatch_layout_changed(
+    worker: Option<Res<LuaWorker>>,
+    strips: Query<&LayoutStrip, Changed<LayoutStrip>>,
+) {
+    let Some(worker) = worker else {
+        return;
+    };
+    if !strips.is_empty()
+        && worker.subscribed_event_mask() & convert::LuaEvent::bit_for_name("layout_changed") != 0
+    {
+        worker.send_events(vec![convert::LuaEvent::LayoutChanged]);
     }
 }
 
@@ -218,7 +239,7 @@ fn extract_once<T>(
 /// into the shared handle.
 pub fn drain_lua_outbox(
     worker: Option<Res<LuaWorker>>,
-    config: Option<Res<Config>>,
+    mut config: Option<ResMut<Config>>,
     mut displays: Query<&mut Display>,
     windows: Windows,
     applications: Query<&Application>,
@@ -236,8 +257,9 @@ pub fn drain_lua_outbox(
             FromLua::ConfigChanged => {
                 // Swap into the shared handle, then re-apply the same side
                 // effects a TOML reload does.
-                if let (Some(config), Some(built)) = (config.as_ref(), worker.built_config()) {
+                if let (Some(config), Some(built)) = (config.as_mut(), worker.built_config()) {
                     config.replace_inner_from(&built);
+                    config.set_changed();
                     apply_config_side_effects(config, &mut displays, &windows, &applications);
                 }
             }

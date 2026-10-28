@@ -5,6 +5,7 @@ use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, With, Without};
+use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Query, Res, Single};
 use bevy::math::IRect;
 use tracing::{Level, instrument};
@@ -62,7 +63,10 @@ pub fn register_commands(app: &mut bevy::app::App) {
     // Registered here (not with the Lua systems) so it's exercised by the mock
     // harness without a running interpreter.
     #[cfg(feature = "lua")]
-    app.add_systems(PreUpdate, crate::ecs::layout_ops::apply_layout_ops);
+    app.add_systems(
+        PreUpdate,
+        crate::ecs::layout_ops::apply_layout_ops.after(crate::ecs::view_history::observe),
+    );
 
     query::register_query_commands(app);
     // Empty store so the mock harness and saveless runs still have one to
@@ -92,7 +96,8 @@ pub fn register_commands(app: &mut bevy::app::App) {
             command_toggle_floating_layer,
             command_swap_focus,
             snap_window,
-        ),
+        )
+            .after(crate::ecs::view_history::observe),
     );
     // A separate registration because the tuple above is already at Bevy's
     // 20-system limit.
@@ -100,7 +105,10 @@ pub fn register_commands(app: &mut bevy::app::App) {
     // A default dialect so the mock harness has one; the real app overwrites it
     // once it knows whether a Lua script took over the configuration.
     app.init_resource::<SnippetDialect>();
-    app.add_systems(PreUpdate, (copy_window_rule, toggle_tabbed_display_handler));
+    app.add_systems(
+        PreUpdate,
+        (copy_window_rule, toggle_tabbed_display_handler).after(crate::ecs::view_history::observe),
+    );
 }
 
 pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
@@ -246,6 +254,71 @@ fn nearest_float_in_direction(
     pick_nearest_in_direction(direction, focused_center, candidates)
 }
 
+fn fullscreen_return_target(
+    marker: &NativeFullscreenMarker,
+    workspaces: &Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
+) -> Option<Entity> {
+    let strip = workspaces
+        .iter()
+        .find_map(|(strip, entity, _)| (entity == marker.layout_strip).then_some(strip))
+        .or_else(|| {
+            workspaces
+                .iter()
+                .find_map(|(strip, _, _)| (strip.id() == marker.workspace_id).then_some(strip))
+        })?;
+    strip.last().ok()?.top()
+}
+
+fn tiled_recovery_target(
+    direction: &Direction,
+    strip: &LayoutStrip,
+    windows: &Windows,
+    history: &FocusHistory,
+    viewport: IRect,
+    window_manager: &WindowManager,
+) -> Option<Entity> {
+    let native_members = window_manager.windows_in_workspace(strip.id()).ok()?;
+    let valid = |entity: Entity| {
+        strip.contains(entity)
+            && windows
+                .get_managed(entity)
+                .is_some_and(|(window, _, unmanaged)| {
+                    unmanaged.is_none() && native_members.contains(&window.id())
+                })
+    };
+    let representative = |column: &Column| {
+        strip
+            .selected_tab(column)
+            .or_else(|| column.top())
+            .filter(|entity| valid(*entity))
+            .or_else(|| column.window_iter().find(|entity| valid(*entity)))
+    };
+    match direction {
+        Direction::First => return strip.first().ok().as_ref().and_then(representative),
+        Direction::Last => return strip.last().ok().as_ref().and_then(representative),
+        Direction::Nth(index) => return strip.get(*index).ok().as_ref().and_then(representative),
+        _ => {}
+    }
+    history
+        .last_managed(strip.id())
+        .filter(|entity| valid(*entity))
+        .or_else(|| {
+            strip
+                .columns()
+                .filter_map(representative)
+                .filter_map(|entity| {
+                    let frame = windows.frame(entity)?;
+                    let visible = viewport.intersect(frame).width() > 0;
+                    Some((
+                        (!visible, frame.center().x.abs_diff(viewport.center().x)),
+                        entity,
+                    ))
+                })
+                .min_by_key(|(rank, _)| *rank)
+                .map(|(_, entity)| entity)
+        })
+}
+
 /// Handles the "focus" command, moving focus to a window in a specified direction.
 ///
 /// # Arguments
@@ -263,25 +336,24 @@ fn focus_with_verification(
     focused_entity: Option<Entity>,
     commands: &mut Commands,
 ) {
-    if focused_entity != Some(entity)
-        && let Ok(mut entity_commands) = commands.get_entity(entity)
-    {
-        entity_commands.try_insert((
-            crate::ecs::VerifyFocus,
-            Timeout::for_component::<crate::ecs::VerifyFocus>(
-                crate::ecs::focus::VERIFY_FOCUS_TIMEOUT,
-            ),
-        ));
+    commands.trigger(crate::ecs::focus::KeyboardFocusRequest {
+        target: entity,
+        source: focused_entity,
+    });
+    // Select for layout first. Native focus follows the committed reveal.
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_insert(FocusedMarker);
     }
-    commands.focus_entity(entity, true);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn command_move_focus(
     mut messages: MessageReader<Event>,
     windows: Windows,
     workspaces: Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
+    focus_history: Res<FocusHistory>,
     mut commands: Commands,
 ) {
     let Some(Operation::Focus(direction)) =
@@ -293,30 +365,41 @@ fn command_move_focus(
     let active_strip = active_display.active_strip();
 
     // On a fullscreen space, swap to the last column in the workspace.
-    if let Some(NativeFullscreenMarker {
-        layout_strip,
-        workspace_id,
-        index: _,
-    }) = active_display.fullscreen()
+    if let Some(marker) = active_display.fullscreen()
         && matches!(direction, Direction::West)
     {
-        let mut strip = workspaces
-            .into_iter()
-            .find_map(|(strip, entity, _)| (entity == *layout_strip).then_some(strip));
-        if strip.is_none() {
-            strip = workspaces
-                .into_iter()
-                .find_map(|(strip, _, _)| (strip.id() == *workspace_id).then_some(strip));
-        }
-
-        if let Some(entity) = strip.and_then(|strip| strip.last().ok().and_then(|col| col.top())) {
-            debug!("fullscreen: swap raising {entity}");
-            focus_with_verification(entity, windows.focused().map(|(_, e)| e), &mut commands);
+        if let Some(entity) = fullscreen_return_target(marker, &workspaces) {
+            focus_with_verification(
+                entity,
+                windows.focused().map(|(_, entity)| entity),
+                &mut commands,
+            );
         }
         return;
     }
 
-    let Some((_, focused_entity)) = windows.focused() else {
+    let focused = windows.focused().map(|(_, entity)| entity);
+    let tiled_focus = focused.filter(|entity| {
+        active_strip.contains(*entity)
+            && windows
+                .get_managed(*entity)
+                .is_some_and(|(_, _, unmanaged)| unmanaged.is_none())
+    });
+    if tiled_focus.is_none()
+        && let Some(target) = tiled_recovery_target(
+            direction,
+            active_strip,
+            &windows,
+            &focus_history,
+            active_display.bounds(),
+            &window_manager,
+        )
+    {
+        focus_with_verification(target, focused, &mut commands);
+        commands.reshuffle_around(target);
+        return;
+    }
+    let Some(focused_entity) = focused else {
         return;
     };
 
@@ -336,15 +419,12 @@ fn command_move_focus(
         return;
     }
 
-    // If focus is on a window that no longer lives in the active strip
-    // (e.g. it just became floating, was minimised on another row, or
-    // the OS handed focus to a window we don't track on this strip),
-    // `get_window_in_direction` would return None and the user would
-    // be unable to leave that window. Enter the active strip from the
-    // appropriate side so subsequent presses behave normally.
-    let candidate = if active_strip.contains(focused_entity) {
+    if tiled_focus.is_none() {
+        return;
+    }
+    let candidate =
         get_window_in_direction(direction, focused_entity, active_strip).or_else(|| {
-            // At the right edge going East, enter the fullscreen workspaces.
+            // At the right edge going East, enter native fullscreen workspaces.
             (matches!(direction, Direction::East)
                 && active_strip.right_neighbour(focused_entity).is_none())
             .then(|| {
@@ -353,23 +433,10 @@ fn command_move_focus(
                     .find(|(strip, _, fullscreen)| {
                         fullscreen.is_some() && strip.id() != active_strip.id()
                     })
-                    .and_then(|(strip, _, _)| strip.get(0).ok().and_then(|col| col.top()))
+                    .and_then(|(strip, _, _)| strip.get(0).ok().and_then(|column| column.top()))
             })
             .flatten()
-        })
-    } else {
-        match direction {
-            Direction::East | Direction::First => {
-                active_strip.first().ok().and_then(|col| col.top())
-            }
-            Direction::West | Direction::Last => active_strip.last().ok().and_then(|col| col.top()),
-            Direction::Nth(index) => active_strip
-                .get(*index)
-                .ok()
-                .and_then(|column| column.top()),
-            Direction::North | Direction::South => None,
-        }
-    };
+        });
 
     if let Some(entity) = candidate {
         focus_with_verification(entity, Some(focused_entity), &mut commands);
@@ -768,7 +835,12 @@ fn resize_window(
     }
 
     let viewport = active_display.actual_bounds(&config);
-    let current_ratio = f64::from(frame.width()) / f64::from(viewport.width());
+    let rail = if config.side_tabs() && active_display.active_strip().is_tabbed_display(entity) {
+        40
+    } else {
+        0
+    };
+    let current_ratio = f64::from(frame.width() + rail) / f64::from(viewport.width());
     let widths = config.preset_column_widths();
     let fallback = *widths.first().unwrap_or(&0.5);
     let cycle = config.window_resize_cycle();
@@ -800,7 +872,8 @@ fn resize_window(
         _ => return,
     };
 
-    let new_width = round_px(next_ratio * f64::from(viewport.width()));
+    let new_width = (round_px(next_ratio * f64::from(viewport.width())) - rail).max(80);
+    let viewport = IRect::from_corners(viewport.min + Origin::new(rail, 0), viewport.max);
     let size = Size::new(new_width, frame.height());
 
     let origin = clamp_origin_to_viewport(
@@ -963,6 +1036,18 @@ fn full_width_window(
     };
 
     let viewport = active_display.actual_bounds(&config);
+    let side_group = config.side_tabs() && active_display.active_strip().is_tabbed_display(entity);
+    let rail = if side_group { 40 } else { 0 };
+    let members = if side_group {
+        let strip = active_display.active_strip();
+        strip
+            .index_of(entity)
+            .ok()
+            .and_then(|i| strip.get(i).ok())
+            .map_or_else(|| vec![entity], |c| c.window_iter().collect::<Vec<_>>())
+    } else {
+        vec![entity]
+    };
 
     if let Some(marker) = windows.full_width(entity) {
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
@@ -970,14 +1055,18 @@ fn full_width_window(
         }
         let w = round_px(marker.width_ratio * f64::from(viewport.width()));
         let bounds = active_display.actual_bounds(&config).size().with_x(w);
-        commands.resize_entity(entity, bounds);
+        for member in members {
+            commands.resize_entity(member, bounds);
+        }
+        commands.reshuffle_around(entity);
     } else {
         let strip = active_display.active_strip();
-        if strip
-            .index_of(entity)
-            .ok()
-            .and_then(|idx| strip.get(idx).ok())
-            .is_some_and(|col| matches!(col, Column::Stack(_)))
+        if !side_group
+            && strip
+                .index_of(entity)
+                .ok()
+                .and_then(|idx| strip.get(idx).ok())
+                .is_some_and(|col| matches!(col, Column::Stack(_)))
         {
             _ = strip.unstack(entity);
         }
@@ -985,8 +1074,11 @@ fn full_width_window(
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_insert(FullWidthMarker { width_ratio });
         }
-        commands.reposition_entity(entity, Origin::new(viewport.min.x, viewport.min.y));
-        commands.resize_entity(entity, Size::new(viewport.width(), viewport.height()));
+        commands.reposition_entity(entity, Origin::new(viewport.min.x + rail, viewport.min.y));
+        let size = Size::new(viewport.width() - rail, viewport.height());
+        for member in members {
+            commands.resize_entity(member, size);
+        }
         commands.reshuffle_around(entity);
     }
 }
