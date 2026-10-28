@@ -436,6 +436,7 @@ final class SettingsWindow: NSWindow {
 
     nonisolated func show() { MainActor.assumeIsolated { present() } }
     private func present() {
+        enterAppMode()
         installMainMenu()
         if window == nil { build() }
         store.reloadFromDisk(); store.refreshWindows(); store.canSampleScreen = CGPreflightScreenCaptureAccess()
@@ -586,6 +587,8 @@ final class SettingsWindow: NSWindow {
         store.cancelRecording?()
         // The color panel belongs to this window's outline well; don't leave it floating alone.
         if NSColorPanel.sharedColorPanelExists { NSColorPanel.shared.orderOut(nil) }
+        // After the close animation, so the window doesn't vanish mid-close with the Dock tile.
+        DispatchQueue.main.async { [weak self] in self?.leaveAppMode() }
     }
     func windowDidBecomeKey(_ notification: Notification) { store.reloadFromDisk() }
 
@@ -614,12 +617,32 @@ final class SettingsWindow: NSWindow {
         func item(_ title: String, _ action: Selector?, _ key: String, _ mods: NSEvent.ModifierFlags = .command, target: AnyObject? = nil) -> NSMenuItem {
             let i = NSMenuItem(title: title, action: action, keyEquivalent: key); i.keyEquivalentModifierMask = mods; i.target = target; return i
         }
-        menu("Microfish", [item("Settings…", #selector(menuShow), ",", target: self), .separator(), item("Hide Microfish", #selector(NSApplication.hide(_:)), "h"), item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]), item("Show All", #selector(NSApplication.unhideAllApplications(_:)), "")])
+        // "Quit Microfish" is nil-targeted to the navigator's full, clean quit (engine and helper
+        // together); AppKit disables it until the app delegate implements quitMicrofish:.
+        menu("Microfish", [item("About Microfish", #selector(menuAbout), "", target: self), .separator(), item("Settings…", #selector(menuShow), ",", target: self), .separator(), item("Hide Microfish", #selector(NSApplication.hide(_:)), "h"), item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]), item("Show All", #selector(NSApplication.unhideAllApplications(_:)), ""), .separator(), item("Quit Microfish", Selector(("quitMicrofish:")), "q")])
         menu("Edit", [item("Undo", Selector(("undo:")), "z"), item("Redo", Selector(("redo:")), "z", [.command, .shift]), .separator(), item("Cut", #selector(NSText.cut(_:)), "x"), item("Copy", #selector(NSText.copy(_:)), "c"), item("Paste", #selector(NSText.paste(_:)), "v"), item("Select All", #selector(NSText.selectAll(_:)), "a"), .separator(), item("Find Shortcut…", #selector(menuFind), "f", target: self)])
         menu("Window", [item("Minimize", #selector(NSWindow.performMiniaturize(_:)), "m"), item("Close", #selector(NSWindow.performClose(_:)), "w")])
         NSApp.mainMenu = main
     }
     @objc private func menuShow() { present() }
+    @objc private func menuAbout() {
+        NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "Microfish", .applicationIcon: Self.appIcon(store.rootURL) as Any].compactMapValues { $0 })
+        NSApp.activate()
+    }
+    nonisolated static func appIcon(_ root: URL) -> NSImage? { NSImage(contentsOf: root.appendingPathComponent("assets/microfish-icon.png")) }
+    /// While Settings is open the helper behaves like an app: menu bar, ⌘Tab, Dock tile. It returns to
+    /// a menu-bar accessory when Settings closes. Off until the engine ignores its own helper even
+    /// when that helper is a regular app (BOARD 2026-10-28 00:35); a regular app is otherwise managed.
+    static let becomesRegularApp = false
+    private func enterAppMode() {
+        guard Self.becomesRegularApp, NSApp.activationPolicy() != .regular else { return }
+        NSApp.setActivationPolicy(.regular)
+        if let icon = Self.appIcon(store.rootURL) { NSApp.applicationIconImage = icon }
+    }
+    private func leaveAppMode() {
+        guard Self.becomesRegularApp, NSApp.activationPolicy() == .regular else { return }
+        NSApp.setActivationPolicy(.accessory)
+    }
     @objc private func menuFind() {
         if pane != .shortcuts { select(.shortcuts, animate: true) }
         DispatchQueue.main.async { if let field = self.searchField { self.window?.makeFirstResponder(field) } }
