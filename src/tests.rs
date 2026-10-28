@@ -4,6 +4,7 @@ mod focus_or_virtual;
 mod harness;
 mod interaction;
 mod mocks;
+mod panels;
 mod parking;
 mod review_a;
 mod rows;

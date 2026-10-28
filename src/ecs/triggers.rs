@@ -1118,6 +1118,7 @@ fn give_away_focus(
 /// * `main_cid` - The main connection ID resource.
 /// * `commands` - Bevy commands to manage components and trigger events.
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_window_trigger(
     mut trigger: On<SpawnWindowTrigger>,
     windows: Query<&Window>,
@@ -1125,6 +1126,7 @@ pub(super) fn spawn_window_trigger(
     active_display: ActiveDisplay,
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     let new_windows = &mut trigger.event_mut().0;
@@ -1144,6 +1146,33 @@ pub(super) fn spawn_window_trigger(
             trace!("unable to find application with pid {pid}.");
             continue;
         };
+
+        // Every way a window reaches the engine ends here: the initial scan, a
+        // created notification, focus-time discovery and its retries, a row
+        // activation. The accessibility layer has already turned away what it
+        // can read, but this is the one place all of them share, so it decides
+        // again: only standard windows are taken on (or any window a rule asks
+        // for). Panels, dialogs, sheets, popovers and menus stay with AppKit.
+        let bundle_id = app.bundle_id().unwrap_or_default();
+        let admission = window.admission(&config, &bundle_id);
+        if !admission.managed() {
+            _ = crate::manager::report_rejection(window_id, app.name(), &admission, || {
+                window.resizable()
+            });
+            continue;
+        }
+        let floating = config
+            .find_window_properties(&window.title().unwrap_or_default(), &bundle_id)
+            .iter()
+            .find_map(|params| params.floating)
+            .unwrap_or(false);
+        crate::manager::log_admission(
+            window_id,
+            app.name(),
+            &admission,
+            window.resizable(),
+            admission.decision(floating),
+        );
 
         if tracing::enabled!(Level::DEBUG) {
             let title = window.title().unwrap_or_default();
