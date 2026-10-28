@@ -622,6 +622,7 @@ private let brandTeal = Color(nsColor: NSColor(name: nil) { $0.bestMatch(from: [
 /// Microfish's teal stands in for the accent only when the user chose Multicolor, exactly as an
 /// app's own accent color does; any explicit system accent wins.
 private var usesBrandAccent: Bool { UserDefaults.standard.object(forKey: "AppleAccentColor") == nil }
+private var settingsAccent: Color { usesBrandAccent ? brandTeal : .accentColor }
 
 struct SettingsPaneView: View {
     let pane: SettingsPane
@@ -677,12 +678,12 @@ struct FooterBar: View {
     }
     private var state: (String, Color, Bool) {
         if store.phase == .applying { return ("Applying…", .secondary, true) }
-        if store.recordingID != nil { return ("Recording a shortcut", .accentColor, false) }
+        if store.recordingID != nil { return ("Recording a shortcut · Esc cancels", settingsAccent, false) }
         if let note = store.recordingNote { return (note, .orange, false) }
         if store.conflictCount > 0 { return ("\(store.conflictCount) shortcut conflict\(store.conflictCount == 1 ? "" : "s") to resolve before applying", .red, false) }
         if let message = store.invalid.sorted(by: { $0.key < $1.key }).first?.value { return (message, .red, false) }
         if case .failed(let message) = store.phase { return ("Couldn’t apply · " + message, .red, false) }
-        if store.isDirty { return (store.restoredDraft ? "Unapplied changes from earlier" : "Unapplied changes", .accentColor, false) }
+        if store.isDirty { return (store.restoredDraft ? "Unapplied changes from earlier" : "Unapplied changes", settingsAccent, false) }
         switch store.phase {
         case .waiting: return ("Applied · waiting for engine", .orange, false)
         case .confirmed: return (store.applyNote.map { "Applied · " + $0 } ?? "Applied · engine confirmed", store.applyNote == nil ? .green : .orange, false)
@@ -806,10 +807,11 @@ struct BehaviorPane: View {
 
 struct Keycap: View {
     let text: String
+    @Environment(\.colorSchemeContrast) private var contrast
     var body: some View {
         Text(text).font(.system(size: 11, weight: .medium)).padding(.horizontal, 5).frame(minWidth: 20, minHeight: 18)
             .background(RoundedRectangle(cornerRadius: 4).fill(Color(nsColor: .controlBackgroundColor)))
-            .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(Color(nsColor: .separatorColor)))
+            .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(contrast == .increased ? Color.primary.opacity(0.6) : Color(nsColor: .separatorColor), lineWidth: contrast == .increased ? 1.5 : 1))
     }
 }
 
@@ -895,11 +897,13 @@ struct ShortcutSlot: View {
             if recording { store.cancelRecording?() } else { store.beginRecording?(id) }
         } label: {
             Group {
-                if recording { HStack(spacing: 4) { Text("Press shortcut…"); Text("esc").font(.caption2).foregroundStyle(.secondary) } }
+                if recording { Text("Press keys…").foregroundStyle(.tint) }
                 else if chord.isEmpty { Text("Not set").foregroundStyle(.secondary) }
                 else { Text(Chord.display(chord)).monospacedDigit().foregroundStyle(conflicted ? Color.red : .primary) }
             }
-            .frame(minWidth: 58)
+            .lineLimit(1)
+            // One width for every state, so recording or clearing never shifts the row.
+            .frame(width: 84)
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
@@ -955,7 +959,11 @@ struct ShortcutRowView: View {
     let row: ShortcutLayout.Row
     var body: some View {
         let conflictIDs = row.ids.filter { store.conflicts[$0] != nil }
-        let others = Array(Set(conflictIDs.flatMap { store.conflicts[$0] ?? [] })).sorted().map(store.label(for:))
+        // "Pick another" belongs on the binding the user just changed; if neither side changed (or
+        // both did), both rows carry it.
+        let edited: (String) -> Bool = { store.draft.shortcuts[$0] != store.saved.shortcuts[$0] }
+        let blamed = conflictIDs.filter { id in edited(id) || !(store.conflicts[id] ?? []).contains(where: edited) }
+        let others = Array(Set(blamed.flatMap { store.conflicts[$0] ?? [] })).sorted().map(store.label(for:))
         let changed = row.ids.contains { (store.draft.shortcuts[$0] ?? "") != (store.defaults[$0] ?? "") }
         LabeledContent {
             HStack(spacing: 6) {
@@ -973,7 +981,7 @@ struct ShortcutRowView: View {
                 if !others.isEmpty { Text("Also used by \(others.joined(separator: ", ")) — pick another").font(.caption).foregroundStyle(.red) }
             }
         }
-        .listRowBackground(conflictIDs.isEmpty ? nil : Color.red.opacity(0.08))
+        .listRowBackground(blamed.isEmpty ? nil : Color.red.opacity(0.08))
     }
 }
 
@@ -1003,6 +1011,7 @@ private func tabStyleImage(_ style: String) -> NSImage {
 
 struct TabStylePicker: View {
     @Binding var style: String
+    @Environment(\.colorSchemeContrast) private var contrast
     private var base: String { style == "folder-compact" ? "folder" : style }
     var body: some View {
         HStack(spacing: 10) {
@@ -1015,7 +1024,7 @@ struct TabStylePicker: View {
                         Image(nsImage: tabStyleImage(value))
                             .padding(6).frame(maxWidth: .infinity)
                             .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .quaternarySystemFill)))
-                            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(on ? AnyShapeStyle(.tint) : AnyShapeStyle(Color(nsColor: .separatorColor)), lineWidth: on ? 2.5 : 1))
+                            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(on ? AnyShapeStyle(.tint) : AnyShapeStyle(contrast == .increased ? Color.primary.opacity(0.6) : Color(nsColor: .separatorColor)), lineWidth: on ? 2.5 : contrast == .increased ? 1.5 : 1))
                         Text(title).font(.callout).foregroundStyle(on ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary)).fontWeight(on ? .semibold : .regular)
                     }
                     .contentShape(Rectangle())
@@ -1133,6 +1142,7 @@ struct AppearancePane: View {
 
 struct MinimapPositionDiagram: View {
     @Binding var position: String
+    @Environment(\.colorSchemeContrast) private var contrast
     private let targets: [(String, CGRect)] = [("top", CGRect(x: 60, y: 6, width: 30, height: 14)), ("left", CGRect(x: 8, y: 32, width: 18, height: 28)),
                                                ("center", CGRect(x: 55, y: 30, width: 40, height: 32)), ("right", CGRect(x: 124, y: 32, width: 18, height: 28)),
                                                ("bottom", CGRect(x: 60, y: 72, width: 30, height: 14))]
@@ -1144,7 +1154,7 @@ struct MinimapPositionDiagram: View {
                 let on = position == name
                 Button { position = name } label: {
                     RoundedRectangle(cornerRadius: 3).fill(on ? AnyShapeStyle(.tint) : AnyShapeStyle(Color(nsColor: .controlBackgroundColor)))
-                        .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(on ? AnyShapeStyle(.tint) : AnyShapeStyle(Color(nsColor: .separatorColor))))
+                        .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(on ? AnyShapeStyle(.tint) : AnyShapeStyle(contrast == .increased ? Color.primary.opacity(0.6) : Color(nsColor: .separatorColor)), lineWidth: contrast == .increased ? 1.5 : 1))
                 }
                 .buttonStyle(.plain)
                 .frame(width: rect.width, height: rect.height)
