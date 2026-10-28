@@ -122,8 +122,104 @@ fn an_app_that_always_fights_causes_a_bounded_number_of_moves() {
     }
     let total: usize = per_ten_seconds.iter().sum();
     assert!(
-        (3..=8).contains(&total),
+        (3..=10).contains(&total),
         "expected a few backed-off corrections in a minute, got {per_ten_seconds:?}"
+    );
+    assert!(
+        per_ten_seconds[3..].iter().all(|moves| *moves <= 2),
+        "a tight fighter settles at one move per backoff cap, got {per_ten_seconds:?}"
+    );
+}
+
+const ESCAPE: Origin = Origin::new(16, 50);
+const TICK: Duration = Duration::from_millis(20);
+
+/// Replays cmux as seen live: it pulls its hidden window back to its old frame,
+/// is parked again, bounces back `bounces` more times half a second after each
+/// correction, then stays parked for `quiet` before the next cluster of escapes.
+/// Returns the longest stretch the window was continuously on screen, and the
+/// corrective moves the engine spent.
+fn replay_sporadic_escapes(
+    h: &mut TestHarness,
+    clusters: usize,
+    bounces: usize,
+    quiet: Duration,
+) -> (Duration, usize) {
+    _ = corrections(h, 0);
+    let (mut worst, mut moves) = (Duration::ZERO, 0);
+    for _ in 0..clusters {
+        h.mock_state.os_move_window(0, ESCAPE);
+        let (mut on_screen, mut parked, mut left) = (Duration::ZERO, Duration::ZERO, bounces);
+        loop {
+            h.advance(TICK);
+            moves += corrections(h, 0);
+            if frame_origin(h, 0) == ESCAPE {
+                on_screen += TICK;
+                parked = Duration::ZERO;
+                worst = worst.max(on_screen);
+                continue;
+            }
+            on_screen = Duration::ZERO;
+            parked += TICK;
+            if left > 0 && parked >= Duration::from_millis(500) {
+                left -= 1;
+                parked = Duration::ZERO;
+                h.mock_state.os_move_window(0, ESCAPE);
+            } else if left == 0 && parked >= quiet {
+                break;
+            }
+        }
+    }
+    (worst, moves)
+}
+
+#[test]
+fn a_sporadic_re_mover_is_never_on_screen_for_long() {
+    let (mut h, entity) = with_window_on_hidden_row(|_| {});
+    let target = logical(&mut h, entity);
+    let (worst, moves) = replay_sporadic_escapes(&mut h, 5, 2, Duration::from_secs(20));
+    assert!(
+        worst <= Duration::from_millis(1100),
+        "window sat on screen for {worst:?} at a stretch"
+    );
+    assert!(
+        moves <= 5 * 4,
+        "a handful of moves per cluster, got {moves}"
+    );
+    assert_eq!(frame_origin(&h, 0), target);
+}
+
+#[test]
+fn a_silent_escape_is_corrected_within_two_audits() {
+    let (mut h, _) = with_window_on_hidden_row(|_| {});
+    h.advance(Duration::from_secs(5));
+    // No notification at all: only the window server knows. The first sighting
+    // waits for the 2 s audit, the second comes a quarter second later.
+    h.mock_state.update_window(0, |w| {
+        let size = w.frame.size();
+        w.frame.min = ESCAPE;
+        w.frame.max = ESCAPE + size;
+    });
+    let mut on_screen = Duration::ZERO;
+    while frame_origin(&h, 0) == ESCAPE && on_screen < Duration::from_secs(8) {
+        h.advance(TICK);
+        on_screen += TICK;
+    }
+    assert!(
+        on_screen <= Duration::from_millis(2500),
+        "a silent escape stayed on screen for {on_screen:?}"
+    );
+}
+
+#[test]
+fn a_tight_fighter_costs_a_bounded_number_of_moves() {
+    let (mut h, _) = with_window_on_hidden_row(|_| {});
+    // Escapes again half a second after every correction, forever.
+    let (worst, moves) = replay_sporadic_escapes(&mut h, 1, 8, Duration::ZERO);
+    assert!(moves <= 12, "{moves} corrective moves in about 70 s");
+    assert!(
+        worst <= Duration::from_millis(10_500),
+        "never on screen longer than the backoff cap, got {worst:?}"
     );
 }
 

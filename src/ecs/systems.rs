@@ -996,18 +996,26 @@ type HiddenRows<'w, 's> = Query<
 const PARKED_VISIBLE_LIMIT: i32 = 64;
 /// Waits between corrective moves for one window: the first correction is
 /// immediate, each later one waits for the next entry, and the last repeats.
-/// A window that fights forever costs five moves in its first minute and
-/// one per minute after, never a flicker.
-const CORRECTION_BACKOFF: [Duration; 5] = [
+/// A window that fights forever costs a handful of moves a minute, never a
+/// flicker. The cap is short because the window sits on screen, behind the
+/// row in use, for as long as the wait lasts.
+const CORRECTION_BACKOFF: [Duration; 4] = [
     Duration::from_millis(250),
     Duration::from_secs(1),
     Duration::from_secs(4),
-    Duration::from_secs(15),
-    Duration::from_secs(60),
+    Duration::from_secs(10),
 ];
 /// A window seen parked this long since its last displacement starts over with
-/// a fresh, immediate first correction.
-const PARKED_SETTLE: Duration = Duration::from_secs(30);
+/// a fresh, immediate first correction. Short on purpose: an app that moves
+/// itself back every 20 to 40 s is a sporadic re-mover, not a feedback loop,
+/// and the long ladder only fits the latter. It has to span two audits
+/// ([`PARKING_AUDIT_EVERY`]), the only callers that see a quiet window.
+const PARKED_SETTLE: Duration = Duration::from_secs(3);
+/// How often the audit looks at the window server when nothing is in doubt.
+const PARKING_AUDIT_EVERY: Duration = Duration::from_secs(2);
+/// How soon the audit looks again when a window was seen displaced once, or a
+/// correction was held back and its wait is over.
+const PARKING_RECHECK: Duration = Duration::from_millis(250);
 
 /// Whether `frame` shows a person-visible part of a display it should not.
 /// A display where the window would show just as much at its logical `target`
@@ -1028,14 +1036,18 @@ struct ParkingEpisode {
     corrections: usize,
     retry_at: Duration,
     parked_since: Option<Duration>,
+    /// Seen displaced while the backoff held the correction back: the audit
+    /// re-checks it as soon as `retry_at` passes, without a second sighting.
+    pending: bool,
 }
 
 /// A parking correction must not become a feedback loop with an app's own
 /// frame constraints. Each hidden-row window has an episode: the first
-/// displacement is corrected at once, later ones back off exponentially. The
-/// episode ends when the row is shown, layout picks a new target, or the window
-/// has stayed parked for [`PARKED_SETTLE`]. Echoes of our own successful move
-/// do not touch it.
+/// displacement is corrected at once, later ones back off exponentially. A
+/// displacement the backoff holds back is not dropped: it is marked pending and
+/// the audit looks again when the wait ends. The episode ends when the row is
+/// shown, layout picks a new target, or the window has stayed parked for
+/// [`PARKED_SETTLE`]. Echoes of our own successful move do not touch it.
 #[derive(Default, bevy::ecs::resource::Resource)]
 pub(crate) struct ParkingCorrections {
     episodes: EntityHashMap<ParkingEpisode>,
@@ -1043,6 +1055,9 @@ pub(crate) struct ParkingCorrections {
     /// move that parked them may not have landed yet, so a second sighting is
     /// needed before the audit acts.
     suspects: bevy::ecs::entity::EntityHashSet,
+    /// When the audit next has something to do: every [`PARKING_AUDIT_EVERY`]
+    /// at rest, sooner while a window is suspected or a correction is waiting.
+    audit_due: Duration,
 }
 
 impl ParkingCorrections {
@@ -1072,12 +1087,46 @@ impl ParkingCorrections {
         }
         episode.parked_since = None;
         if now < episode.retry_at {
+            episode.pending = true;
+            self.audit_due = self.audit_due.min(episode.retry_at);
             return false;
         }
         let wait = CORRECTION_BACKOFF[episode.corrections.min(CORRECTION_BACKOFF.len() - 1)];
         episode.retry_at = now + wait;
         episode.corrections += 1;
+        episode.pending = false;
         true
+    }
+
+    /// The audit saw the window displaced but its wait is not over: remember
+    /// to look again when it is.
+    fn hold_back(&mut self, entity: Entity) {
+        self.suspects.remove(&entity);
+        if let Some(episode) = self.episodes.get_mut(&entity) {
+            episode.pending = true;
+        }
+    }
+
+    fn is_pending(&self, entity: Entity) -> bool {
+        self.episodes
+            .get(&entity)
+            .is_some_and(|episode| episode.pending)
+    }
+
+    fn audit_is_due(&self, now: Duration) -> bool {
+        now >= self.audit_due
+    }
+
+    /// Schedules the next audit after one has run at `now`.
+    fn audit_done(&mut self, now: Duration) {
+        let mut due = now + PARKING_AUDIT_EVERY;
+        if !self.suspects.is_empty() {
+            due = due.min(now + PARKING_RECHECK);
+        }
+        for episode in self.episodes.values().filter(|episode| episode.pending) {
+            due = due.min(episode.retry_at.max(now + PARKING_RECHECK));
+        }
+        self.audit_due = due;
     }
 
     /// A hidden-row window was seen parked.
@@ -1086,6 +1135,7 @@ impl ParkingCorrections {
         let Some(episode) = self.episodes.get_mut(&entity) else {
             return;
         };
+        episode.pending = false;
         let since = *episode.parked_since.get_or_insert(now);
         if episode.target != target || now.saturating_sub(since) >= PARKED_SETTLE {
             self.episodes.remove(&entity);
@@ -1100,6 +1150,7 @@ impl ParkingEpisode {
             corrections: 0,
             retry_at: Duration::ZERO,
             parked_since: None,
+            pending: false,
         }
     }
 }
@@ -1181,9 +1232,12 @@ pub(crate) fn window_moved_update_frame(
 
 /// Safety net for [`window_moved_update_frame`]: an app can move a hidden-row
 /// window without telling us, or after its correction was backed off. Every
-/// `PARKING_AUDIT_FREQ` (in `ecs.rs`), while any hidden row holds windows, ask
-/// the window server once where everything is. No per-window AX read happens unless a
-/// window is already shown displaced twice in a row, and the backoff in
+/// [`PARKING_AUDIT_EVERY`], while any hidden row holds windows, ask the window
+/// server once where everything is. The system itself ticks faster, but
+/// [`ParkingCorrections::audit_due`] brings the real work forward only for a
+/// window seen displaced once (a second sighting is needed) or one whose held
+/// back correction is now allowed. No per-window AX read happens unless a
+/// window is shown displaced twice in a row or is pending, and the backoff in
 /// [`ParkingCorrections`] bounds those.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(crate) fn audit_parked_windows(
@@ -1194,20 +1248,39 @@ pub(crate) fn audit_parked_windows(
     time: Res<Time>,
     mut corrections: ResMut<ParkingCorrections>,
 ) {
+    let now = time.elapsed();
+    if !corrections.audit_is_due(now) {
+        return;
+    }
     corrections.retain_hidden(&strips);
     let hidden = strips
         .iter()
         .flat_map(LayoutStrip::all_windows)
         .collect::<Vec<_>>();
-    if hidden.is_empty() {
-        return;
+    if !hidden.is_empty()
+        && let Some(on_screen) = window_manager.on_screen_window_bounds()
+    {
+        audit_hidden(
+            &hidden,
+            &on_screen,
+            &display_frames(&displays),
+            &mut windows,
+            &mut corrections,
+            now,
+        );
     }
-    let Some(on_screen) = window_manager.on_screen_window_bounds() else {
-        return;
-    };
-    let displays = display_frames(&displays);
-    let now = time.elapsed();
-    for entity in hidden {
+    corrections.audit_done(now);
+}
+
+fn audit_hidden(
+    hidden: &[Entity],
+    on_screen: &[(crate::platform::WinID, IRect)],
+    displays: &[IRect],
+    windows: &mut MovableWindows,
+    corrections: &mut ParkingCorrections,
+    now: Duration,
+) {
+    for &entity in hidden {
         let Ok((_, mut window, position, _, unmanaged, repositioning)) = windows.get_mut(entity)
         else {
             continue;
@@ -1220,19 +1293,23 @@ pub(crate) fn audit_parked_windows(
             .iter()
             .find(|(id, _)| *id == window.id())
             .map(|(_, frame)| *frame);
-        if !shown.is_some_and(|frame| intrudes_on_displays(frame, position.0, &displays)) {
+        if !shown.is_some_and(|frame| intrudes_on_displays(frame, position.0, displays)) {
             corrections.parked(entity, position.0, now);
             continue;
         }
-        // First sighting only marks the window; the next audit decides.
-        if corrections.suspects.insert(entity) || !corrections.may_correct(entity, position.0, now)
-        {
+        // First sighting only marks the window; the next audit decides. A
+        // window already known to have moved needs no second look.
+        if !corrections.is_pending(entity) && corrections.suspects.insert(entity) {
+            continue;
+        }
+        if !corrections.may_correct(entity, position.0, now) {
+            corrections.hold_back(entity);
             continue;
         }
         // Our own AX cache holds the position we asked for, which would make
         // `reposition` skip the move; read the real frame first.
         match window.update_frame() {
-            Ok(frame) if !intrudes_on_displays(frame, position.0, &displays) => {
+            Ok(frame) if !intrudes_on_displays(frame, position.0, displays) => {
                 corrections.parked(entity, position.0, now);
             }
             Ok(frame) if corrections.displaced(entity, position.0, now) => {
@@ -2143,7 +2220,7 @@ mod parking_correction_tests {
         let mut episodes = ParkingCorrections::default();
         let entity = Entity::from_bits(123);
         let target = Origin::new(1500, 970);
-        let waits = [0.0, 0.25, 1.25, 5.25, 20.25, 80.25, 140.25];
+        let waits = [0.0, 0.25, 1.25, 5.25, 15.25, 25.25, 35.25];
         let mut now = 0.0;
         for wait in waits {
             // Seen displaced every half second between corrections.
@@ -2176,11 +2253,53 @@ mod parking_correction_tests {
         assert!(episodes.displaced(entity, target, at(0.0)));
         assert!(!episodes.displaced(entity, target, at(0.1)));
         episodes.parked(entity, target, at(2.0));
-        episodes.parked(entity, target, at(31.0));
+        episodes.parked(entity, target, at(4.0));
         assert!(episodes.episodes.contains_key(&entity));
-        episodes.parked(entity, target, at(32.0));
+        episodes.parked(entity, target, at(5.0));
         assert!(!episodes.episodes.contains_key(&entity));
-        assert!(episodes.displaced(entity, target, at(32.1)));
+        assert!(episodes.displaced(entity, target, at(5.1)));
+    }
+
+    #[test]
+    fn a_held_back_displacement_brings_the_audit_forward() {
+        let mut episodes = ParkingCorrections::default();
+        let entity = Entity::from_bits(123);
+        let target = Origin::new(1500, 970);
+        assert!(episodes.displaced(entity, target, at(0.0)));
+        assert!(episodes.displaced(entity, target, at(0.25)));
+        // The next wait ends at 1.25.
+        episodes.audit_done(at(0.25));
+        assert!(!episodes.audit_is_due(at(1.0)), "at rest the audit waits");
+        // A bounce inside the wait is dropped now, but remembered.
+        assert!(!episodes.displaced(entity, target, at(0.75)));
+        assert!(episodes.is_pending(entity));
+        assert!(!episodes.audit_is_due(at(1.0)));
+        assert!(episodes.audit_is_due(at(1.25)), "due when the wait ends");
+        // An audit that runs early re-arms for the end of the wait, not 2 s on.
+        episodes.audit_done(at(1.0));
+        assert!(!episodes.audit_is_due(at(1.0)));
+        assert!(episodes.audit_is_due(at(1.25)));
+        // It then acts without a second sighting.
+        assert!(episodes.displaced(entity, target, at(1.25)));
+        assert!(!episodes.is_pending(entity));
+        // Seeing the window parked clears the mark.
+        assert!(!episodes.displaced(entity, target, at(1.5)));
+        episodes.parked(entity, target, at(1.75));
+        assert!(!episodes.is_pending(entity));
+    }
+
+    #[test]
+    fn a_suspect_is_looked_at_again_soon() {
+        let mut episodes = ParkingCorrections::default();
+        let entity = Entity::from_bits(123);
+        episodes.suspects.insert(entity);
+        episodes.audit_done(at(10.0));
+        assert!(episodes.audit_is_due(at(10.25)));
+        assert!(!episodes.audit_is_due(at(10.0)));
+        episodes.parked(entity, Origin::new(1500, 970), at(10.25));
+        episodes.audit_done(at(10.25));
+        assert!(!episodes.audit_is_due(at(11.0)));
+        assert!(episodes.audit_is_due(at(12.25)));
     }
 
     #[test]
