@@ -352,7 +352,7 @@ impl OverlayManager {
 
 // ── FlashMessage ────────────────────────────────────────────────────────
 //
-// The engine's transient confirmations ("View 3", "Layout move undone",
+// The engine's transient confirmations ("View 3", "Move undone",
 // "Settings reloaded", row badges) in the same family as the helper's own
 // transient panels (`src/main.swift`: the minimap HUD and `FailureHUDView`):
 // `.hudWindow` material behind the window, 16 pt corners, a vibrant appearance

@@ -449,7 +449,7 @@ fn undo(world: &mut World) {
     }
     world.resource_mut::<History>().candidate = None;
     world.resource_mut::<History>().transaction = Transaction::Idle;
-    announce(world, "Layout move undone");
+    announce(world, "Move undone");
 }
 fn navigate(world: &mut World) {
     if !world.resource::<History>().navigating {
