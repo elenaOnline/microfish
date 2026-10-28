@@ -791,7 +791,7 @@ pub fn run_schedules_inline(app: &mut BevyApp) {
 }
 
 /// See [`run_schedules_inline`]: long enough that the accumulator never reaches it.
-const FIXED_TIMESTEP_NEVER: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+const FIXED_TIMESTEP_NEVER: Duration = Duration::from_hours(24 * 365);
 
 pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<BevyApp> {
     crate::manager::app::bound_ax_messaging_timeout()?;
