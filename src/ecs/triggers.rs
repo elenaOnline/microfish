@@ -122,7 +122,7 @@ pub(super) fn front_switched_trigger(
 
         // Before the process lookup: Spotlight, Raycast and the engine itself
         // are not managed processes, and still end (or confirm) the hold.
-        hold.front_switched(*psn);
+        hold.front_switched(*psn, window_manager.front_process());
 
         let Some((BProcess(process), children)) =
             processes.iter().find(|process| &process.0.psn() == psn)

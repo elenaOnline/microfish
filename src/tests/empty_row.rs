@@ -164,6 +164,7 @@ fn a_front_switch_to_another_process_releases_the_hold_without_a_focus_request()
     assert!(held(&mut h));
     // Spotlight, Raycast: not a process the engine manages.
     let before = h.mock_state.focus_calls().len();
+    h.mock_state.unmanaged_takes_front();
     send(
         &mut h,
         vec![Event::ApplicationFrontSwitched {

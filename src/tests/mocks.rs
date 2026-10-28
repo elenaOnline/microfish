@@ -307,6 +307,12 @@ impl MockState {
         self.inner.force_write().hold_ineffective = true;
     }
 
+    /// A process the engine does not manage (Spotlight, Raycast) takes the
+    /// front from the engine.
+    pub(crate) fn unmanaged_takes_front(&self) {
+        self.inner.force_write().engine_front = false;
+    }
+
     /// Whether the engine, not an app, is the front process.
     pub(crate) fn engine_is_front(&self) -> bool {
         self.inner.force_read().engine_front
@@ -1161,7 +1167,21 @@ impl MockState {
         let s = self.clone();
         wm.expect_hold_keyboard().returning(move |previous| {
             s.activate_engine(previous);
-            Some(ENGINE_PSN)
+            // As the real one does: only a front switch that took counts.
+            s.engine_is_front().then_some(ENGINE_PSN)
+        });
+
+        let s = self.clone();
+        wm.expect_front_process().returning(move || {
+            let inner = s.inner.force_read();
+            if inner.engine_front {
+                return Some(ENGINE_PSN);
+            }
+            inner
+                .apps
+                .values()
+                .find(|app| app.is_frontmost)
+                .map(|app| app.psn)
         });
 
         let s = self.clone();

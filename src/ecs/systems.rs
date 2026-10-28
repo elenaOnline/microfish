@@ -1330,7 +1330,10 @@ fn audit_hidden(
                 );
                 window.reposition(position.0);
             }
-            _ => {}
+            // The app did not answer. Count it as an attempt, so the backoff
+            // paces the next look rather than the quarter-second recheck.
+            Err(_) => _ = corrections.displaced(entity, position.0, now),
+            Ok(_) => {}
         }
     }
 }

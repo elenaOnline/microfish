@@ -12,7 +12,7 @@ use objc2_core_foundation::{
     CGPoint, CGRect, CGSize, kCFBooleanTrue,
 };
 use objc2_core_graphics::{
-    CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds, CGError,
+    CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds,
     CGGetActiveDisplayList, CGRectMakeWithDictionaryRepresentation, CGWarpMouseCursorPosition,
     CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowBounds,
     kCGWindowNumber,
@@ -34,11 +34,10 @@ use crate::util::{AXUIWrapper, MacResult, create_array, round_px, symlink_target
 use app::ApplicationOS;
 pub use app::{Application, ApplicationApi};
 pub use display::Display;
-use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
 pub use process::{Process, ProcessApi, is_microfish_helper};
 pub use skylight::AXUIElementCopyAttributeValue;
 use skylight::{
-    _AXUIElementCreateWithRemoteToken, _SLPSSetFrontProcessWithOptions,
+    _AXUIElementCreateWithRemoteToken, _SLPSGetFrontProcess, _SLPSSetFrontProcessWithOptions,
     SLSCopyActiveMenuBarDisplayIdentifier, SLSCopyAssociatedWindows, SLSCopyManagedDisplaySpaces,
     SLSCopyWindowsWithOptionsAndTags, SLSFindWindowAndOwner, SLSGetConnectionIDForPSN,
     SLSGetCurrentCursorLocation, SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode,
@@ -210,6 +209,10 @@ pub trait WindowManagerApi: Send + Sync {
     /// The engine's own serial number, to tell its front switch from another
     /// app's, or `None` when it could not take the front.
     fn hold_keyboard(&self, previous: Option<Pid>) -> Option<ProcessSerialNumber>;
+
+    /// The window server's front process right now, which a queued front-switch
+    /// notification may already be behind.
+    fn front_process(&self) -> Option<ProcessSerialNumber>;
 }
 
 /// `WindowManager` is a Bevy resource that holds a boxed `WindowManagerApi` trait object.
@@ -348,22 +351,26 @@ impl WindowManagerOS {
 impl WindowManagerApi for WindowManagerOS {
     fn hold_keyboard(&self, previous: Option<Pid>) -> Option<ProcessSerialNumber> {
         let psn = platform::hold::own_psn()?;
-        // Mode 0x400, no windows: the engine has none to bring forward.
-        let status = unsafe { _SLPSSetFrontProcessWithOptions(&psn, 0, windows::CPS_NO_WINDOWS) };
-        if status != CGError::Success {
-            // `NSRunningApplication` activation is cooperative since macOS 14 and
-            // may be declined, so it is only the fallback.
-            let activated = NSRunningApplication::currentApplication()
-                .activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
-            warn!(
-                "hold: SLPS front switch failed ({status:?}); NSRunningApplication activate: {activated}"
-            );
-            if !activated {
-                return None;
+        // Mode 0x400, no windows: the engine has none to bring forward. A
+        // success status is not proof, so ask the window server who is front,
+        // and try once more before giving up. `NSRunningApplication` activation
+        // is no fallback: it is cooperative since macOS 14 and may land later,
+        // after the engine has stopped expecting it.
+        for attempt in 1..=2 {
+            let status =
+                unsafe { _SLPSSetFrontProcessWithOptions(&psn, 0, windows::CPS_NO_WINDOWS) };
+            if self.front_process() == Some(psn) {
+                platform::hold::engage(previous);
+                return Some(psn);
             }
+            warn!("hold: attempt {attempt} did not make the engine front ({status:?})");
         }
-        platform::hold::engage(previous);
-        Some(psn)
+        None
+    }
+
+    fn front_process(&self) -> Option<ProcessSerialNumber> {
+        let mut psn = ProcessSerialNumber::default();
+        (unsafe { _SLPSGetFrontProcess(&mut psn) } == 0).then_some(psn)
     }
 
     fn new_application(&self, process: &dyn ProcessApi) -> Result<Application> {

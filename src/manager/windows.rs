@@ -347,6 +347,10 @@ pub struct WindowOS {
     /// in [`Self::disable_enhanced_ui`] is a relaxed atomic load instead of
     /// contending for the global mutex from every `par_iter_mut` worker.
     enhanced_ui_absent: AtomicBool,
+    /// Role and subrole as first read. A later admission check falls back to
+    /// them when the app does not answer, so a transient AX error cannot turn
+    /// a standard window into an unknown one and drop it.
+    first_kind: OnceLock<(String, String)>,
 
     /// The last title read off the element, cached because reading one is a
     /// synchronous cross-process call and many callers want it for every
@@ -404,7 +408,11 @@ impl WindowOS {
             app_reference: OnceLock::new(),
             enhanced_ui_absent: AtomicBool::new(false),
             title: RwLock::new(None),
+            first_kind: OnceLock::new(),
         };
+        if let (Ok(role), Ok(subrole)) = (window.role(), window.subrole()) {
+            _ = window.first_kind.set((role, subrole));
+        }
 
         let admission = window.admission(config, bundle_id.unwrap_or_default());
         if !admission.managed() {
@@ -702,9 +710,18 @@ impl WindowApi for WindowOS {
     }
 
     fn admission(&self, config: &Config, bundle_id: &str) -> Admission {
+        let first = self.first_kind.get();
+        let role = self
+            .role()
+            .ok()
+            .or_else(|| first.map(|(role, _)| role.clone()));
+        let subrole = self
+            .subrole()
+            .ok()
+            .or_else(|| first.map(|(_, subrole)| subrole.clone()));
         Admission::evaluate(
-            &self.role().unwrap_or_default(),
-            &self.subrole().unwrap_or_default(),
+            &role.unwrap_or_default(),
+            &subrole.unwrap_or_default(),
             self.title().ok().as_deref(),
             config,
             bundle_id,
