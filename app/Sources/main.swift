@@ -613,6 +613,53 @@ final class StripPanel: NSPanel {
  override var canBecomeMain: Bool { false }
 }
 struct Entry { let id: Int; let column: Int; let app: String; let bundle: String; let title: String; var tabHeight: Int = 0; var selectedID: Int = 0 }
+// Clean quit of the whole product: engine first (Command::Quit -> AppExit saves the session and
+// restores windows), then the helper. Both launchd jobs have KeepAlive false, so nothing
+// respawns; Microfish.app relaunches both. Runner and clock are injected so tests never reach
+// the real binary. Exit codes: noLaunch = could not start the engine binary, timedOut = our own
+// per-call deadline killed a hung child (the engine may be mid-shutdown: not proof it is gone).
+struct QuitSequence {
+ enum Outcome: Equatable {
+  case stopped, absent, stuck, sendFailed, unreachable
+  // Only a confirmed-gone engine lets the helper go; otherwise the tabs stay usable.
+  var helperMayExit: Bool { self == .stopped || self == .absent }
+ }
+ static let noLaunch: Int32 = -1, timedOut: Int32 = 124
+ var run: ([String]) -> Int32
+ var now: () -> Double = { ProcessInfo.processInfo.systemUptime }
+ var sleep: (Double) -> Void = { Thread.sleep(forTimeInterval: $0) }
+ var timeout = 5.0, interval = 0.1
+ // `query active` answers only while the daemon is serving the socket. nil = cannot tell.
+ func alive() -> Bool? {
+  let code = run(["query","active"])
+  return code == 0 || code == QuitSequence.timedOut ? true : code == QuitSequence.noLaunch ? nil : false
+ }
+ func execute() -> Outcome {
+  guard let up = alive() else { return .unreachable }
+  if !up { return .absent }
+  if run(["send-cmd","quit"]) != 0 { return alive() == false ? .stopped : .sendFailed }
+  let deadline = now() + timeout
+  while true {
+   if alive() == false { return .stopped }
+   if now() >= deadline { return .stuck }
+   sleep(interval)
+  }
+ }
+ // Production runner: the engine binary next to this helper, silent, each call bounded.
+ static func process(_ executable: URL, callLimit: Double = 2) -> ([String]) -> Int32 {
+  return { arguments in
+   let child = Process(); child.executableURL = executable; child.arguments = arguments
+   child.standardOutput = FileHandle.nullDevice; child.standardError = FileHandle.nullDevice
+   do { try child.run() } catch { return noLaunch }
+   let deadline = Date().addingTimeInterval(callLimit)
+   while child.isRunning {
+    if Date() >= deadline { child.terminate(); child.waitUntilExit(); return timedOut }
+    Thread.sleep(forTimeInterval: 0.02)
+   }
+   return child.terminationStatus
+  }
+ }
+}
 final class Navigator: NSObject, NSApplicationDelegate {
  let path: String
  var hudAppearance:NSAppearance?
@@ -633,6 +680,26 @@ final class Navigator: NSObject, NSApplicationDelegate {
  var fastTimer: Timer?
  var workWatch: DispatchSourceFileSystemObject?
  var statusItem: NSStatusItem?
+ // Quit: idle -> stopping (engine going down, off the main thread) -> finishing (helper may die)
+ // or back to idle when the engine would not stop. A second request while not idle does nothing.
+ enum QuitPhase { case idle, stopping, finishing }
+ var quitPhase = QuitPhase.idle
+ var quitSequenceOverride: QuitSequence?
+ var quitBackground: (@escaping () -> Void) -> Void = { DispatchQueue.global(qos:.userInitiated).async(execute:$0) }
+ var quitMain: (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute:$0) }
+ #if NAVIGATOR_TESTS
+ var quitExit: () -> Void = { }
+ var quitFailed: () -> Void = { }
+ #else
+ var quitExit: () -> Void = { NSApp.terminate(nil) }
+ var quitFailed: () -> Void = { NSSound.beep() }
+ #endif
+ // Logout, shutdown and restart ask every app to quit; refusing would block them.
+ var systemQuit: () -> Bool = {
+  guard let reason = NSAppleEventManager.shared().currentAppleEvent?.attributeDescriptor(forKeyword:0x7768793F /* 'why?' */)?.enumCodeValue else { return false }
+  let codes = ["logo","rlgo","rest","shut"].map { $0.utf8.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) } }
+  return codes.contains(reason)
+ }
  #if !NAVIGATOR_TESTS
  var settings: SettingsController?
  let spatialOverview=SpatialOverviewController()
@@ -663,6 +730,55 @@ final class Navigator: NSObject, NSApplicationDelegate {
  var icons: [String:NSImage] = [:]
  let commandQueue = DispatchQueue(label: "local.paneru.navigator.commands", qos: .userInitiated)
  init(path: String) { self.path=path }
+ // Status menu: Settings, Reload, then Quit last, as menu bar apps do (⌘Q while the menu is open).
+ func makeStatusMenu() -> NSMenu {
+  let menu=NSMenu()
+  let heading=NSMenuItem(title:"Microfish",action:nil,keyEquivalent:""); heading.isEnabled=false; menu.addItem(heading)
+  let settingsItem=NSMenuItem(title:"Settings…",action:#selector(openSettings),keyEquivalent:""); settingsItem.target=self; menu.addItem(settingsItem)
+  let reload=NSMenuItem(title:"Reload preferences",action:#selector(reloadFromMenu),keyEquivalent:""); reload.target=self; menu.addItem(reload)
+  menu.addItem(.separator())
+  let quit=NSMenuItem(title:"Quit Microfish",action:#selector(quitMicrofish(_:)),keyEquivalent:"q"); quit.keyEquivalentModifierMask = .command; quit.target=self; menu.addItem(quit)
+  return menu
+ }
+ func liveQuitSequence() -> QuitSequence {
+  #if NAVIGATOR_TESTS
+  // A test that gets here would reach the real engine: refuse (tests inject quitSequenceOverride).
+  return QuitSequence(run:{ _ in preconditionFailure("test reached the real engine") })
+  #else
+  let engine=URL(fileURLWithPath:CommandLine.arguments[0]).standardizedFileURL.deletingLastPathComponent().appendingPathComponent("Microfish")
+  return QuitSequence(run:QuitSequence.process(engine))
+  #endif
+ }
+ // Stops the engine cleanly (it saves the session), then the helper. If the engine does not
+ // stop within the timeout the helper stays: killing it would leave a live engine with no tabs,
+ // minimap or Settings, and a retry from this menu stays possible. Beep + log say so.
+ @objc func quitMicrofish(_ sender: Any?) {
+  guard quitPhase == .idle else { return }
+  quitPhase = .stopping
+  if panel != nil { hide() }
+  NSLog("Navigator quit: stopping engine")
+  let sequence = quitSequenceOverride ?? liveQuitSequence()
+  quitBackground { [weak self] in
+   let outcome = sequence.execute()
+   self?.quitMain { [weak self] in self?.finishQuit(outcome) }
+  }
+ }
+ func finishQuit(_ outcome: QuitSequence.Outcome) {
+  NSLog("Navigator quit: engine %@",String(describing:outcome))
+  if outcome.helperMayExit { quitPhase = .finishing; quitExit() }
+  else { quitPhase = .idle; quitFailed() }
+ }
+ func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+  // Our own quit is done, or the system is logging out: go. Anything else (Dock-tile Quit while
+  // Settings is open, terminate:) takes the full quit so the helper never dies alone.
+  if quitPhase == .finishing || systemQuit() { return .terminateNow }
+  quitMicrofish(nil)
+  return .terminateCancel
+ }
+ func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+  openSettings()
+  return true
+ }
  func applicationDidFinishLaunching(_ notification: Notification) {
   panel=StripPanel(contentRect:.zero,styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
   panel.level = .floating
@@ -680,10 +796,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   } else { status.button?.title="P" }
   status.button?.toolTip="Microfish Settings"
   status.button?.setAccessibilityLabel("Microfish Settings")
-  let menu=NSMenu()
-  let heading=NSMenuItem(title:"Microfish",action:nil,keyEquivalent:""); heading.isEnabled=false; menu.addItem(heading)
-  let settingsItem=NSMenuItem(title:"Settings…",action:#selector(openSettings),keyEquivalent:""); settingsItem.target=self; menu.addItem(settingsItem)
-  let reload=NSMenuItem(title:"Reload preferences",action:#selector(reloadFromMenu),keyEquivalent:""); reload.target=self; menu.addItem(reload)
+  let menu=makeStatusMenu()
   status.menu=menu; statusItem=status
   #if !NAVIGATOR_TESTS
   spatialOverview.pinsPath = rootURL.appendingPathComponent("work/state/paneru/view-pins.json").path
@@ -826,6 +939,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   if kind == .scroll { presentHUD(kind) } else { presence.holdRender(kind,mtime:mtime,now:Date.timeIntervalSinceReferenceDate) }
  }
  func tick(forcePoll: Bool = false) {
+  if quitPhase != .idle { return }  // nothing may bring the HUD back while the product is going down
   let date=Date(), now=date.timeIntervalSinceReferenceDate
   let pollSnapshot = forcePoll || date.timeIntervalSince(lastSnapshotPoll) >= 0.1
   if pollSnapshot {
