@@ -171,6 +171,21 @@ pub struct EventLoopWaker {
 unsafe impl Send for EventLoopWaker {}
 unsafe impl Sync for EventLoopWaker {}
 
+/// The synthetic event [`EventLoopWaker::wake`] posts.
+fn wake_event() -> Option<Retained<NSEvent>> {
+    NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+        NSEventType::ApplicationDefined,
+        NSPoint::ZERO,
+        NSEventModifierFlags::empty(),
+        0.0,
+        0,
+        None,
+        WAKE_EVENT_SUBTYPE,
+        0,
+        0,
+    )
+}
+
 impl EventLoopWaker {
     pub fn new() -> Self {
         Self {
@@ -193,27 +208,27 @@ impl EventLoopWaker {
         if self.pending.swap(true, Ordering::AcqRel) {
             return;
         }
-        let Some(event) = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
-            NSEventType::ApplicationDefined,
-            NSPoint::ZERO,
-            NSEventModifierFlags::empty(),
-            0.0,
-            0,
-            None,
-            WAKE_EVENT_SUBTYPE,
-            0,
-            0,
-        ) else {
+        // Callers are the IPC reader, the config watcher and the AX resolver:
+        // plain threads with no autorelease pool, where the event the factory
+        // method autoreleases is never freed. It leaked ~400 bytes (the event,
+        // its event record and its CGEvent) per wake-up, ~18k of them in a day.
+        // A pool of our own makes the call leak-free on any thread.
+        let posted = autoreleasepool(|_| {
+            let Some(event) = wake_event() else {
+                return false;
+            };
+            // SAFETY: `postEvent:atStart:` is callable from any thread.
+            let app = unsafe { app.as_ref() };
+            // Appended, not pushed to the front, so it can't reorder real input.
+            app.postEvent_atStart(&event, false);
+            true
+        });
+        if !posted {
             // Nothing else will clear the flag, so drop it here or the pump is
             // never woken again.
             self.pending.store(false, Ordering::Release);
             error!("unable to create wake-up event");
-            return;
-        };
-        // SAFETY: `postEvent:atStart:` is callable from any thread.
-        let app = unsafe { app.as_ref() };
-        // Appended, not pushed to the front, so it can't reorder real input.
-        app.postEvent_atStart(&event, false);
+        }
     }
 
     /// Re-arms the waker. Must be called before the pump waits, not after:
@@ -549,5 +564,43 @@ mod tests {
         assert!(!fn_alt.matches(Modifiers::FN));
         assert!(!fn_alt.matches(Modifiers::LALT));
         assert!(!fn_alt.matches(Modifiers::FN | Modifiers::LALT | Modifiers::LSHIFT));
+    }
+}
+
+#[cfg(test)]
+mod waker_tests {
+    use super::{autoreleasepool, wake_event};
+    use objc2::rc::Weak;
+
+    /// Builds the wake-up event on a thread with no autorelease pool of its
+    /// own, as the IPC reader and the watchers do, and reports whether the
+    /// event is still alive once the caller has dropped everything it holds.
+    fn event_outlives_caller(pooled: bool) -> bool {
+        std::thread::spawn(move || {
+            let weak = if pooled {
+                autoreleasepool(|_| {
+                    let event = wake_event().expect("the factory builds an event");
+                    Weak::from_retained(&event)
+                })
+            } else {
+                let event = wake_event().expect("the factory builds an event");
+                Weak::from_retained(&event)
+            };
+            weak.load().is_some()
+        })
+        .join()
+        .expect("thread finished")
+    }
+
+    #[test]
+    fn a_pool_of_its_own_frees_the_wake_event() {
+        assert!(!event_outlives_caller(true));
+    }
+
+    /// The premise of the pool in `wake`: without one, the factory's
+    /// autorelease reference is all that is left and nothing ever drops it.
+    #[test]
+    fn without_a_pool_the_wake_event_leaks() {
+        assert!(event_outlives_caller(false));
     }
 }
