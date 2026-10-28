@@ -27,7 +27,7 @@ use crate::ecs::{
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
-use crate::platform::WorkspaceId;
+use crate::platform::{Pid, ProcessSerialNumber, WorkspaceId};
 
 const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
 pub(crate) const VERIFY_FOCUS_TIMEOUT: Duration = Duration::from_millis(300);
@@ -96,6 +96,7 @@ impl Plugin for FocusEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FocusHistory>();
         app.init_resource::<KeyboardFocusHandoff>();
+        app.init_resource::<KeyboardHold>();
         app.add_systems(
             PreUpdate,
             cancel_keyboard_focus
@@ -107,6 +108,7 @@ impl Plugin for FocusEventsPlugin {
             (
                 detect_focus_rejection.before(super::systems::timeout_ticker),
                 fix_window_size_on_focus,
+                resolve_keyboard_hold.run_if(|hold: Res<KeyboardHold>| hold.engaged()),
             ),
         );
         app.add_systems(
@@ -157,10 +159,101 @@ pub(crate) struct KeyboardFocusRequest {
     pub row_switch: bool,
 }
 
+/// The engine holding the keyboard for an empty row.
+///
+/// Entering an empty row leaves the window that had focus parked and invisible.
+/// Keystrokes must not reach it: typing or pressing Return into a terminal
+/// nobody can see. So the engine makes itself the front process, which has no
+/// window and no menu, and the keys go nowhere. The hold ends when a window
+/// appears in the row, when the row stops being the active one, or when any
+/// other process takes the front.
 #[derive(Default, Resource)]
-pub(super) struct KeyboardFocusHandoff(Option<KeyboardFocusAttempt>);
+pub(crate) struct KeyboardHold(Option<HeldRow>);
+
+#[derive(Clone, Copy)]
+struct HeldRow {
+    /// The empty row being held.
+    row: Entity,
+    /// The engine's own serial number, to tell its front switch from another's.
+    own: ProcessSerialNumber,
+    /// The app whose window was left parked, which ⌘N asks for a new window.
+    previous: Option<Pid>,
+}
+
+impl KeyboardHold {
+    pub(crate) fn engaged(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// The app that was in front when the hold began.
+    pub(crate) fn previous(&self) -> Option<Pid> {
+        self.0.and_then(|held| held.previous)
+    }
+
+    pub(crate) fn engage(&mut self, row: Entity, own: ProcessSerialNumber, previous: Option<Pid>) {
+        self.0 = Some(HeldRow { row, own, previous });
+    }
+
+    /// Ends the hold. The OS front process is left to whatever takes it next.
+    pub(crate) fn release(&mut self) {
+        if self.0.take().is_some() {
+            crate::platform::hold::release();
+        }
+    }
+
+    /// A front switch to `psn`: the engine's own is the hold taking effect, any
+    /// other process (an app, Spotlight, Raycast) ends it.
+    pub(super) fn front_switched(&mut self, psn: ProcessSerialNumber) {
+        if self.0.is_some_and(|held| held.own != psn) {
+            info!("empty row: front switch to another process, keyboard released");
+            self.release();
+        }
+    }
+}
+
+/// A window appeared in the held row, or the row is no longer the active one:
+/// the hold has done its job. A new window is visible, and the only thing in
+/// view, so it is safe to give it the keyboard; that is what makes the
+/// empty-row then ⌘N flow, and a window arriving from another app, work.
+fn resolve_keyboard_hold(
+    mut hold: ResMut<KeyboardHold>,
+    strips: Query<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    mut commands: Commands,
+) {
+    let Some(current) = hold.0 else {
+        return;
+    };
+    let Ok((strip, active)) = strips.get(current.row) else {
+        hold.release();
+        return;
+    };
+    if !active {
+        hold.release();
+        return;
+    }
+    if strip.len() == 0 {
+        return;
+    }
+    hold.release();
+    if let Some(target) = strip.first().ok().and_then(|column| column.top()) {
+        info!(
+            "empty row {} got a window: keyboard released to it",
+            strip.virtual_index + 1
+        );
+        crate::commands::focus_with_verification(target, None, &mut commands);
+    }
+}
+
+#[derive(Default, Resource)]
+pub(crate) struct KeyboardFocusHandoff(Option<KeyboardFocusAttempt>);
 
 impl KeyboardFocusHandoff {
+    /// Drops any pending request. An empty row supersedes it: its target would
+    /// put a parked window back in front of the keyboard.
+    pub(crate) fn cancel(&mut self) {
+        self.0 = None;
+    }
+
     pub(super) fn cancel_target_in(&mut self, entities: &[Entity]) {
         if self
             .0
@@ -908,9 +1001,11 @@ fn raise_window_trigger(
 fn recover_lost_focus(
     windows: Windows,
     active_workspace: Query<&LayoutStrip, With<ActiveWorkspaceMarker>>,
+    hold: Res<KeyboardHold>,
     mut commands: Commands,
 ) {
-    if windows.focused().is_some() {
+    // An empty row holds the keyboard on purpose: no window has focus.
+    if windows.focused().is_some() || hold.engaged() {
         return;
     }
     if let Ok(strip) = active_workspace

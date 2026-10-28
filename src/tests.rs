@@ -1,5 +1,6 @@
 mod display;
 mod drag_reorder;
+mod empty_row;
 mod focus_or_virtual;
 mod harness;
 mod interaction;

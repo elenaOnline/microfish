@@ -15,14 +15,14 @@ use crate::platform::WinID;
 
 use super::*;
 
-fn cmd(op: Operation) -> Event {
+pub(super) fn cmd(op: Operation) -> Event {
     Event::Command {
         command: Command::Window(op),
     }
 }
 
 /// Delivers `events` in ONE frame, then lets the engine settle.
-fn send(h: &mut TestHarness, events: Vec<Event>) {
+pub(super) fn send(h: &mut TestHarness, events: Vec<Event>) {
     for event in events {
         h.app.world_mut().write_message::<Event>(event);
     }
@@ -30,14 +30,14 @@ fn send(h: &mut TestHarness, events: Vec<Event>) {
 }
 
 #[derive(Debug)]
-struct Row {
-    index: u32,
-    active: bool,
-    origin_x: i32,
-    windows: Vec<WinID>,
+pub(super) struct Row {
+    pub(super) index: u32,
+    pub(super) active: bool,
+    pub(super) origin_x: i32,
+    pub(super) windows: Vec<WinID>,
 }
 
-fn rows(h: &mut TestHarness) -> Vec<Row> {
+pub(super) fn rows(h: &mut TestHarness) -> Vec<Row> {
     let world = h.world();
     let ids: Vec<(Entity, WinID)> = world
         .query::<(Entity, &Window)>()
@@ -59,7 +59,7 @@ fn rows(h: &mut TestHarness) -> Vec<Row> {
     out
 }
 
-fn active_row(h: &mut TestHarness) -> u32 {
+pub(super) fn active_row(h: &mut TestHarness) -> u32 {
     let active = rows(h)
         .into_iter()
         .filter(|row| row.active)
@@ -70,7 +70,7 @@ fn active_row(h: &mut TestHarness) -> u32 {
 }
 
 /// Window ids carrying the ECS focus marker.
-fn ecs_focus(h: &mut TestHarness) -> Vec<WinID> {
+pub(super) fn ecs_focus(h: &mut TestHarness) -> Vec<WinID> {
     let world = h.world();
     world
         .query_filtered::<&Window, With<FocusedMarker>>()
@@ -81,14 +81,14 @@ fn ecs_focus(h: &mut TestHarness) -> Vec<WinID> {
 
 /// Focuses `id` the way the OS does: the app reports it and the notifications
 /// follow.
-fn focus(h: &mut TestHarness, id: WinID) {
+pub(super) fn focus(h: &mut TestHarness, id: WinID) {
     h.mock_state.focus_window(id);
     h.advance(Duration::from_millis(600));
 }
 
 /// `count` windows; the last `lower` of them sit on row 1, the rest on row 0.
 /// Row 0 is active and `focus_id` has focus when this returns.
-fn two_rows(count: i32, lower: &[WinID], focus_id: WinID) -> TestHarness {
+pub(super) fn two_rows(count: i32, lower: &[WinID], focus_id: WinID) -> TestHarness {
     let mut h = TestHarness::new().with_windows(count);
     send(&mut h, vec![Event::MenuOpened { window_id: 0 }]);
     for id in lower {
@@ -102,13 +102,13 @@ fn two_rows(count: i32, lower: &[WinID], focus_id: WinID) -> TestHarness {
     h
 }
 
-fn production_config() -> crate::config::Config {
+pub(super) fn production_config() -> crate::config::Config {
     crate::config::Config::try_from("[options]\nreap_empty_workspaces=true\n[bindings]\n").unwrap()
 }
 
 /// Row 0 holds windows 0, 1 and 2 (the strip is wider than the display, so
 /// it can be scrolled); row 1 holds 3 and 4. Row 0 is active, focused on 1.
-fn rig() -> TestHarness {
+pub(super) fn rig() -> TestHarness {
     two_rows(5, &[3, 4], 1)
 }
 

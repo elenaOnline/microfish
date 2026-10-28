@@ -123,7 +123,18 @@ struct MockStateInner {
     refused_focus: HashMap<WinID, u8>,
     /// How many times the engine asked an app for its full window list.
     window_list_scans: usize,
+    /// The apps in front when the engine made itself the front process, one
+    /// entry per request (the empty-row keyboard hold).
+    self_activations: Vec<Option<Pid>>,
+    /// The engine is the front process: no app is.
+    engine_front: bool,
 }
+
+/// The serial number the mock gives the engine itself.
+pub(crate) const ENGINE_PSN: ProcessSerialNumber = ProcessSerialNumber {
+    high: 0xE,
+    low: 0xE,
+};
 
 /// One native focus request recorded by the mock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +168,8 @@ impl MockState {
                 focus_calls: Vec::new(),
                 refused_focus: HashMap::new(),
                 window_list_scans: 0,
+                self_activations: Vec::new(),
+                engine_front: false,
             })),
         }
     }
@@ -254,6 +267,50 @@ impl MockState {
         self.inner.force_read().focus_calls.clone()
     }
 
+    /// Times the engine made itself the front process, each with the app that
+    /// was in front, oldest first.
+    pub(crate) fn self_activations(&self) -> Vec<Option<Pid>> {
+        self.inner.force_read().self_activations.clone()
+    }
+
+    /// Whether the engine, not an app, is the front process.
+    pub(crate) fn engine_is_front(&self) -> bool {
+        self.inner.force_read().engine_front
+    }
+
+    /// The engine takes the front: no app is frontmost, and the switch is
+    /// announced with the engine's own serial number.
+    fn activate_engine(&self, previous: Option<Pid>) {
+        let mut inner = self.inner.force_write();
+        inner.self_activations.push(previous);
+        inner.engine_front = true;
+        for app in inner.apps.values_mut() {
+            app.is_frontmost = false;
+        }
+        inner
+            .event_queue
+            .push_back(Event::ApplicationFrontSwitched { psn: ENGINE_PSN });
+    }
+
+    /// Focusing a window makes its app the front process, which ends the
+    /// engine's turn as front and is announced like any front switch.
+    fn take_front_from_engine(&self, id: WinID) {
+        let mut inner = self.inner.force_write();
+        if !std::mem::take(&mut inner.engine_front) {
+            return;
+        }
+        let Some(pid) = inner.windows.get(&id).map(|window| window.pid) else {
+            return;
+        };
+        if let Some(app) = inner.apps.get_mut(&pid) {
+            app.is_frontmost = true;
+            let psn = app.psn;
+            inner
+                .event_queue
+                .push_back(Event::ApplicationFrontSwitched { psn });
+        }
+    }
+
     /// Makes the next `times` native focus requests for window `id` do nothing.
     pub(crate) fn refuse_focus(&self, id: WinID, times: u8) {
         self.inner.force_write().refused_focus.insert(id, times);
@@ -293,8 +350,11 @@ impl MockState {
         let mut inner = self.inner.force_write();
         if let Some(win) = inner.windows.get(&id) {
             let pid = win.pid;
+            let engine_was_front = std::mem::take(&mut inner.engine_front);
             if let Some(app) = inner.apps.get_mut(&pid) {
                 app.focused_window_id = Some(id);
+                // Focusing an app's window takes the front from the engine.
+                app.is_frontmost |= engine_was_front;
                 let psn = app.psn;
                 inner
                     .event_queue
@@ -337,6 +397,10 @@ impl MockState {
 
     pub fn active_display(&self) -> CGDirectDisplayID {
         self.inner.force_read().active_display_id
+    }
+
+    pub(crate) fn set_active_display(&self, id: u32) {
+        self.inner.force_write().active_display_id = id;
     }
 
     pub(crate) fn activate_workspace(
@@ -790,6 +854,7 @@ impl MockState {
             .returning(move |_psn, focused, _focused_psn| {
                 if s.record_focus_call(id, Some(focused.id())) {
                     s.set_focused_window(id);
+                    s.take_front_from_engine(id);
                 }
             });
         let s = self.clone();
@@ -1019,6 +1084,12 @@ impl MockState {
                 .filter_map(|(id, window)| window.visible.then_some((*id, window.frame)))
                 .collect::<Vec<_>>();
             Some(windows)
+        });
+
+        let s = self.clone();
+        wm.expect_hold_keyboard().returning(move |previous| {
+            s.activate_engine(previous);
+            Some(ENGINE_PSN)
         });
 
         let s = self.clone();

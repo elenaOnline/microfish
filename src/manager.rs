@@ -12,7 +12,7 @@ use objc2_core_foundation::{
     CGPoint, CGRect, CGSize, kCFBooleanTrue,
 };
 use objc2_core_graphics::{
-    CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds,
+    CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds, CGError,
     CGGetActiveDisplayList, CGRectMakeWithDictionaryRepresentation, CGWarpMouseCursorPosition,
     CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowBounds,
     kCGWindowNumber,
@@ -29,19 +29,20 @@ use crate::config::Config;
 use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender};
 use crate::manager::skylight::SLSSetWindowListBrightness;
-use crate::platform::{ConnID, Pid, ProcessSerialNumber, WinID, WorkspaceId};
+use crate::platform::{self, ConnID, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use crate::util::{AXUIWrapper, MacResult, create_array, round_px, symlink_target};
 use app::ApplicationOS;
 pub use app::{Application, ApplicationApi};
 pub use display::Display;
+use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
 pub use process::{Process, ProcessApi, is_microfish_helper};
 pub use skylight::AXUIElementCopyAttributeValue;
 use skylight::{
-    _AXUIElementCreateWithRemoteToken, SLSCopyActiveMenuBarDisplayIdentifier,
-    SLSCopyAssociatedWindows, SLSCopyManagedDisplaySpaces, SLSCopyWindowsWithOptionsAndTags,
-    SLSFindWindowAndOwner, SLSGetConnectionIDForPSN, SLSGetCurrentCursorLocation,
-    SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode, SLSMainConnectionID,
-    SLSManagedDisplayGetCurrentSpace, SLSSpaceGetType, SLSWindowIsOrderedIn,
+    _AXUIElementCreateWithRemoteToken, _SLPSSetFrontProcessWithOptions,
+    SLSCopyActiveMenuBarDisplayIdentifier, SLSCopyAssociatedWindows, SLSCopyManagedDisplaySpaces,
+    SLSCopyWindowsWithOptionsAndTags, SLSFindWindowAndOwner, SLSGetConnectionIDForPSN,
+    SLSGetCurrentCursorLocation, SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode,
+    SLSMainConnectionID, SLSManagedDisplayGetCurrentSpace, SLSSpaceGetType, SLSWindowIsOrderedIn,
     SLSWindowIteratorAdvance, SLSWindowIteratorGetAttributes, SLSWindowIteratorGetParentID,
     SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows,
     SLSWindowQueryWindows,
@@ -194,6 +195,16 @@ pub trait WindowManagerApi: Send + Sync {
     /// the global top-left-origin points accessibility uses. One query for all
     /// windows, so it never waits on an app the way a per-window AX read can.
     fn on_screen_window_bounds(&self) -> Option<Vec<(WinID, IRect)>>;
+
+    /// Makes the engine itself the front process, with no window, so that no
+    /// other app's window is the keyboard target (see `platform::hold`).
+    /// `previous` is the app that was in front, kept for the hold's ⌘N.
+    ///
+    /// # Returns
+    ///
+    /// The engine's own serial number, to tell its front switch from another
+    /// app's, or `None` when it could not take the front.
+    fn hold_keyboard(&self, previous: Option<Pid>) -> Option<ProcessSerialNumber>;
 }
 
 /// `WindowManager` is a Bevy resource that holds a boxed `WindowManagerApi` trait object.
@@ -330,6 +341,26 @@ impl WindowManagerOS {
 }
 
 impl WindowManagerApi for WindowManagerOS {
+    fn hold_keyboard(&self, previous: Option<Pid>) -> Option<ProcessSerialNumber> {
+        let psn = platform::hold::own_psn()?;
+        // Mode 0x400, no windows: the engine has none to bring forward.
+        let status = unsafe { _SLPSSetFrontProcessWithOptions(&psn, 0, windows::CPS_NO_WINDOWS) };
+        if status != CGError::Success {
+            // `NSRunningApplication` activation is cooperative since macOS 14 and
+            // may be declined, so it is only the fallback.
+            let activated = NSRunningApplication::currentApplication()
+                .activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
+            warn!(
+                "hold: SLPS front switch failed ({status:?}); NSRunningApplication activate: {activated}"
+            );
+            if !activated {
+                return None;
+            }
+        }
+        platform::hold::engage(previous);
+        Some(psn)
+    }
+
     fn new_application(&self, process: &dyn ProcessApi) -> Result<Application> {
         let connection = self.connection_for_process(process.psn());
         ApplicationOS::new(

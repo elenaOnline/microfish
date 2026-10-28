@@ -23,7 +23,7 @@ use crate::commands::{
     get_window_in_direction,
 };
 use crate::config::Config;
-use crate::ecs::focus::FocusHistory;
+use crate::ecs::focus::{FocusHistory, KeyboardFocusHandoff, KeyboardHold};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER, origin_exposing};
 use crate::ecs::params::{ActiveDisplay, WindowCtx, Windows};
 use crate::ecs::{
@@ -1312,13 +1312,17 @@ fn column_nearest_viewport_center(
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) fn show_active_workspace(
     activated: Single<Entity, Added<ActiveWorkspaceMarker>>,
     windows: Windows,
     mut workspaces: RestorableStrips,
     displays: Query<(&Display, Option<&DockPosition>)>,
     focus_markers: Query<Ref<FocusedMarker>>,
+    apps: Query<&Application>,
+    window_manager: Res<WindowManager>,
+    mut hold: ResMut<KeyboardHold>,
+    mut handoff: ResMut<KeyboardFocusHandoff>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
@@ -1329,8 +1333,18 @@ pub(crate) fn show_active_workspace(
         return;
     };
 
+    // A new row ends any earlier hold; an empty one below takes it up again.
+    let held_before = hold.engaged().then(|| hold.previous());
+    hold.release();
+
     // Hide other strips on the current workspace
     let current_focus = windows.focused();
+    // The focused window, when this activation leaves it parked.
+    let parked_focus = current_focus.filter(|(_, focus)| {
+        workspaces.iter().any(|(entity, _, strip, _, _, _)| {
+            entity != *activated && strip.id() == workspace_id && strip.contains(*focus)
+        })
+    });
     let current_workspace = workspaces
         .iter_mut()
         .filter(|(entity, _, strip, _, _, _)| strip.id() == workspace_id && *entity != *activated);
@@ -1381,6 +1395,39 @@ pub(crate) fn show_active_workspace(
         strip.virtual_index + 1,
         strip.all_windows().len()
     );
+
+    // An empty row shows nothing to type into, yet the window that had focus
+    // is now parked out of sight and would take the keystrokes. Hold the
+    // keyboard instead. Focus on another display's window is not affected, and
+    // neither is a row entered with no focused window at all, unless it is
+    // another empty row reached while already holding.
+    if strip.len() == 0 {
+        let previous = parked_focus
+            .and_then(|(window, _)| windows.find_parent(window.id()))
+            .and_then(|(_, _, parent)| apps.get(parent).ok())
+            .map(|app| app.pid())
+            .or(held_before.flatten());
+        if (parked_focus.is_some() || held_before.is_some())
+            && let Some(own) = window_manager.hold_keyboard(previous)
+        {
+            info!(
+                "row {} is empty: the keyboard is held, left window {} parked",
+                strip.virtual_index + 1,
+                parked_focus.map_or(0, |(window, _)| window.id())
+            );
+            hold.engage(*activated, own, previous);
+            // Without the marker a return to the old row takes the remembered
+            // focus path and really focuses the window, instead of assuming
+            // the OS focus never left it. The pending request, if any, would
+            // put that parked window back in front of the keyboard.
+            if let Some((_, focus)) = parked_focus
+                && let Ok(mut entity_commands) = commands.get_entity(focus)
+            {
+                entity_commands.try_remove::<FocusedMarker>();
+            }
+            handoff.cancel();
+        }
+    }
 
     // If no previous strip position exists, then the workspace was not hidden.
     if let Some(PreviousStripPosition { origin, focus }) = previous_position {
