@@ -960,9 +960,11 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
     }
     @objc private func clicked() {
         guard let button = item?.button else { return }
-        if NSApp.currentEvent?.type == .rightMouseUp, let menu, let event = NSApp.currentEvent {
+        if NSApp.currentEvent?.type == .rightMouseUp, let menu, let item {
             if popover.isShown { popover.performClose(nil) }
-            NSMenu.popUpContextMenu(menu, with: event, for: button); return
+            // Attach the menu for one click, as a menu extra does: it opens under the item with the
+            // item highlighted, instead of a context menu at the pointer.
+            item.menu = menu; button.performClick(nil); item.menu = nil; return
         }
         let pressClosed = spatialStatusClickClosesPopover(closedByPressAt: closedByStatusPressAt, now: ProcessInfo.processInfo.systemUptime)
         closedByStatusPressAt = nil
