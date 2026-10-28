@@ -420,6 +420,9 @@ final class TabBars: NSObject {
  func stripView(column: Int) -> NSView? { bars[column]?.strip }
  func panelFrame(column: Int) -> CGRect? { bars[column]?.panel.frame }
  var hasVisibleBars: Bool { bars.values.contains { $0.panel.isVisible } }
+ #if NAVIGATOR_TESTS
+ func backdatePress(column: Int, by seconds: TimeInterval) { bars[column]?.pressedSince -= seconds }
+ #endif
  func update(_ snapshot: NavigatorSnapshot, windows: [LiveWindow]) {
   currentWindows=windows
   guard snapshot.tabsVisible, let screen = NSScreen.screens.first(where: { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == snapshot.display }) else {
@@ -436,7 +439,11 @@ final class TabBars: NSObject {
    if windows.prefix(while: { $0.id != live.id }).contains(where: { $0.layer == 0 && !ids.contains($0.id) && $0.frame.contains(screen.visibleFrame) }) { continue }
    let bar = bars[column] ?? TabBarSurface(); bars[column] = bar
    bar.memberIDs=ids
-   if tabPressIsStale(pressed:bar.pressed,since:bar.pressedSince,now:Date.timeIntervalSinceReferenceDate,buttonsDown:Int(NSEvent.pressedMouseButtons)) { bar.pressed=false; clearDragFeedback() }
+   if tabPressIsStale(pressed:bar.pressed,since:bar.pressedSince,now:Date.timeIntervalSinceReferenceDate,buttonsDown:Int(NSEvent.pressedMouseButtons)) {
+    // A lost mouse-up: unwind the card and any drag so the minimap's tab-drag hold ends too.
+    cancelTabPresses(in:bar.panel.contentView); bar.pressed=false
+    if dragSource != nil || dragMark != nil { finishDrag() } else { clearDragFeedback() }
+   }
    shown.insert(column)
    let selection = tabSelection(members, focused: snapshot.focused, liveID: live.id)
    let side=style == "side"
@@ -526,7 +533,8 @@ final class TabBars: NSObject {
        item.target = self; item.tag = member.id; item.state = member.id == selection ? .on : .off; menu.addItem(item)
       }
       if let event { NSMenu.popUpContextMenu(menu, with: event, for: more) }
-      else { menu.popUp(positioning: nil, at: NSPoint(x: 0, y: more.bounds.height), in: more) }
+      // VoiceOver press: return before the menu's modal tracking starts.
+      else { DispatchQueue.main.async { menu.popUp(positioning: nil, at: NSPoint(x: 0, y: more.bounds.height), in: more) } }
      }
      more.onClick = { showMenu(NSApp.currentEvent) }
      more.setAccessibilityLabel("More tabs")

@@ -225,7 +225,7 @@ final class SpatialMapView: NSView {
     init(snapshot: SpatialSnapshot, width: CGFloat, onFocus: ((Int) -> Void)?) {
         self.snapshot = snapshot; self.map = SpatialMapLayout(snapshot: snapshot, width: width); self.onFocus = onFocus; requestedWidth = width
         super.init(frame: CGRect(x: 0, y: 0, width: map.width, height: map.height))
-        setAccessibilityRole(.group); setAccessibilityLabel("Spatial window overview"); rebuild()
+        setAccessibilityElement(true); setAccessibilityRole(.group); setAccessibilityLabel("Windows by row"); rebuild()
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(displayEnvironmentChanged), name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(displayEnvironmentChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
     }
@@ -293,7 +293,14 @@ final class SpatialMapView: NSView {
         guard let state = drag else { return }
         var target = state.moved && visibleRect.contains(point) ? spatialDrop(snapshot: snapshot, map: map, drag: state, point: point) : nil
         // A snapshot queued during the drag can remove the anchor the drop was computed against.
-        if let next = pending, let anchor = target?.anchor, !next.windows.contains(where: { $0.id == anchor }) { target = nil }
+        // Commit only if the source column and the anchor are still where the drop was computed.
+        if let next = pending, let t = target {
+            let column = { (id: Int) in next.windows.first(where: { $0.id == id }).map { ($0.row, $0.column) } }
+            let before = { (id: Int) in self.snapshot.windows.first(where: { $0.id == id }).map { ($0.row, $0.column) } }
+            let sourceSame = column(t.sourceID).map { $0 == (t.sourceRow, before(t.sourceID)?.1 ?? -1) } ?? false
+            let anchorSame = t.anchor.map { a in column(a).map { $0 == (t.row, before(a)?.1 ?? -1) } ?? false } ?? true
+            if !sourceSame || !anchorSame { target = nil }
+        }
         let clicked = !state.moved ? map.tiles.first(where: { $0.window.id == state.sourceID && $0.rect.contains(point) })?.window : nil
         cancelDrag()
         if let target { onMove?(target.sourceID, target.sourceRow, target.row, target.anchor, target.after) }
@@ -554,7 +561,7 @@ final class SpatialContentView: NSView {
         geometry = SpatialPanelGeometry(available: available, rowCount: snapshot.rows.count)
         mapView = SpatialMapView(snapshot: snapshot, width: max(1, geometry.scroll.width-14), onFocus: nil)
         super.init(frame: CGRect(origin: .zero, size: geometry.size))
-        setAccessibilityRole(.group); setAccessibilityLabel("Window map")
+        setAccessibilityElement(true); setAccessibilityRole(.group); setAccessibilityLabel("Window map")
         // Gutters and overflow pills depend on visibleRect. Copying old pixels
         // during scrolling would move those fixed decorations into the map.
         let clip=SpatialClipView();scrollView.contentView=clip
