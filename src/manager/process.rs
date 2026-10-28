@@ -152,6 +152,23 @@ impl ProcessApi for ProcessOS {
     }
 }
 
+/// Bundle identifier of Microfish's helper (`MicrofishNavigator`).
+pub const MICROFISH_HELPER_BUNDLE_ID: &str = "local.microfish.navigator";
+
+/// Whether a process with this identity is Microfish's own helper. The bundle
+/// identifier is authoritative; the executable path covers a helper built
+/// without an embedded Info.plist.
+pub fn is_microfish_helper(bundle_id: Option<&str>, executable: Option<&str>) -> bool {
+    bundle_id == Some(MICROFISH_HELPER_BUNDLE_ID)
+        || executable.is_some_and(|path| path.ends_with("/bin/MicrofishNavigator"))
+}
+
+/// Whether a process may be managed: a regular app, or one a window rule
+/// forces, but never Microfish's own helper.
+pub fn admits(policy: NSApplicationActivationPolicy, forced: bool, helper: bool) -> bool {
+    !helper && (forced || policy == NSApplicationActivationPolicy::Regular)
+}
+
 impl From<Pin<Box<Process>>> for BProcess {
     /// Converts a `Pin<Box<Process>>` into a `BProcess` by wrapping it in `ProcessOS`.
     fn from(inner: Pin<Box<Process>>) -> Self {
@@ -241,11 +258,25 @@ impl Process {
     pub fn is_observable(&mut self) -> bool {
         if let Some(app) = &self.application {
             self.policy = app.activationPolicy();
-            self.policy == NSApplicationActivationPolicy::Regular
+            admits(self.policy, false, self.is_microfish_helper())
         } else {
             self.policy = NSApplicationActivationPolicy::Prohibited;
             false
         }
+    }
+
+    /// Whether this is Microfish's own helper (tab bars, minimap, Settings).
+    /// It turns into a regular app while Settings is open, so it gets a menu
+    /// bar and a place in Cmd-Tab, and the engine must never tile it.
+    pub fn is_microfish_helper(&self) -> bool {
+        self.application.as_ref().is_some_and(|app| {
+            let bundle_id = app.bundleIdentifier().map(|id| id.to_string());
+            let executable = app
+                .executableURL()
+                .and_then(|url| url.path())
+                .map(|path| path.to_string());
+            is_microfish_helper(bundle_id.as_deref(), executable.as_deref())
+        })
     }
 
     /// Forces the process to be treated as manageable regardless of its activation policy.
@@ -386,6 +417,12 @@ impl Process {
         }
         self.unobserve_finished_launching();
 
+        if self.is_microfish_helper() {
+            // Never managed, whatever its policy becomes, so there is no
+            // policy change worth waiting for either.
+            self.unobserve_activation_policy();
+            return false;
+        }
         if !self.force_manage && !self.is_observable() {
             debug!(
                 "{} ({}) is not observable, subscribing to activationPolicy changes",
@@ -396,5 +433,55 @@ impl Process {
         }
         self.unobserve_activation_policy();
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn microfish_helper_is_recognised_by_bundle_id_or_executable() {
+        assert!(is_microfish_helper(Some("local.microfish.navigator"), None));
+        assert!(is_microfish_helper(
+            None,
+            Some("/Applications/Microfish.app/Contents/MacOS/bin/MicrofishNavigator")
+        ));
+        assert!(!is_microfish_helper(Some("local.microfish.engine"), None));
+        assert!(!is_microfish_helper(
+            Some("com.cmuxterm.app"),
+            Some("/Applications/cmux.app/Contents/MacOS/cmux")
+        ));
+        assert!(!is_microfish_helper(
+            None,
+            Some("/x/bin/MicrofishNavigator.next")
+        ));
+        assert!(!is_microfish_helper(None, None));
+    }
+
+    /// The helper flips to a regular app while Settings is open. Neither that
+    /// policy nor a window rule forcing management may admit it.
+    #[test]
+    fn helper_is_never_admitted_whatever_its_policy() {
+        for policy in [
+            NSApplicationActivationPolicy::Regular,
+            NSApplicationActivationPolicy::Accessory,
+            NSApplicationActivationPolicy::Prohibited,
+        ] {
+            for forced in [false, true] {
+                assert!(!admits(policy, forced, true), "{policy:?} forced={forced}");
+            }
+        }
+        assert!(admits(NSApplicationActivationPolicy::Regular, false, false));
+        assert!(!admits(
+            NSApplicationActivationPolicy::Accessory,
+            false,
+            false
+        ));
+        assert!(admits(
+            NSApplicationActivationPolicy::Accessory,
+            true,
+            false
+        ));
     }
 }

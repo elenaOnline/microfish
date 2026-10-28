@@ -461,6 +461,10 @@ impl Config {
             else {
                 return false;
             };
+            // No rule can make the engine tile Microfish's own helper.
+            if crate::manager::is_microfish_helper(Some(&bundle_id), None) {
+                return false;
+            }
             windows.values().any(|params| {
                 params
                     .bundle_id
