@@ -177,6 +177,52 @@ struct KeyCounterWatch {
   return counter != base
  }
 }
+// A mouse press during a bare Hyper hold (Hyper-click) is not a request for the HUD either.
+struct ChordInputWatch {
+ var keys=KeyCounterWatch(), left=KeyCounterWatch(), right=KeyCounterWatch(), other=KeyCounterWatch()
+ mutating func interrupted(exact: Bool, key: UInt32, leftDown: UInt32, rightDown: UInt32, otherDown: UInt32, buttonsDown: Bool) -> Bool {
+  let k=keys.otherKey(exact:exact,counter:key), l=left.otherKey(exact:exact,counter:leftDown)
+  let r=right.otherKey(exact:exact,counter:rightDown), o=other.otherKey(exact:exact,counter:otherDown)
+  return k || l || r || o || (exact && buttonsDown)
+ }
+}
+// A fading HUD must not swallow clicks.
+func hudIgnoresMouse(alpha: Double) -> Bool { alpha < 1 }
+// Strip motion: window frames of the snapshot's windows, rounded to half points, in id order.
+func stripMotionSignature(_ windows: [LiveWindow], ids: Set<Int>) -> [Int] {
+ windows.filter { ids.contains($0.id) }.sorted { $0.id < $1.id }.flatMap { w in
+  [w.id,Int((w.frame.minX*2).rounded()),Int((w.frame.minY*2).rounded()),Int((w.frame.width*2).rounded()),Int((w.frame.height*2).rounded())]
+ }
+}
+struct StripMotion {
+ var last: [Int]?
+ mutating func moved(_ signature: [Int]) -> Bool { defer { last=signature }; return last != nil && last != signature }
+ mutating func reset() { last=nil }
+}
+// Keeps `current` when the item is already fully in view, else the smallest scroll that shows it.
+func revealOffset(current: CGFloat, visible: CGFloat, itemMin: CGFloat, itemMax: CGFloat, content: CGFloat) -> CGFloat {
+ let limit=max(0,content-visible)
+ var offset=current
+ if itemMax > offset+visible { offset=itemMax-visible }
+ if itemMin < offset { offset=itemMin }
+ return min(limit,max(0,offset))
+}
+// What the HUD displays, as a string: equal strings need no rebuild. Titles show only in "titles" style.
+func hudRenderSignature(_ rows: HUDRows, focused: Int, viewing: Int?, style: String, position: String, dark: Bool, visible: CGRect, aliases: [String:String]) -> String {
+ var out="\(style)|\(position)|\(dark)|\(visible)|\(rows.current)|\(focused)|\(viewing.map(String.init) ?? "-")"
+ for row in rows.indices {
+  out+="\nrow\(row)"
+  for e in rows.entries[row] ?? [] {
+   out+="\n\(e.id),\(e.column),\(e.app),\(e.bundle),\(e.tabHeight),\(e.selectedID)"
+   if style == "titles" { out+=",\(e.title)" }
+  }
+ }
+ return out+"\n"+aliases.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator:"\n")
+}
+struct HUDScrollState {
+ var lanes: [Int:CGFloat] = [:]
+ var fromTop: CGFloat?
+}
 struct Chord: OptionSet {
  let rawValue: Int
  static let control=Chord(rawValue:1), option=Chord(rawValue:2), command=Chord(rawValue:4)
@@ -207,6 +253,10 @@ struct HUDPresence {
  var visible=false, timer=false, forced=false, moved=false
  var chord=Chord(), escapedChord: Chord?
  var pending: (due: TimeInterval, kind: Kind, chord: Chord)?
+ // The engine writes show/row intents before it runs the command: render once a newer snapshot
+ // lands, or deferWait after the intent, whichever is first. The earliest intent keeps the deadline.
+ static let deferWait=0.15
+ var deferred: (kind: Kind, mtime: TimeInterval)?
  var anchor: TimeInterval=0, releaseAt: TimeInterval?
  var origin=CGPoint.zero
  var fast: Bool { visible || pending != nil }
@@ -215,7 +265,16 @@ struct HUDPresence {
   if !visible { origin=pointer; moved=false }
   visible=true; self.timer=timer; self.chord=chord; anchor=now; releaseAt=nil; forced=false; pending=nil
  }
- mutating func hide() { visible=false; pending=nil; forced=false; releaseAt=nil; moved=false; timer=false }
+ mutating func hide() { visible=false; pending=nil; forced=false; releaseAt=nil; moved=false; timer=false; deferred=nil }
+ mutating func holdRender(_ kind: Kind, mtime: TimeInterval) { deferred=(kind,deferred?.mtime ?? mtime) }
+ mutating func releaseRender(snapshot: TimeInterval, now: TimeInterval) -> Kind? {
+  guard let d=deferred, snapshot > d.mtime || now >= d.mtime+Self.deferWait else { return nil }
+  deferred=nil
+  if timer { anchor=now }
+  return d.kind
+ }
+ // Ongoing strip motion counts as activity for a scroll (timer) session, like a hold.
+ mutating func motion(now: TimeInterval) { if visible && timer { anchor=now; releaseAt=nil } }
  // Returns the kind to render now, or nil (nothing yet, or a reveal is pending).
  mutating func navigate(_ kind: Kind, chord observed: Chord, mtime: TimeInterval, now: TimeInterval, pointer: CGPoint) -> Kind? {
   let t=kind == .scroll || mode == "timer"
@@ -228,7 +287,7 @@ struct HUDPresence {
  mutating func bareHoldReveal(now: TimeInterval, mods: Chord, pointer: CGPoint) -> Bool {
   if visible { anchor=now; return false }
   if let e=escapedChord, e.isSubset(of:mods) { return false }
-  present(now:now,pointer:pointer,timer:mode == "timer",chord:mods)
+  present(now:now,pointer:pointer,timer:mode == "timer",chord:mods); deferred=nil
   return true
  }
  // true: stay and re-render. false: the click committed; the HUD leaves.
@@ -248,7 +307,7 @@ struct HUDPresence {
   if let e=escapedChord, !e.isSubset(of:mods) { escapedChord=nil }
   if let p=pending {
    if !p.chord.isSubset(of:mods) { pending=nil }
-   else if now >= p.due { present(now:now,pointer:pointer,timer:false,chord:p.chord); return HUDStep(present:p.kind,alpha:1,fast:true) }
+   else if now >= p.due { present(now:now,pointer:pointer,timer:false,chord:p.chord); deferred=nil; return HUDStep(present:p.kind,alpha:1,fast:true) }
   }
   guard visible else { return HUDStep(alpha:0,fast:pending != nil) }
   let inside=frame.contains(pointer)
@@ -410,6 +469,11 @@ final class ColumnCard: NSView {
   (active ? hudColor(dark ? 0x3CC6C4:0x00898B):(dark ? NSColor.white:NSColor.black).withAlphaComponent(dark ? 0.08:0.10)).setStroke()
   path.lineWidth=active ? 1.5:0.5;path.stroke()
  }
+ // The tab strip also uses cards and exposes them itself; only the minimap opts in.
+ var exposedAsButton = false
+ override func isAccessibilityElement() -> Bool { exposedAsButton || super.isAccessibilityElement() }
+ override func accessibilityRole() -> NSAccessibility.Role? { exposedAsButton ? .button : super.accessibilityRole() }
+ override func accessibilityPerformPress() -> Bool { guard exposedAsButton, let onClick else { return super.accessibilityPerformPress() }; onClick(); return true }
  var onPress: ((Bool) -> Void)?
  var onClick: (() -> Void)?
  var onClickAt: ((CGPoint) -> Void)?
@@ -496,7 +560,12 @@ final class Navigator: NSObject, NSApplicationDelegate {
  var preferences = NavigatorPreferences()
  var preferencesModified = Date.distantPast
  var hyperHold = HyperHold()
- var keyWatch = KeyCounterWatch()
+ var keyWatch = ChordInputWatch()
+ var motion = StripMotion()
+ var renderRequested = false
+ var lastRenderSig: String?
+ var observers: [NSObjectProtocol] = []
+ var appearanceObservation: NSKeyValueObservation?
  var presence = HUDPresence()
  var escapeWasDown = false
  var fastMode = false
@@ -540,7 +609,8 @@ final class Navigator: NSObject, NSApplicationDelegate {
   panel.ignoresMouseEvents=false
   panel.hidesOnDeactivate=false
   panel.becomesKeyOnlyIfNeeded=true
-  panel.collectionBehavior=[.canJoinAllSpaces,.fullScreenAuxiliary,.ignoresCycle]
+  panel.collectionBehavior=[.canJoinAllSpaces,.fullScreenAuxiliary,.ignoresCycle,.transient]
+  panel.animationBehavior = .none
   intentModified = (try? FileManager.default.attributesOfItem(atPath:path.replacingOccurrences(of:".tsv",with:".intent"))[.modificationDate] as? Date) ?? .distantPast
   reloadPreferences()
   let status=NSStatusBar.system.statusItem(withLength:NSStatusItem.variableLength)
@@ -605,7 +675,21 @@ final class Navigator: NSObject, NSApplicationDelegate {
   RunLoop.main.add(lifecycle, forMode: .common)
   timer = lifecycle
   watchWorkDirectory()
+  observeEnvironment()
  }
+ // Spaces, displays, appearance and accessibility options change under a visible HUD.
+ func observeEnvironment() {
+  let workspace=NSWorkspace.shared.notificationCenter
+  observers.append(workspace.addObserver(forName:NSWorkspace.activeSpaceDidChangeNotification,object:nil,queue:.main) { [weak self] _ in self?.hide() })
+  observers.append(NotificationCenter.default.addObserver(forName:NSApplication.didChangeScreenParametersNotification,object:nil,queue:.main) { [weak self] _ in self?.rebuildIfVisible() })
+  observers.append(workspace.addObserver(forName:NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,object:nil,queue:.main) { [weak self] _ in self?.rebuildIfVisible() })
+  appearanceObservation=NSApp.observe(\.effectiveAppearance,options:[.new]) { [weak self] _, _ in DispatchQueue.main.async { self?.rebuildIfVisible() } }
+ }
+ func rebuildIfVisible() {
+  lastRenderSig=nil
+  if panel.isVisible { requestRender() }
+ }
+ func requestRender() { renderRequested=true }
  // The engine publishes by tmp+rename, which modifies the directory: wake at once instead of
  // waiting for the next poll. Polling stays as the fallback.
  func watchWorkDirectory() {
@@ -616,7 +700,10 @@ final class Navigator: NSObject, NSApplicationDelegate {
   source.setCancelHandler { close(fd) }
   source.resume(); workWatch=source
  }
- deinit { workWatch?.cancel(); fastTimer?.invalidate() }
+ deinit {
+  workWatch?.cancel(); fastTimer?.invalidate()
+  observers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0); NotificationCenter.default.removeObserver($0) }
+ }
  @objc func openSettings() {
   #if !NAVIGATOR_TESTS
   if settings == nil {
@@ -633,7 +720,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   preferencesModified=(try? FileManager.default.attributesOfItem(atPath:url.path)[.modificationDate] as? Date) ?? .distantPast
   tabBars.aliases=preferences.aliases
   tabBars.style=preferences.tabStyle; tabBars.height=CGFloat(preferences.tabHeight); tabBars.matchAppColor=preferences.tabMatchAppColor
-  if panel?.isVisible == true { render(previous) }
+  if panel?.isVisible == true { requestRender() }
  }
  @objc func displayTick(_ sender: CADisplayLink) { tick() }
  func screenID(_ screen: NSScreen) -> UInt32? { (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value }
@@ -662,9 +749,15 @@ final class Navigator: NSObject, NSApplicationDelegate {
   } else if let t=fastTimer { t.invalidate(); fastTimer=nil }
  }
  func presentHUD(_ kind: HUDPresence.Kind) {
+  // A swipe's first frame needs the strip's current position for the viewing highlight.
+  if kind == .scroll && !(scrollNavigation && panel.isVisible) { liveWindows = readLiveWindows() }
   rowNavigation = kind == .row
   scrollNavigation = kind == .scroll
-  render(previous)
+  requestRender()
+ }
+ // The engine writes the intent before it runs the command: hold the render for its snapshot.
+ func navigateHUD(_ kind: HUDPresence.Kind, mtime: TimeInterval) {
+  if kind == .scroll { presentHUD(kind) } else { presence.holdRender(kind,mtime:mtime) }
  }
  func tick(forcePoll: Bool = false) {
   let date=Date(), now=date.timeIntervalSinceReferenceDate
@@ -684,11 +777,14 @@ final class Navigator: NSObject, NSApplicationDelegate {
     #if !NAVIGATOR_TESTS
     spatialOverview.update(text:content)
     #endif
-    if panel.isVisible { render(content) }
+    if panel.isVisible { requestRender() }
    }
   }
   if (!snapshot.tabGroups.isEmpty && snapshot.tabsVisible) || (scrollNavigation && panel.isVisible) { liveWindows = readLiveWindows() }
   else { liveWindows = [] }
+  if scrollNavigation && panel.isVisible && presence.timer {
+   if motion.moved(stripMotionSignature(liveWindows,ids:Set(snapshot.entries.map(\.id)))) { presence.motion(now:now) }
+  } else { motion.reset() }
   tabBars.update(snapshot, windows: liveWindows)
   let flags=NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
   let mods=Chord(flags), pointer=NSEvent.mouseLocation
@@ -697,7 +793,8 @@ final class Navigator: NSObject, NSApplicationDelegate {
    intentModified=stamp
    let action=(try? String(contentsOfFile:intentPath,encoding:.utf8)) ?? "hide"
    if let kind=["show":HUDPresence.Kind.show,"row":.row,"scroll":.scroll][action] {
-    if let k=presence.navigate(kind,chord:mods,mtime:stamp.timeIntervalSinceReferenceDate,now:now,pointer:pointer) { presentHUD(k) }
+    let mtime=stamp.timeIntervalSinceReferenceDate
+    if let k=presence.navigate(kind,chord:mods,mtime:mtime,now:now,pointer:pointer) { navigateHUD(k,mtime:mtime) }
    }
    else {
     let inside=panel.frame.contains(pointer)
@@ -708,13 +805,14 @@ final class Navigator: NSObject, NSApplicationDelegate {
   }
   if scrollNavigation && panel.isVisible {
    let column = viewportColumn(previous)
-   if column != lastViewportColumn { render(previous) }
+   if column != lastViewportColumn { requestRender() }
   }
   let navigationHeld=flags.contains(.control) && flags.contains(.option) && flags.contains(.command)
   if navigationModifiersHeld && !navigationHeld { sendCommand(["view-end"]) }
   navigationModifiersHeld=navigationHeld
   let exactHyper=isHyperClick(flags)
-  let otherKey=keyWatch.otherKey(exact:exactHyper,counter:CGEventSource.counterForEventType(.combinedSessionState,eventType:.keyDown))
+  let counter={ CGEventSource.counterForEventType(.combinedSessionState,eventType:$0) }
+  let otherKey=keyWatch.interrupted(exact:exactHyper,key:counter(.keyDown),leftDown:counter(.leftMouseDown),rightDown:counter(.rightMouseDown),otherDown:counter(.otherMouseDown),buttonsDown:NSEvent.pressedMouseButtons != 0)
   let reveal=hyperHold.update(exactHyper:exactHyper && preferences.showOnHyper,otherKey:otherKey,now:now,delay:preferences.hyperDelay)
   // Physical Escape (edge) dismisses at once, unless a card press or drag owns it.
   let escapeDown=CGEventSource.keyState(.combinedSessionState,key:53)
@@ -722,17 +820,22 @@ final class Navigator: NSObject, NSApplicationDelegate {
   escapeWasDown=escapeDown
   // A hold must not change an already-running scroll HUD to focus mode.
   if reveal && presence.bareHoldReveal(now:now,mods:mods,pointer:pointer) { presentHUD(.show) }
-  if presence.visible && !panel.isVisible { presence.hide() }
+  if presence.visible && !panel.isVisible && !renderRequested && presence.deferred == nil { presence.hide() }
   let out=presence.step(now:now,mods:mods,pointer:pointer,frame:panel.frame,pressing:pressingCard,tabDrag:tabDragRevealed)
   if let k=out.present { presentHUD(k) }
   else if out.orderOut { hide() }
-  else if presence.visible { panel.alphaValue=CGFloat(out.alpha) }
+  else if presence.visible { panel.alphaValue=CGFloat(out.alpha); panel.ignoresMouseEvents=hudIgnoresMouse(alpha:out.alpha) }
+  // Mission Control and Show Desktop clear the HUD, and nothing presents during them.
+  if !snapshot.tabsVisible && (panel.isVisible || presence.visible || presence.pending != nil || renderRequested) { hide() }
+  if let k=presence.releaseRender(snapshot:modified.timeIntervalSinceReferenceDate,now:now) { presentHUD(k) }
+  if renderRequested { render(previous) }
   updateDisplayLink()
  }
  func hide() {
   cancelTabPresses(in:panel.contentView)
   clearMinimapDrop(); minimapDropTargets=[]
   pressingCard = false
+  renderRequested = false
   panel.orderOut(nil)
   presence.hide()
  }
@@ -802,7 +905,9 @@ final class Navigator: NSObject, NSApplicationDelegate {
   cancelTabPresses(in:panel.contentView)
   clearMinimapDrop(); minimapDropTargets=[]; panel.contentView=effect
   panel.setFrame(minimapFrame(size:CGSize(width:width,height:height),visible:screen.visibleFrame,position:preferences.position),display:true)
-  presence.present(now:Date.timeIntervalSinceReferenceDate,pointer:NSEvent.mouseLocation,timer:true,chord:[]); panel.alphaValue=1; panel.orderFrontRegardless()
+  panel.invalidateShadow(); lastRenderSig=nil; renderRequested=false
+  presence.present(now:Date.timeIntervalSinceReferenceDate,pointer:NSEvent.mouseLocation,timer:true,chord:[]); presence.deferred=nil
+  panel.alphaValue=1; panel.ignoresMouseEvents=false; panel.orderFrontRegardless()
  }
  func clearMinimapDrop() { minimapDropMark?.removeFromSuperview(); minimapDropMark=nil }
  func minimapInsertion(_ point: CGPoint) -> (target: StripDropTarget,before: Bool)? {
@@ -892,6 +997,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
    }
    card.wantsLayer=true; card.layer?.cornerRadius=10
    card.hudActive=active;card.hudStyle=style
+   card.exposedAsButton=true
    var apps=minimapApps(members)
    if let selected=selectedWindow(members,focused:focused), let member=members.first(where:{$0.id==selected}), let i=apps.firstIndex(where:{$0.bundle==member.bundle}) {
     apps.remove(at:i);apps.append(member)
@@ -954,7 +1060,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   }
  }
  // Build a real HUD view independently of NSPanel ordering for headless rendering.
- func makeRowsHUD(_ rows: HUDRows, focused: Int, viewing: Int?, visible: CGRect, appearance: NSAppearance? = nil) -> NSView {
+ func makeRowsHUD(_ rows: HUDRows, focused: Int, viewing: Int?, visible: CGRect, appearance: NSAppearance? = nil, scroll state: HUDScrollState = HUDScrollState()) -> NSView {
   activeHUDCards=[]; hudRowLanes=[:]; hudRowCards=[:]
   let maxColumns=rows.entries.values.map { Set($0.map(\.column)).count }.max() ?? 0
   let layout=HUDRowsLayout(rowCount:rows.indices.count,maxColumns:maxColumns,visible:visible,style:preferences.style)
@@ -963,17 +1069,20 @@ final class Navigator: NSObject, NSApplicationDelegate {
   root.appearance=NSAppearance(named:dark ? .vibrantDark : .vibrantLight)
   root.material = .hudWindow; root.blendingMode = .behindWindow; root.state = .active
   root.wantsLayer=true; root.layer?.cornerRadius=16; root.layer?.masksToBounds=true
+  root.setAccessibilityLabel("Minimap")
   hudAppearance=root.appearance
   let style=layout.compact ? "compact":preferences.style,m=HUDMetrics(style)
   let heights=rows.indices.map { (rows.entries[$0] ?? []).isEmpty ? min(m.emptyHeight,layout.rowHeight-m.gap):layout.rowHeight-m.gap }
   let contentHeight=2*m.pad+heights.reduce(0,+)+CGFloat(max(0,heights.count-1))*m.gap
   root.setFrameSize(CGSize(width:layout.size.width,height:min(layout.size.height,contentHeight)))
   var rowTop=contentHeight-m.pad
+  var currentSpan=(min:CGFloat(0),max:CGFloat(0))
   let canvas=NSView(frame:CGRect(x:0,y:0,width:layout.size.width,height:contentHeight))
   for (index,row) in rows.indices.enumerated() {
    let current=row == rows.current
    let rowHeight=heights[index],y=rowTop-rowHeight
    rowTop=y-m.gap
+   if current { currentSpan=(y,y+rowHeight) }
    let label=NSTextField(labelWithString:"\(current ? "●" : "○") \(row)")
    label.frame=CGRect(x:m.left,y:y+(rowHeight-16)/2,width:m.gutter,height:16)
    label.font = .monospacedSystemFont(ofSize:style == "compact" ? 11:12,weight:current ? .semibold : .regular)
@@ -996,10 +1105,12 @@ final class Navigator: NSObject, NSApplicationDelegate {
    let cardWidth=max(32,min(preferred,(laneWidth-CGFloat(columns.count-1)*m.gap)/CGFloat(columns.count)))
    let stripWidth=max(laneWidth,CGFloat(columns.count)*(cardWidth+m.gap)-m.gap)
    let strip=NSView(frame:CGRect(x:0,y:0,width:stripWidth,height:rowHeight))
+   var activeSpan: (min:CGFloat,max:CGFloat)?
    for (offset,col) in columns.enumerated() {
     let members=groups[col]!
     let active=current && (viewing.map { $0 == col } ?? members.contains { $0.id == focused })
     let card=makeHUDCard(members,column:col,focused:current ? focused : 0,active:active,interactive:current,frame:CGRect(x:CGFloat(offset)*(cardWidth+m.gap),y:0,width:cardWidth,height:rowHeight),style:style)
+    if active && activeSpan == nil { activeSpan=(card.frame.minX,card.frame.maxX) }
     let sourceID=members.first!.id
     card.onDrag = { [weak self] point in self?.rowCardDrag(source:sourceID,sourceRow:row,point:point,commit:false) }
     card.onDrop = { [weak self] point in self?.rowCardDrag(source:sourceID,sourceRow:row,point:point,commit:true) }
@@ -1013,6 +1124,12 @@ final class Navigator: NSObject, NSApplicationDelegate {
    scroll.scrollerStyle = .overlay; scroll.drawsBackground=false; scroll.hasHorizontalScroller=stripWidth > laneWidth+1; scroll.autohidesScrollers=false
    scroll.documentView=strip; canvas.addSubview(scroll); hudRowLanes[row]=scroll
    if stripWidth > laneWidth+1 {
+    // Keep the lane where the viewer left it; the active card is always brought into view.
+    let kept=min(stripWidth-laneWidth,max(0,state.lanes[row] ?? 0))
+    let x=activeSpan.map { revealOffset(current:kept,visible:laneWidth,itemMin:$0.min,itemMax:$0.max,content:stripWidth) } ?? kept
+    scroll.contentView.scroll(to:CGPoint(x:x,y:0)); scroll.reflectScrolledClipView(scroll.contentView)
+   }
+   if stripWidth > laneWidth+1 {
     let overflow=NSTextField(labelWithString:"↔")
     overflow.frame=CGRect(x:20,y:y+2,width:24,height:13); overflow.font = .systemFont(ofSize:10)
     overflow.textColor = .secondaryLabelColor
@@ -1024,37 +1141,52 @@ final class Navigator: NSObject, NSApplicationDelegate {
   if contentHeight > root.frame.height {
    let scroll=NSScrollView(frame:root.bounds); scroll.drawsBackground=false; scroll.hasVerticalScroller=true
    scroll.documentView=canvas; root.addSubview(scroll)
-   scroll.contentView.scroll(to:CGPoint(x:0,y:contentHeight-root.frame.height))
+   let top=contentHeight-root.frame.height
+   let y=revealOffset(current:state.fromTop.map { top-$0 } ?? top,visible:root.frame.height,itemMin:currentSpan.min,itemMax:currentSpan.max,content:contentHeight)
+   scroll.contentView.scroll(to:CGPoint(x:0,y:y)); scroll.reflectScrolledClipView(scroll.contentView)
   } else { root.addSubview(canvas) }
   return root
+ }
+ // What a rebuild would lose: each lane's horizontal offset and the many-rows vertical offset.
+ func captureScroll() -> HUDScrollState {
+  var state=HUDScrollState()
+  guard panel?.isVisible == true else { return state }
+  for (row,lane) in hudRowLanes { if let scroll=lane as? NSScrollView { state.lanes[row]=scroll.contentView.bounds.origin.x } }
+  if let scroll=panel.contentView?.subviews.compactMap({ $0 as? NSScrollView }).first, let document=scroll.documentView {
+   state.fromTop=document.frame.height-(scroll.contentView.bounds.origin.y+scroll.contentView.bounds.height)
+  }
+  return state
  }
  func render(_ content: String) {
   // Snapshot/highlight ticks must not replace the view tracking a mouse press.
   guard !pressingCard else { return }
-  clearMinimapDrop(); minimapDropTargets=[]; activeHUDCards=[]; hudRowLanes=[:]; hudRowCards=[:]
-  let lines=content.components(separatedBy:"\n")
-  let header=lines.first?.components(separatedBy:"\t") ?? []
+  renderRequested=false
+  let header=content.components(separatedBy:"\n").first?.components(separatedBy:"\t") ?? []
   guard header.count>=2 else { return }
   let focused=Int(header[0]) ?? 0; let display=UInt32(header[1]) ?? 0
-  let entries=NavigatorSnapshot(content).entries
-  let screen=NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value==display } ?? NSScreen.main!
-  if let allRows=HUDRows(content) {
-   let viewing=scrollNavigation ? viewportColumn(content) : nil
-   lastViewportColumn=viewing
-   let view=makeRowsHUD(allRows,focused:focused,viewing:viewing,visible:screen.visibleFrame)
-   // AppKit resizes an assigned content view to the panel’s existing size.
-   // Capture the desired size first; a newly created panel is zero-sized.
-   let targetFrame=minimapFrame(size:view.frame.size,visible:screen.visibleFrame,position:preferences.position)
-   panel.setFrame(targetFrame,display:false)
-   panel.contentView=view
-   refreshHUDDropTargets(); panel.alphaValue=1; panel.orderFrontRegardless(); return
-  }
-  guard !entries.isEmpty else { panel.orderOut(nil); return }
+  guard let screen=NSScreen.screens.first(where: { screenID($0) == display }) ?? NSScreen.main else { hide(); return }
   // The single-row path uses the same presentation and hit targets.
-  let single=HUDRows(content+"\n#rows\t1\t1\nspatialrow\t1\n")!
-  let view=makeRowsHUD(single,focused:focused,viewing:scrollNavigation ? viewportColumn(content):nil,visible:screen.visibleFrame)
+  guard let model=HUDRows(content) ?? (NavigatorSnapshot(content).entries.isEmpty ? nil : HUDRows(content+"\n#rows\t1\t1\nspatialrow\t1\n")) else {
+   clearMinimapDrop(); minimapDropTargets=[]; activeHUDCards=[]; hudRowLanes=[:]; hudRowCards=[:]; lastRenderSig=nil
+   panel.orderOut(nil); return
+  }
+  let viewing=scrollNavigation ? viewportColumn(content) : nil
+  lastViewportColumn=viewing
+  let dark=(NSApp?.effectiveAppearance ?? NSAppearance.currentDrawing()).bestMatch(from:[.aqua,.darkAqua]) == .darkAqua
+  let signature=hudRenderSignature(model,focused:focused,viewing:viewing,style:preferences.style,position:preferences.position,dark:dark,visible:screen.visibleFrame,aliases:preferences.aliases)
+  if panel.isVisible && signature == lastRenderSig { return }
+  let scrollState=captureScroll(), presenting = !panel.isVisible
+  clearMinimapDrop(); minimapDropTargets=[]; activeHUDCards=[]; hudRowLanes=[:]; hudRowCards=[:]
+  lastRenderSig=signature
+  let view=makeRowsHUD(model,focused:focused,viewing:viewing,visible:screen.visibleFrame,scroll:scrollState)
+  // AppKit resizes an assigned content view to the panel’s existing size.
+  // Capture the desired size first; a newly created panel is zero-sized.
   panel.setFrame(minimapFrame(size:view.frame.size,visible:screen.visibleFrame,position:preferences.position),display:false)
-  panel.contentView=view;refreshHUDDropTargets();panel.alphaValue=1;panel.orderFrontRegardless()
+  panel.contentView=view
+  panel.invalidateShadow()
+  refreshHUDDropTargets()
+  if presenting { panel.alphaValue=1; panel.ignoresMouseEvents=false }
+  panel.orderFrontRegardless()
  }
 }
 #if !NAVIGATOR_TESTS
