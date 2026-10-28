@@ -15,7 +15,10 @@ a = p.parse_args(); scratch = Path(a.scratch); shutil.rmtree(scratch, ignore_err
 if a.base: base = Path(a.base)
 else:
     base = scratch/'base'; base.mkdir()
-    tar = subprocess.run(['git', '-C', str(repo), 'archive', a.base_ref, 'src'], check=True, capture_output=True).stdout
+    # The main tree sits inside the Intelligence repo; its navigator history lives in polish/navigator.git.
+    gitdir = repo/'polish'/'navigator.git'
+    git = ['git', '--git-dir', str(gitdir)] if gitdir.is_dir() else ['git', '-C', str(repo)]
+    tar = subprocess.run([*git, 'archive', a.base_ref, 'src'], check=True, capture_output=True).stdout
     subprocess.run(['tar', '-x', '-C', str(base)], input=tar, check=True); base = base/'src'
 new = Path(a.src)
 FW = ['-framework', 'AppKit', '-framework', 'QuartzCore']
