@@ -9,6 +9,7 @@ mod mocks;
 mod panels;
 mod parking;
 mod review_a;
+mod review_beh2;
 mod rows;
 mod rows_review;
 mod session_restore;
