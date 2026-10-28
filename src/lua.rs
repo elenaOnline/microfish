@@ -31,7 +31,7 @@ use std::sync::Arc;
 use crate::ecs::layout::LayoutStrip;
 use bevy::app::{App, Last, Plugin, PostUpdate, PreUpdate, Update};
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::Changed;
+use bevy::ecs::query::{Added, Changed};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::{Commands, NonSendMut, Query, Res, ResMut};
@@ -42,7 +42,9 @@ use crate::config::Config;
 use crate::ecs::params::Windows;
 use crate::ecs::script_state::ScriptStateStore;
 use crate::ecs::state::QueryStateParams;
-use crate::ecs::{SendMessageTrigger, SpawnCommandsExt, apply_config_side_effects};
+use crate::ecs::{
+    ActiveWorkspaceMarker, SendMessageTrigger, SpawnCommandsExt, apply_config_side_effects,
+};
 use crate::events::Event;
 use crate::manager::{Application, Display, WindowManager};
 use crate::util::symlink_target;
@@ -87,15 +89,20 @@ impl Plugin for LuaPlugin {
 
 // Publish structural changes after command processing and layout reconciliation.
 // Inactive rows are included because the spatial overview displays them too.
-// No frame polling or synthetic focus events; hidden overlays remain hidden.
+// Switching rows changes no strip, only which one is active, so it is published
+// on its own: a script that mirrors the active row (the navigation HUD) would
+// otherwise wait for the OS's focus acknowledgment, or never hear of a switch
+// to an empty row. No frame polling or synthetic focus events; hidden overlays
+// remain hidden.
 fn dispatch_layout_changed(
     worker: Option<Res<LuaWorker>>,
     strips: Query<&LayoutStrip, Changed<LayoutStrip>>,
+    activated: Query<(), Added<ActiveWorkspaceMarker>>,
 ) {
     let Some(worker) = worker else {
         return;
     };
-    if !strips.is_empty()
+    if (!strips.is_empty() || !activated.is_empty())
         && worker.subscribed_event_mask() & convert::LuaEvent::bit_for_name("layout_changed") != 0
     {
         worker.send_events(vec![convert::LuaEvent::LayoutChanged]);
