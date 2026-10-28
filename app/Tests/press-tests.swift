@@ -195,5 +195,20 @@ do {
   c.mouseDown(with: ev(.leftMouseDown, mid)); c.mouseUp(with: ev(.leftMouseUp, mid))
   ok(otherClicks == 0 && r.focused == [7001], "primary click never goes through onClick")
  }
+
+ // Mouse follows focus: the engine warps the pointer on focus, so tabs keep selecting on release.
+ do {
+  let prefs = NavigatorPreferences(#"{"mouseFollowsFocus":true}"#.data(using:.utf8))
+  ok(prefs.mouseFollowsFocus && !NavigatorPreferences(nil).mouseFollowsFocus, "mouseFollowsFocus parsed, default off")
+  let r = Rig(); r.bars.selectOnPress = false; r.bars.update(snap(3), windows: live(3, wide))
+  let c = use(r.card(7002))
+  ok(!c.selectsOnPress, "cards built with selectOnPress=false do not select on press")
+  c.mouseDown(with: ev(.leftMouseDown, mid))
+  ok(r.focused.isEmpty, "no focus on press while mouse follows focus: \(r.focused)")
+  c.mouseUp(with: ev(.leftMouseUp, mid))
+  ok(r.focused == [7002], "focus on release while mouse follows focus: \(r.focused)")
+  r.bars.selectOnPress = true; r.bars.update(snap(3), windows: live(3, wide))
+  ok(r.card(7002).selectsOnPress, "turning the setting off rebuilds cards that select on press")
+ }
  print("Tab press (select on mouse-down) checks passed: \(n)")
 }

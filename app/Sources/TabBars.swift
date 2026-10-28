@@ -368,6 +368,7 @@ final class TabBars: NSObject {
  var style="folder"
  var height:CGFloat=34
  var matchAppColor=false
+ var selectOnPress=true
  private let sampler=TabColorSampler()
  var onSampled: (() -> Void)? { didSet { sampler.onSample = onSampled } }
  var focus: ((Int) -> Void)?
@@ -452,7 +453,7 @@ final class TabBars: NSObject {
    let seamFrame=side ? CGRect(x:live.frame.minX,y:live.frame.minY,width:32,height:live.frame.height) : CGRect(x:live.frame.minX,y:live.frame.maxY-32,width:live.frame.width,height:32)
    let sample=matchAppColor ? sampler.sample(id:live.id,size:live.frame.size,key:ids.sorted().hashValue &+ (selection ?? 0),titles:members.map(\.title).hashValue):nil
    let matched=side ? sample?.sideColor:sample?.titleColor
-   let signature = tabContentSignature(members, selected: selection, width: contentWidth, height: frame.height) + ":\(style):\(sample != nil):\(NSApp.effectiveAppearance.name.rawValue):\(matched?.description ?? "default")" + members.map { aliases[$0.bundle+"\t"+$0.title] ?? "" }.joined(separator:"|") + ":\(NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast):\(NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency)"
+   let signature = tabContentSignature(members, selected: selection, width: contentWidth, height: frame.height) + ":\(style):\(selectOnPress):\(sample != nil):\(NSApp.effectiveAppearance.name.rawValue):\(matched?.description ?? "default")" + members.map { aliases[$0.bundle+"\t"+$0.title] ?? "" }.joined(separator:"|") + ":\(NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast):\(NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency)"
    if signature != bar.signature && !bar.pressed {
     bar.signature = signature
     let view = NSView(frame: CGRect(x: 0, y: 0, width: contentWidth, height: frame.height))
@@ -482,7 +483,7 @@ final class TabBars: NSObject {
      // Tabs select on mouse-down, as native tabs do. A drag from the same press reorders as before and
      // sends no further focus; releasing without a drag does not click again. onClick stays for the
      // modifier, Hyper and VoiceOver paths.
-     card.selectsOnPress = true
+     card.selectsOnPress = selectOnPress
      card.onSelect = { [weak self] in
       NSLog("Navigator tab click column=%d target=%d on=down",column,entry.id)
       self?.focus?(entry.id)

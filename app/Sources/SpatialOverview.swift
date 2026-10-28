@@ -661,7 +661,9 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
     func refreshFailure() -> String {
         let log=URL(fileURLWithPath:pinsPath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("work/refresh.log")
         let last=((try? String(contentsOf:log,encoding:.utf8)) ?? "").split(separator:"\n").last.map(String.init)?.trimmingCharacters(in:.whitespaces) ?? ""
-        let plain = !last.isEmpty && last.count < 160 && !last.contains("Error:") && !last.hasPrefix("File ") && !last.hasPrefix("Traceback")
+        // The script's own messages are sentences; exception lines look like "Name: detail".
+        let exceptionLine = last.range(of:#"^[A-Za-z_][\w.]*: "#,options:.regularExpression) != nil
+        let plain = !last.isEmpty && last.count < 160 && !exceptionLine && !last.hasPrefix("File ") && !last.hasPrefix("Traceback")
         return plain ? last : "Couldn’t refresh windows."
     }
     var onViewAction: ((String, Int?) -> Void)?

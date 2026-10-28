@@ -65,6 +65,7 @@ struct NavigatorPreferences {
  var delay = 1.3, fade = 0.22, hyperDelay = 0.2
  var tabStyle = "folder", tabHeight = 34, tabMatchAppColor = false
  var showOnHyper = true
+ var mouseFollowsFocus = false
  var hide = "release"
  var aliases: [String:String] = [:]
  init(_ data: Data? = nil) {
@@ -79,6 +80,7 @@ struct NavigatorPreferences {
   if let value=json["tabStyle"] as? String, ["folder","folder-compact","classic","side"].contains(value) { tabStyle=value }
   if let value=json["tabHeight"] as? Int, [28,34].contains(value) { tabHeight=value }
   tabMatchAppColor=json["tabMatchAppColor"] as? Bool ?? false
+  mouseFollowsFocus=json["mouseFollowsFocus"] as? Bool ?? false
   aliases=json["tabAliases"] as? [String:String] ?? [:]
  }
 }
@@ -983,6 +985,9 @@ final class Navigator: NSObject, NSApplicationDelegate {
   preferencesModified=(try? FileManager.default.attributesOfItem(atPath:url.path)[.modificationDate] as? Date) ?? .distantPast
   tabBars.aliases=preferences.aliases
   tabBars.style=preferences.tabStyle; tabBars.height=CGFloat(preferences.tabHeight); tabBars.matchAppColor=preferences.tabMatchAppColor
+  // The engine warps the pointer on focus when this is on; a press-time focus would turn the next
+  // pointer event into a long drag, so tabs keep selecting on release then.
+  tabBars.selectOnPress = !preferences.mouseFollowsFocus
   if panel?.isVisible == true { requestRender() }
  }
  @objc func displayTick(_ sender: CADisplayLink) { tick() }
