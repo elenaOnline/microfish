@@ -348,8 +348,8 @@ fn reload(
             // The error itself is in the log and in Settings' footer; the
             // flash says what happened and what is still in force.
             let _ = to_main.try_send(FromLua::Flash {
-                message: "Couldn’t load settings".to_string(),
-                detail: Some("The previous settings are still in use.".to_string()),
+                message: "Couldn’t apply settings".to_string(),
+                detail: Some("Microfish kept the previous ones.".to_string()),
                 duration: 4.0,
             });
             None
@@ -819,7 +819,7 @@ mod tests {
         std::fs::write(&script, "this is not lua ===").unwrap();
         worker.send_reload(script.clone());
         assert!(
-            next_flash(&worker, "the reload error") == "Couldn’t load settings",
+            next_flash(&worker, "the reload error") == "Couldn’t apply settings",
             "a broken script should be reported"
         );
 

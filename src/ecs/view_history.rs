@@ -279,8 +279,8 @@ fn restore_view(world: &mut World, view: &View) -> bool {
     else {
         warn_user(
             world,
-            "Couldn’t restore the view",
-            "Its windows or layout have changed.",
+            "Couldn’t go to that view",
+            "The layout changed. Try again.",
         );
         return false;
     };
@@ -391,8 +391,8 @@ fn undo(world: &mut World) {
     {
         warn_user(
             world,
-            "Couldn’t undo",
-            "The windows changed since the move.",
+            "Couldn’t undo the move",
+            "The layout changed. Try again.",
         );
         return;
     }
@@ -478,7 +478,7 @@ fn view_command(world: &mut World, op: Operation) {
                     announce(world, "Previous view");
                 }
             } else {
-                announce(world, "No previous view yet");
+                announce(world, "No previous view");
             }
         }
         Operation::ViewPin(slot) | Operation::ViewSave(slot) if slot < 10 => {

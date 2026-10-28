@@ -23,7 +23,7 @@ pub(crate) fn show_accessibility_setup(
     alert.setMessageText(&NSString::from_str("Allow Microfish to Control Windows"));
     alert.setInformativeText(&NSString::from_str(
         "Microfish needs permission to move, resize, and arrange windows.\n\n\
-         In System Settings, open Privacy & Security → Device Control and Data Access, then turn \
+         In System Settings, open Privacy & Security > Device Control and Data Access, then turn \
          on Microfish.\n\n\
          If Microfish is already listed but still can’t control windows, remove it with the – \
          button, add it again with the + button, and turn it on.",
