@@ -1018,8 +1018,6 @@ mod tests {
     }
 }
 
-/// Preserve small coherent movements even if one finger barely moves. The
-/// per-event baseline is updated below, so dropping these loses travel forever.
 /// Set by the Lua dispatcher while the loaded script has a `paneru.on("mouse_moved")`
 /// handler, so the tap knows a script reads pointer motion.
 pub(crate) static LUA_WANTS_MOUSE_MOVED: AtomicBool = AtomicBool::new(false);
@@ -1057,6 +1055,8 @@ fn mouse_moved_wanted(
         || resize_released
 }
 
+/// Preserve small coherent movements even if one finger barely moves. The
+/// per-event baseline is updated below, so dropping these loses travel forever.
 fn horizontal_motion_is_meaningful(deltas: &[f64]) -> bool {
     !deltas.is_empty() && deltas.iter().sum::<f64>().abs() > 0.000_001
 }
