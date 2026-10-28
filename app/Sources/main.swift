@@ -186,6 +186,8 @@ struct ChordInputWatch {
   return k || l || r || o || (exact && buttonsDown)
  }
 }
+// VoiceOver's own modifier is ⌃⌥ and reading the HUD takes longer than a chord: use the timer.
+func effectiveHideMode(_ preference: String, voiceOver: Bool) -> String { voiceOver ? "timer" : preference }
 // A fading HUD must not swallow clicks.
 func hudIgnoresMouse(alpha: Double) -> Bool { alpha < 1 }
 // Strip motion: window frames of the snapshot's windows, rounded to half points, in id order.
@@ -788,7 +790,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
    let prefsStamp=(try? FileManager.default.attributesOfItem(atPath:prefsPath)[.modificationDate] as? Date) ?? .distantPast
    if prefsStamp != preferencesModified { reloadPreferences() }
   }
-  presence.mode=preferences.hide; presence.delay=preferences.delay; presence.fade=preferences.fade
+  presence.mode=effectiveHideMode(preferences.hide,voiceOver:NSWorkspace.shared.isVoiceOverEnabled); presence.delay=preferences.delay; presence.fade=preferences.fade
   if pollSnapshot, let attrs=try? FileManager.default.attributesOfItem(atPath:path), let stamp=attrs[.modificationDate] as? Date, stamp != modified {
    modified=stamp
    if let content=try? String(contentsOfFile:path,encoding:.utf8) {
