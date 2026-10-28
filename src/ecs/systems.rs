@@ -12,7 +12,7 @@ use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
 use bevy::time::Time;
 use objc2_foundation::NSPoint;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
@@ -1833,20 +1833,30 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
     windows: Query<&Window>,
     apps: Query<&Application>,
     config: Res<Config>,
-    mut cache: Local<HashSet<WinID>>,
+    time: Res<Time>,
+    mut cache: Local<HashMap<WinID, Duration>>,
     mut commands: Commands,
 ) {
     const CACHE_CLEANUP_SIZE: usize = 1000;
+    // A window the app cannot hand over yet (its role and subrole fill in a beat
+    // after creation, as a terminal's do) is not unmanageable for good, so a failed
+    // discovery is only remembered for this long before the window may be tried again.
+    const RETRY_AFTER: Duration = Duration::from_secs(1);
     if cache.len() > CACHE_CLEANUP_SIZE {
         cache.clear();
     }
+    let now = time.elapsed();
 
     for event in messages.read() {
         let Event::WindowFocused { window_id } = *event else {
             continue;
         };
 
-        if windows.iter().any(|w| w.id() == window_id) || cache.contains(&window_id) {
+        if windows.iter().any(|w| w.id() == window_id)
+            || cache
+                .get(&window_id)
+                .is_some_and(|failed_at| now.saturating_sub(*failed_at) < RETRY_AFTER)
+        {
             continue;
         }
 
@@ -1879,7 +1889,7 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
             trace!(
                 "Failed to discover manageable window for focused ID {window_id}; caching as unmanageable."
             );
-            cache.insert(window_id);
+            cache.insert(window_id, now);
         }
     }
 }

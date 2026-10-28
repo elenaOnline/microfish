@@ -131,6 +131,42 @@ fn activating_terminal_reveals_its_hidden_row() {
         .run(commands);
 }
 
+/// A terminal window's accessibility element is not always usable the moment
+/// the first focus event names it (role and subrole fill in a beat later). A
+/// failed discovery must not mark the window unmanageable for good: the next
+/// focus event for it, once it can be read, has to bring it into the strip.
+#[test]
+fn window_that_was_unreadable_at_first_focus_is_discovered_later() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        // The window exists in the window server but the app cannot hand it over yet.
+        Event::WindowFocused { window_id: 5 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        // The same window is focused again once its element is readable.
+        Event::WindowFocused { window_id: 5 },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(1, |_world, state| {
+            state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 5, window_frame());
+            state.set_focused_window(5);
+        })
+        .on_iteration(4, |world, _state| {
+            let mut query = world.query::<&Window>();
+            assert!(
+                query.iter(world).any(|window| window.id() == 5),
+                "a window that became readable after a failed discovery must be adopted"
+            );
+        })
+        .run(commands);
+}
+
 /// A terminal window created while another app is in front (Spotlight, a CLI,
 /// a hotkey that has not finished activating it) is placed in the strip but
 /// must not steal focus from the app the user is working in; the activation
