@@ -370,3 +370,55 @@ fn held_row_key_asks_the_os_to_focus_only_the_row_it_lands_on() {
     );
     assert_focus_is_on_active_row(&mut h, &[6, 7]);
 }
+
+/// When the focus marker is lost, the active row takes focus back on the
+/// column the user is looking at, as a row switch does, not on the strip's
+/// leftmost column (which may be scrolled off screen).
+#[test]
+fn lost_focus_recovers_to_the_column_nearest_the_viewport_center() {
+    let mut h = TestHarness::new().with_windows(8);
+    h.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        cmd(Operation::Focus(Direction::East)),
+        cmd(Operation::Focus(Direction::East)),
+        cmd(Operation::Focus(Direction::East)),
+        cmd(Operation::Focus(Direction::East)),
+        cmd(Operation::Focus(Direction::East)),
+    ]);
+    h.advance(Duration::from_secs(1));
+
+    // The column whose window sits nearest the display's center.
+    let center = TEST_DISPLAY_WIDTH / 2;
+    let nearest = (0..8)
+        .min_by_key(|id| {
+            let frame = h.mock_state.window_frame(*id);
+            (i32::midpoint(frame.min.x, frame.max.x) - center).abs()
+        })
+        .unwrap();
+    assert!(
+        nearest >= 2,
+        "setup: the strip should be scrolled, got {nearest}"
+    );
+
+    let world = h.world();
+    let focused = world
+        .query_filtered::<Entity, With<FocusedMarker>>()
+        .iter(world)
+        .collect::<Vec<_>>();
+    for entity in focused {
+        world.entity_mut(entity).remove::<FocusedMarker>();
+    }
+    h.advance(Duration::from_secs(2));
+
+    let world = h.world();
+    let recovered = world
+        .query_filtered::<&Window, With<FocusedMarker>>()
+        .iter(world)
+        .map(|window| window.id())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recovered,
+        vec![nearest],
+        "recovery should land on the column at the center, not the first one"
+    );
+}

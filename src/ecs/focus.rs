@@ -20,7 +20,7 @@ use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Timeout, Unmanaged, Ver
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
-use crate::ecs::workspace::RestoreFocusMarker;
+use crate::ecs::workspace::{RestoreFocusMarker, column_closest_to_center};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, ResizeMarker, Scrolling,
     SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
@@ -908,15 +908,19 @@ fn raise_window_trigger(
 fn recover_lost_focus(
     windows: Windows,
     active_workspace: Query<&LayoutStrip, With<ActiveWorkspaceMarker>>,
+    active_display: ActiveDisplay,
     mut commands: Commands,
 ) {
     if windows.focused().is_some() {
         return;
     }
+    // The column the user is looking at, as when a row is shown again. The
+    // active strip is on screen, so its real frames say where that is.
     if let Ok(strip) = active_workspace
         .single()
         .inspect_err(|err| error!("Unable to get current workspace: {err}"))
-        && let Some(entity) = strip.first().ok().and_then(|col| col.top())
+        && let Some(entity) = column_closest_to_center(strip, active_display.display(), &windows)
+            .or_else(|| strip.first().ok().and_then(|col| col.top()))
     {
         error!("Lost focus marker, recovering!");
         commands.focus_entity(entity, false);
