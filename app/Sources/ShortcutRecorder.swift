@@ -19,7 +19,7 @@ final class ShortcutRecorder: NSObject {
         isStarting = true
         let center = NotificationCenter.default
         observers = [center.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in self?.cancel() }, center.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in self?.cancel() }, center.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in self?.cancel() }]
-        guard let suspend else { finish(nil, "Engine shortcut suspension is unavailable."); return }
+        guard let suspend else { finish(nil, "Couldn’t start recording. Microfish isn’t responding."); return }
         suspend { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { if case .success(let release) = result { release() }; return }
@@ -32,10 +32,12 @@ final class ShortcutRecorder: NSObject {
                     self.monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
                         guard let self else { return event }
                         if event.keyCode == 53 { self.cancel(); return nil }
+                        // Plain Delete clears the binding, as in System Settings' shortcut fields.
+                        if [51, 117].contains(event.keyCode), event.modifierFlags.intersection([.control, .option, .command, .shift]).isEmpty { self.finish("", nil); return nil }
                         guard let chord = Self.chord(event) else { return nil }
                         self.finish(chord, nil); return nil
                     }
-                    self.timer = Timer.scheduledTimer(withTimeInterval: 12, repeats: false) { [weak self] _ in self?.finish(nil, "Recording timed out; shortcut resume requested.") }
+                    self.timer = Timer.scheduledTimer(withTimeInterval: 12, repeats: false) { [weak self] _ in self?.finish(nil, "Recording timed out.") }
                 }
             }
         }
