@@ -24,6 +24,9 @@ import QuartzCore
 
 func hudColor(_ hex:UInt32)->NSColor { NSColor(srgbRed:CGFloat((hex>>16)&255)/255,green:CGFloat((hex>>8)&255)/255,blue:CGFloat(hex&255)/255,alpha:1) }
 func hudDark(_ view:NSView)->Bool { view.effectiveAppearance.bestMatch(from:[.aqua,.darkAqua]) == .darkAqua }
+// System Increase Contrast, read at draw and build time (tests pin it through the override).
+var hudIncreaseContrastOverride: Bool?
+func hudIncreaseContrast() -> Bool { hudIncreaseContrastOverride ?? NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast }
 struct HUDMetrics {
  let card:CGSize; let gap:CGFloat; let gutter:CGFloat; let pad:CGFloat; let left:CGFloat; let radius:CGFloat; let emptyHeight:CGFloat
  init(_ style:String) {
@@ -51,7 +54,8 @@ final class HUDEmptySlot:NSView {
  required init?(coder:NSCoder) { fatalError("init(coder:) has not been implemented") }
  override func draw(_ dirtyRect:NSRect) {
   let p=NSBezierPath(roundedRect:bounds.insetBy(dx:0.5,dy:0.5),xRadius:9,yRadius:9)
-  (hudDark(self) ? NSColor.white:NSColor.black).withAlphaComponent(hudDark(self) ? 0.24:0.22).setStroke();p.lineWidth=1;p.setLineDash([1,2],count:2,phase:0);p.stroke()
+  let strong=hudIncreaseContrast()
+  (hudDark(self) ? NSColor.white:NSColor.black).withAlphaComponent(strong ? 0.6:hudDark(self) ? 0.24:0.22).setStroke();p.lineWidth=strong ? 1.5:1;p.setLineDash([1,2],count:2,phase:0);p.stroke()
  }
 }
 final class HUDBadge:NSTextField {
@@ -60,32 +64,63 @@ final class HUDBadge:NSTextField {
  }
 }
 
+// What the command-failure HUD says, by the command that failed. nil: stay silent (log only). view-end runs on every
+// Hyper release, so it must never surface a message, least of all while the engine is down.
+func failureEngineUnreachable(_ diagnostic: String) -> Bool {
+ let d=diagnostic.lowercased()
+ return d.contains("no process is registered") || d.contains("peer has exited") || d.contains("not running")
+}
+func failureCopy(action: String, diagnostic: String) -> (title: String, detail: String)? {
+ if action == "view-end" { return nil }
+ if failureEngineUnreachable(diagnostic) { return ("Microfish isn’t running","Open Microfish to turn it back on.") }
+ let title: String
+ switch action {
+ case "focus": title="Couldn’t switch to that window"
+ case "view-pin","view-save": title="Couldn’t save the view"
+ case "view-back": title="Couldn’t go back"
+ case "undo-move": title="Couldn’t undo the move"
+ case "move-column-row","reorder-column": title="Couldn’t move that column"
+ default: title="Couldn’t move that window"
+ }
+ return (title,"The layout changed. Try again.")
+}
 // The command-failure HUD. One instance is kept and re-configured per failure (Navigator.failureView); makeFailureHUD
 // still returns a new one for rendering and tests.
 final class FailureHUDView:RoundedHUDView {
  let title=NSTextField(labelWithString:"")
  let warning=NSImageView(frame:CGRect(x:14,y:26,width:20,height:20))
  let detail=NSTextField(labelWithString:"")
+ var onClick: (() -> Void)?
  override init(frame frameRect:NSRect) {
   super.init(frame:frameRect)
   material = .hudWindow; blendingMode = .behindWindow; state = .active
   wantsLayer=true; layer?.cornerRadius=16; layer?.masksToBounds=true
   addSubview(title); addSubview(warning); addSubview(detail)
+  // One VoiceOver element reading the message; the icon and the two lines are not separate stops.
+  setAccessibilityElement(true); setAccessibilityRole(.staticText)
+  for v in [title,warning,detail] as [NSView] { v.setAccessibilityElement(false) }
  }
  required init?(coder:NSCoder) { fatalError("init(coder:) has not been implemented") }
+ // A click dismisses it (like a notification banner).
+ override func hitTest(_ point: NSPoint) -> NSView? { bounds.contains(convert(point,from:superview)) ? self : nil }
+ override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+ override func mouseDown(with event: NSEvent) { if let onClick { onClick() } else { super.mouseDown(with:event) } }
+ /// What VoiceOver should say when it appears.
+ var spokenMessage: String { "\(title.stringValue). \(detail.stringValue)" }
  func configure(action:String,diagnostic:String,width:CGFloat,appearance:NSAppearance?) {
   let height:CGFloat=62
   setFrameSize(NSSize(width:width,height:height))
-  title.stringValue=action == "focus" ? "Focus not confirmed" : "Move not confirmed"
+  let copy=failureCopy(action:action,diagnostic:diagnostic) ?? failureCopy(action:"move",diagnostic:"")!
+  title.stringValue=copy.title
   let sourceAppearance=appearance ?? NSApp?.effectiveAppearance ?? NSAppearance.currentDrawing()
   self.appearance=NSAppearance(named:sourceAppearance.bestMatch(from:[.aqua,.darkAqua]) == .darkAqua ? .vibrantDark:.vibrantLight)
   let dark=hudDark(self)
   title.font = .systemFont(ofSize:13,weight:.semibold); title.textColor = hudColor(dark ? 0xFF6961:0xC4000F)
   title.frame=CGRect(x:44,y:31,width:width-60,height:17)
   warning.image=NSImage(systemSymbolName:"exclamationmark.triangle",accessibilityDescription:"Warning");warning.contentTintColor=hudColor(dark ? 0xFF6961:0xD70015)
-  detail.stringValue="The target may have changed. Try again."
+  detail.stringValue=copy.detail
   detail.font = .systemFont(ofSize:12); detail.frame=CGRect(x:44,y:14,width:width-60,height:16)
-  detail.toolTip=String(diagnostic.prefix(500))
+  setAccessibilityLabel(spokenMessage)
   needsDisplay=true
  }
 }
@@ -247,8 +282,8 @@ func revealOffset(current: CGFloat, visible: CGFloat, itemMin: CGFloat, itemMax:
  return min(limit,max(0,offset))
 }
 // What the HUD displays, as a string: equal strings need no rebuild. Titles show only in "titles" style.
-func hudRenderSignature(_ rows: HUDRows, focused: Int, viewing: Int?, style: String, position: String, dark: Bool, visible: CGRect, aliases: [String:String]) -> String {
- var out="\(style)|\(position)|\(dark)|\(visible)|\(rows.current)|\(focused)|\(viewing.map(String.init) ?? "-")"
+func hudRenderSignature(_ rows: HUDRows, focused: Int, viewing: Int?, style: String, position: String, dark: Bool, visible: CGRect, aliases: [String:String], contrast: Bool = false) -> String {
+ var out="\(style)|\(position)|\(dark)|\(contrast ? "ic" : "")|\(visible)|\(rows.current)|\(focused)|\(viewing.map(String.init) ?? "-")"
  for row in rows.indices {
   out+="\nrow\(row)"
   for e in rows.entries[row] ?? [] {
@@ -438,6 +473,12 @@ func viewingColumn(_ windows: [(column:Int,x:Double,width:Double)], left:Double,
 }
 
 func shouldDismiss(visible: Bool, inside: Bool, pressed: Bool = false) -> Bool { !visible || (!inside && !pressed) }
+// "Safari, Notes — Inbox"; just the app names when the window has no title.
+func minimapCardTooltip(apps: [String], title: String) -> String {
+ let names=apps.joined(separator:", ")
+ return title.isEmpty ? names : names+" — "+title
+}
+let minimapLabelMinWidth: CGFloat = 44
 func selectedWindow(_ members: [Entry], focused: Int) -> Int? {
  members.first { $0.id == focused }?.id
   ?? members.first { $0.id == members.first?.selectedID }?.id
@@ -537,10 +578,12 @@ struct CardDrag {
  mutating func reset() { self=CardDrag() }
 }
 final class DropInsertionMark: NSView {
- var color=NSColor.systemTeal
+ /// nil: Microfish teal for the current appearance. Orange (detach) is set by the caller.
+ var color: NSColor?
  var outline=false
  override func hitTest(_ point: NSPoint) -> NSView? { nil }
  override func draw(_ dirtyRect: NSRect) {
+  let color=self.color ?? hudColor(hudDark(self) ? 0x3CC6C4:0x007F81)
   if outline { color.setStroke(); let path=NSBezierPath(roundedRect:bounds.insetBy(dx:2,dy:2),xRadius:8,yRadius:8); path.lineWidth=3; path.stroke() }
   else { color.setFill(); bounds.fill() }
  }
@@ -564,12 +607,15 @@ final class ColumnCard: NSView {
   let dark=hudDark(self),radius=HUDMetrics(hudStyle).radius
   let path=NSBezierPath(roundedRect:bounds.insetBy(dx:0.75,dy:0.75),xRadius:radius,yRadius:radius)
   hudColor(active ? (dark ? 0x1D4647:0xDCEEEE):(dark ? 0x3A3E3F:0xFFFFFF)).setFill();path.fill()
-  (active ? hudColor(dark ? 0x3CC6C4:0x00898B):(dark ? NSColor.white:NSColor.black).withAlphaComponent(dark ? 0.08:0.10)).setStroke()
-  path.lineWidth=active ? 1.5:0.5;path.stroke()
+  let strong=hudIncreaseContrast()
+  (active ? hudColor(dark ? 0x3CC6C4:strong ? 0x005F61:0x00898B):(dark ? NSColor.white:NSColor.black).withAlphaComponent(strong ? 0.55:dark ? 0.08:0.10)).setStroke()
+  path.lineWidth=active ? (strong ? 2:1.5):(strong ? 1:0.5);path.stroke()
  }
  // The tab strip also uses cards and exposes them itself; only the minimap opts in.
  var exposedAsButton = false
  override func isAccessibilityElement() -> Bool { exposedAsButton || super.isAccessibilityElement() }
+ // A minimap card is one button; its icons and label are not separate stops.
+ override func accessibilityChildren() -> [Any]? { exposedAsButton ? [] : super.accessibilityChildren() }
  override func accessibilityRole() -> NSAccessibility.Role? { exposedAsButton ? .button : super.accessibilityRole() }
  override func accessibilityPerformPress() -> Bool { guard exposedAsButton, let onClick else { return super.accessibilityPerformPress() }; onClick(); return true }
  var onPress: ((Bool) -> Void)?
@@ -958,10 +1004,11 @@ final class Navigator: NSObject, NSApplicationDelegate {
  // Status menu: Settings, Reload, then Quit last, as menu bar apps do (⌘Q while the menu is open).
  func makeStatusMenu() -> NSMenu {
   let menu=NSMenu()
-  let heading=NSMenuItem(title:"Microfish",action:nil,keyEquivalent:""); heading.isEnabled=false; menu.addItem(heading)
-  let settingsItem=NSMenuItem(title:"Settings…",action:#selector(openSettings),keyEquivalent:""); settingsItem.target=self; menu.addItem(settingsItem)
+  let settingsItem=NSMenuItem(title:"Settings…",action:#selector(openSettings),keyEquivalent:","); settingsItem.keyEquivalentModifierMask = .command; settingsItem.target=self; menu.addItem(settingsItem)
   menu.addItem(.separator())
   let quit=NSMenuItem(title:"Quit Microfish",action:#selector(quitMicrofish(_:)),keyEquivalent:"q"); quit.keyEquivalentModifierMask = .command; quit.target=self; menu.addItem(quit)
+  // macOS 27 adds an image to some rows by action name (Settings… got one, Quit did not): none of ours show one.
+  if #available(macOS 27.0, *) { for item in menu.items where !item.isSeparatorItem { item.preferredImageVisibility = .hidden } }
   return menu
  }
  func liveQuitSequence() -> QuitSequence {
@@ -1012,6 +1059,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   panel.becomesKeyOnlyIfNeeded=true
   panel.collectionBehavior=[.canJoinAllSpaces,.fullScreenAuxiliary,.ignoresCycle,.transient]
   panel.animationBehavior = .none
+  panel.canHide=false   // ⌘H / Hide Others must not blank the HUD, and orderFront while hidden would un-hide the app
   intentModified = (try? FileManager.default.attributesOfItem(atPath:path.replacingOccurrences(of:".tsv",with:".intent"))[.modificationDate] as? Date) ?? .distantPast
   reloadPreferences()
   let status=NSStatusBar.system.statusItem(withLength:NSStatusItem.variableLength)
@@ -1090,6 +1138,8 @@ final class Navigator: NSObject, NSApplicationDelegate {
   appearanceObservation=NSApp.observe(\.effectiveAppearance,options:[.new]) { [weak self] _, _ in DispatchQueue.main.async { self?.rebuildIfVisible() } }
  }
  func rebuildIfVisible() {
+  // The failure message is not a minimap: re-theme it in place.
+  if failureUntil != nil, let last=lastFailure { _=failureView(action:last.action,diagnostic:last.diagnostic,width:panel.frame.width); panel.invalidateShadow(); return }
   lastRenderSig=nil
   if panel.isVisible { requestRender() }
  }
@@ -1145,6 +1195,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   } else if let t=fastTimer { t.invalidate(); fastTimer=nil }
  }
  func presentHUD(_ kind: HUDPresence.Kind) {
+  failureUntil=nil   // a navigation replaces the message
   // A swipe's first frame needs the strip's current position for the viewing highlight.
   if kind == .scroll && !(scrollNavigation && panel.isVisible) { liveWindows = readLiveWindows() }
   rowNavigation = kind == .row
@@ -1231,10 +1282,20 @@ final class Navigator: NSObject, NSApplicationDelegate {
   // A hold must not change an already-running scroll HUD to focus mode.
   if reveal && presence.bareHoldReveal(now:now,mods:mods,pointer:pointer) { presentHUD(.show) }
   if presence.visible && !panel.isVisible && !renderRequested && presence.deferred == nil { presence.hide() }
+  // The failure message has its own lifetime (not the minimap's linger/fade) and nothing renders over it.
+  if failureUntil != nil, presence.deferred != nil { failureUntil=nil; presence.anchor=now }   // a navigation is arriving: it takes over
+  if let until=failureUntil {
+   if now >= until { hide() }
+   else {
+    let alpha=min(1,(until-now)/Navigator.failureFade)
+    panel.alphaValue=CGFloat(alpha); panel.ignoresMouseEvents=alpha < 1
+   }
+  } else {
   let out=presence.step(now:now,mods:mods,pointer:pointer,frame:panel.frame,pressing:pressingCard,tabDrag:tabDragRevealed)
   if let k=out.present { presentHUD(k) }
   else if out.orderOut { hide() }
   else if presence.visible { panel.alphaValue=CGFloat(out.alpha); panel.ignoresMouseEvents=hudIgnoresMouse(alpha:out.alpha) }
+  }
   // Mission Control and Show Desktop clear the HUD, and nothing presents during them.
   if !snapshot.tabsVisible && (panel.isVisible || presence.visible || presence.pending != nil || renderRequested) { hide() }
   if let k=presence.releaseRender(snapshot:modified.timeIntervalSinceReferenceDate,now:now) { presentHUD(k) }
@@ -1246,6 +1307,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   clearMinimapDrop(); minimapDropTargets=[]
   pressingCard = false
   renderRequested = false
+  failureUntil = nil
   panel.orderOut(nil)
   presence.hide()
  }
@@ -1299,11 +1361,17 @@ final class Navigator: NSObject, NSApplicationDelegate {
  }
  // The one failure HUD, re-configured for each failure (a new one per failure would leak, see labelDefaults).
  let failureHUD=FailureHUDView(frame:CGRect(x:0,y:0,width:340,height:62))
+ // The failure message stays up this long, whatever Hide after / Fade out say, then fades. nil: not showing.
+ static let failureLife=3.0, failureFade=0.2
+ var failureUntil: TimeInterval?
+ var lastFailure: (action: String, diagnostic: String)?
  func failureView(action:String,diagnostic:String,width:CGFloat) -> RoundedHUDView {
   failureHUD.configure(action:action,diagnostic:diagnostic,width:width,appearance:nil)
   return failureHUD
  }
  func showCommandFailure(_ action: String, diagnostic: String) {
+  // Some commands never surface a failure (view-end runs on every Hyper release); the log has it.
+  guard failureCopy(action:action,diagnostic:diagnostic) != nil else { NSLog("Navigator command failure not shown: %@ %@",action,diagnostic); return }
   guard let screen=NSScreen.screens.first(where: { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == snapshot.display }) ?? NSScreen.main else { return }
   let width=min(340,screen.visibleFrame.width-64), height:CGFloat=62
   let effect=failureView(action:action,diagnostic:diagnostic,width:width)
@@ -1311,8 +1379,12 @@ final class Navigator: NSObject, NSApplicationDelegate {
   clearMinimapDrop(); minimapDropTargets=[]; if panel.contentView !== effect { panel.contentView=effect }
   panel.setFrame(minimapFrame(size:CGSize(width:width,height:height),visible:screen.visibleFrame,position:preferences.position),display:true)
   panel.invalidateShadow(); lastRenderSig=nil; renderRequested=false
-  presence.present(now:Date.timeIntervalSinceReferenceDate,pointer:NSEvent.mouseLocation,timer:true,chord:[]); presence.deferred=nil
-  panel.alphaValue=1; panel.ignoresMouseEvents=false; panel.orderFrontRegardless()
+  let now=Date.timeIntervalSinceReferenceDate
+  presence.present(now:now,pointer:NSEvent.mouseLocation,timer:true,chord:[]); presence.deferred=nil
+  failureUntil=now+Navigator.failureLife; lastFailure=(action,diagnostic)
+  failureHUD.onClick = { [weak self] in self?.hide() }
+  panel.alphaValue=1; panel.ignoresMouseEvents=false; if ordersPanel { panel.orderFrontRegardless() }
+  NSAccessibility.post(element:NSApp as Any,notification:.announcementRequested,userInfo:[.announcement:failureHUD.spokenMessage,.priority:NSAccessibilityPriorityLevel.high.rawValue])
  }
  func clearMinimapDrop() { minimapDropMark?.removeFromSuperview(); minimapDropMark=nil }
  func minimapInsertion(_ point: CGPoint) -> (target: StripDropTarget,before: Bool)? {
@@ -1326,7 +1398,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   let frame=insertion.target.frame
   let local=panel.convertPoint(fromScreen:CGPoint(x:insertion.before ? frame.minX-3 : frame.maxX+3,y:frame.minY))
   let mark=DropInsertionMark(frame:CGRect(x:local.x-1.5,y:local.y,width:3,height:frame.height))
-  mark.color=detaching ? .systemOrange : .systemTeal
+  mark.color=detaching ? .systemOrange : nil
   view.addSubview(mark); minimapDropMark=mark
  }
  func columnDrag(source: Int, point: CGPoint, commit: Bool) {
@@ -1436,11 +1508,12 @@ final class Navigator: NSObject, NSApplicationDelegate {
    }
    let alias=preferences.aliases[chosen.bundle+"\t"+chosen.title]
    let label=card.takeLabel(titles ? (alias ?? (chosen.title.isEmpty ? chosen.app : chosen.title)) : chosen.app)
-   card.toolTip=apps.map { $0.app }.joined(separator:", ")+" — "+(alias ?? chosen.title)
+   card.toolTip=minimapCardTooltip(apps:apps.map { $0.app },title:alias ?? chosen.title)
    label.frame=NSRect(x:iconLayout.labelStart,y:titles ? (cardHeight-16)/2 : compact ? 7:18,width:max(0,cardWidth-iconLayout.labelStart-(titles && members.count>1 ? 28:8)),height:14);label.font = .systemFont(ofSize:titles ? 12:compact ? 10:11,weight:active ? .semibold : .regular)
    label.textColor=hudColor(hudDark(card) ? (active ? 0xF5F5F7:0xE5E5E7):(active ? 0x1D1D1F:0x3A3A3C))
    label.alignment = titles ? .left:.center;label.lineBreakMode = .byTruncatingTail
-   card.addSubview(label)
+   // Narrower than this a label shows only "…": leave it out (the icon, tooltip and VoiceOver name the app).
+   if label.frame.width >= minimapLabelMinWidth { card.addSubview(label) }
    if members.count>1 {
     let badge=card.takeBadge("\(members.count)")
     let bh:CGFloat=compact ? 13:15,bw:CGFloat=max(bh,CGFloat(String(members.count).count)*6+6)
@@ -1448,7 +1521,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
     badge.textColor=hudDark(card) ? hudColor(0x062626):.white
     badge.alignment = .center;card.addSubview(badge)
    }
-   if !interactive { card.toolTip=(card.toolTip ?? "")+" · another row" }
+   if !interactive { card.toolTip=(card.toolTip ?? "")+"\nIn another row." }
    card.setAccessibilityLabel("\(members.map { $0.app }.joined(separator:", "))\(active ? ", current" : "")\(interactive ? "" : ", another row")")
    return card
  }
@@ -1476,7 +1549,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   root.appearance=NSAppearance(named:dark ? .vibrantDark : .vibrantLight)
   root.material = .hudWindow; root.blendingMode = .behindWindow; root.state = .active
   root.wantsLayer=true; root.layer?.cornerRadius=16; root.layer?.masksToBounds=true
-  root.setAccessibilityLabel("Minimap")
+  root.setAccessibilityElement(true); root.setAccessibilityRole(.group); root.setAccessibilityLabel("Minimap")
   hudAppearance=root.appearance
   let style=layout.compact ? "compact":preferences.style,m=HUDMetrics(style)
   let heights=rows.indices.map { (rows.entries[$0] ?? []).isEmpty ? min(m.emptyHeight,layout.rowHeight-m.gap):layout.rowHeight-m.gap }
@@ -1523,7 +1596,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
     card.onDrag = { [weak self] point in self?.rowCardDrag(source:sourceID,sourceRow:row,point:point,commit:false) }
     card.onDrop = { [weak self] point in self?.rowCardDrag(source:sourceID,sourceRow:row,point:point,commit:true) }
     card.onCancelDrag = { [weak self] in self?.clearMinimapDrop() }
-    card.toolTip=(card.toolTip ?? "")+" · drag to move this column between rows"
+    card.toolTip=(card.toolTip ?? "")+"\nDrag to move this column to another row."
     hudRowCards[row,default:[]].append(card)
     strip.addSubview(card)
     if current { activeHUDCards.append(card) }
@@ -1538,7 +1611,8 @@ final class Navigator: NSObject, NSApplicationDelegate {
     let x=activeSpan.map { revealOffset(current:kept,visible:laneWidth,itemMin:$0.min,itemMax:$0.max,content:stripWidth) } ?? kept
     scroll.contentView.scroll(to:CGPoint(x:x,y:0)); scroll.reflectScrolledClipView(scroll.contentView)
    }
-   if stripWidth > laneWidth+1 {
+   // Release mode: the HUD leaves with the chord and ignores the pointer, so a horizontal scroll is not available.
+   if stripWidth > laneWidth+1, effectiveHideMode(preferences.hide,voiceOver:NSWorkspace.shared.isVoiceOverEnabled) == "timer" {
     let overflow=kit.label("↔")
     overflow.frame=CGRect(x:20,y:y+2,width:24,height:13); overflow.font = .systemFont(ofSize:10)
     overflow.textColor = .secondaryLabelColor
@@ -1567,9 +1641,10 @@ final class Navigator: NSObject, NSApplicationDelegate {
   return state
  }
  func render(_ content: String) {
-  // Snapshot/highlight ticks must not replace the view tracking a mouse press.
+  // Snapshot/highlight ticks must not replace the view tracking a mouse press, nor the failure message.
   guard !pressingCard else { return }
   renderRequested=false
+  guard failureUntil == nil else { return }
   let header=content.components(separatedBy:"\n").first?.components(separatedBy:"\t") ?? []
   guard header.count>=2 else { return }
   let focused=Int(header[0]) ?? 0; let display=UInt32(header[1]) ?? 0
@@ -1582,7 +1657,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   let viewing=scrollNavigation ? viewportColumn(content) : nil
   lastViewportColumn=viewing
   let dark=(NSApp?.effectiveAppearance ?? NSAppearance.currentDrawing()).bestMatch(from:[.aqua,.darkAqua]) == .darkAqua
-  let signature=hudRenderSignature(model,focused:focused,viewing:viewing,style:preferences.style,position:preferences.position,dark:dark,visible:screen.visibleFrame,aliases:preferences.aliases)
+  let signature=hudRenderSignature(model,focused:focused,viewing:viewing,style:preferences.style,position:preferences.position,dark:dark,visible:screen.visibleFrame,aliases:preferences.aliases,contrast:hudIncreaseContrast())
   if panel.isVisible && signature == lastRenderSig { return }
   let scrollState=captureScroll(), presenting = !panel.isVisible
   clearMinimapDrop(); minimapDropTargets=[]; activeHUDCards=[]; hudRowLanes=[:]; hudRowCards=[:]
