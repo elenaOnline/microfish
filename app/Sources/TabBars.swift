@@ -1,0 +1,515 @@
+import AppKit
+import QuartzCore
+import ScreenCaptureKit
+
+struct NavigatorSnapshot {
+ let focused: Int
+ let display: UInt32
+ let tabsVisible: Bool
+ let entries: [Entry]
+ let tabGroups: [Int: [Entry]]
+ init(_ text: String) {
+  let lines = text.components(separatedBy: "\n")
+  let header = lines.first?.components(separatedBy: "\t") ?? []
+  tabsVisible = header.count < 3 || header[2] != "0"
+  focused = header.first.flatMap(Int.init) ?? 0
+  display = header.count > 1 ? UInt32(header[1]) ?? 0 : 0
+  let parsed: [Entry] = lines.dropFirst().compactMap { line in
+   let f = line.components(separatedBy: "\t")
+   guard f.count >= 5, let id = Int(f[0]), id > 0, let column = Int(f[1]) else { return nil }
+   return Entry(id: id, column: column, app: f[2], bundle: f[3], title: f[4], tabHeight: f.count > 5 ? Int(f[5]) ?? 0 : 0, selectedID: f.count > 6 ? Int(f[6]) ?? 0 : 0)
+  }
+  entries = parsed
+  tabGroups = Dictionary(grouping: parsed, by: { $0.column }).filter { _, group in
+   group.count >= 2 && group.allSatisfy { $0.tabHeight > 0 && $0.tabHeight == group[0].tabHeight }
+  }
+ }
+}
+
+func tabSelection(_ entries: [Entry], focused: Int, liveID: Int? = nil) -> Int? {
+ if entries.contains(where: { $0.id == focused }) { return focused }
+ if let liveID, entries.contains(where: { $0.id == liveID }) { return liveID }
+ return entries.first.flatMap { entry in entries.contains(where: { $0.id == entry.selectedID }) ? entry.selectedID : nil }
+}
+func visibleTabMembers(_ entries: [Entry], capacity: Int, selected: Int?) -> [Entry] {
+ let count = max(1, capacity)
+ guard entries.count > count else { return entries }
+ var result = Array(entries.prefix(count))
+ if let chosen = entries.first(where: { $0.id == selected }), !result.contains(where: { $0.id == chosen.id }) {
+  result[result.count - 1] = chosen
+ }
+ return result
+}
+func appKitRect(_ quartz: CGRect, primaryTop: CGFloat) -> CGRect {
+ CGRect(x: quartz.minX, y: primaryTop - quartz.maxY, width: quartz.width, height: quartz.height)
+}
+// Keep every tab surface and hit target on the straight top edge. The 24pt
+// clearance covers the current macOS rounded corners, including border inset.
+let tabCornerClearance: CGFloat = 24
+func tabBarFrame(window: CGRect, height: CGFloat, display: CGRect, visible: CGRect) -> CGRect? {
+ guard height > 0, height <= 80, window.width > 2 * tabCornerClearance, window.height > 0 else { return nil }
+ let overlap = window.intersection(visible)
+ // A narrow exposed edge is a strip sliver, not a usable tab target.
+ guard !overlap.isNull, overlap.width >= min(120, window.width * 0.5), overlap.height > 40 else { return nil }
+ let raw = CGRect(x: window.minX + tabCornerClearance, y: window.maxY, width: window.width - 2 * tabCornerClearance, height: height)
+ let clipped = raw.intersection(display).intersection(visible)
+ guard !clipped.isNull, clipped.height >= height - 1, clipped.width >= min(120, window.width * 0.5) else { return nil }
+ return clipped
+}
+// Translation and clipping must never change the layout width or rebuild key.
+struct TabStripPlacement {
+ let contentWidth: CGFloat
+ let offsetX: CGFloat
+ init(window: CGRect, clipped: CGRect) {
+  contentWidth = max(0, window.width - 2 * tabCornerClearance)
+  offsetX = window.minX + tabCornerClearance - clipped.minX
+ }
+}
+func tabContentSignature(_ members: [Entry], selected: Int?, width: CGFloat, height: CGFloat) -> String {
+ members.map { "\($0.id):\($0.app):\($0.title):\($0.bundle)" }.joined(separator: "|") + ":\(selected ?? 0):\(width):\(height)"
+}
+struct LiveWindow {
+ let id: Int
+ let frame: CGRect
+ let layer: Int
+}
+func readLiveWindows() -> [LiveWindow] {
+ guard let rows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] else { return [] }
+ let top = NSScreen.screens.first?.frame.maxY ?? 0
+ return rows.compactMap { row in
+  guard let id = row[kCGWindowNumber as String] as? Int,
+   let bounds = row[kCGWindowBounds as String] as? NSDictionary,
+   let frame = CGRect(dictionaryRepresentation: bounds) else { return nil }
+  return LiveWindow(id: id, frame: appKitRect(frame, primaryTop: top), layer: row[kCGWindowLayer as String] as? Int ?? 0)
+ }
+}
+// Rounded shoulders grow from a full-width bottom seam. The selected tab
+// rises four points above its recessed neighbours, while retaining 28pt targets.
+func folderTabPath(in bounds: CGRect, selected: Bool, compact:Bool=false) -> NSBezierPath {
+ let roomy=bounds.height >= 34
+ let bottom=bounds.minY + (selected || compact ? 0 : (roomy ? 4 : 3.25))
+ let top=bounds.maxY - (selected || compact ? 0.75 : (roomy ? 5.5 : 4.75))
+ let slant=min(8.5,bounds.width/4), radius:CGFloat=selected ? 4 : 3
+ let p=NSBezierPath(); p.move(to:CGPoint(x:bounds.minX,y:bottom))
+ p.line(to:CGPoint(x:bounds.minX+slant-radius/2,y:top-radius))
+ p.curve(to:CGPoint(x:bounds.minX+slant+radius,y:top),controlPoint1:CGPoint(x:bounds.minX+slant,y:top),controlPoint2:CGPoint(x:bounds.minX+slant,y:top))
+ p.line(to:CGPoint(x:bounds.maxX-slant-radius,y:top))
+ p.curve(to:CGPoint(x:bounds.maxX-slant+radius/2,y:top-radius),controlPoint1:CGPoint(x:bounds.maxX-slant,y:top),controlPoint2:CGPoint(x:bounds.maxX-slant,y:top))
+ p.line(to:CGPoint(x:bounds.maxX,y:bottom))
+ if !selected { p.close() }
+ return p
+}
+func tabPresentationFrame(window:CGRect,height:CGFloat,style:String,visible:CGRect) -> CGRect? {
+ let side=style == "side"
+ let height=style == "folder-compact" ? (height==34 ? 25.0:20.0):height
+ let overlap=window.intersection(visible)
+ guard !overlap.isNull, overlap.width >= min(100,window.width/2), overlap.height>40 else {return nil}
+ if side {
+  let raw=CGRect(x:window.minX-40,y:window.minY,width:41,height:window.height).intersection(visible)
+  return raw.width>=20 && raw.height>40 ? raw : nil
+ }
+ let left=style.hasPrefix("folder") ? max(window.minX,visible.minX)+24 : max(window.minX,visible.minX+(window.minX<visible.minX ? 12:0))
+ let right=style.hasPrefix("folder") ? min(window.maxX,visible.maxX)-24 : min(window.maxX,visible.maxX-(window.maxX>visible.maxX ? 12:0))
+ let raw=CGRect(x:left,y:window.maxY-1,width:max(0,right-left),height:height+1).intersection(visible)
+ return raw.width>=40 && raw.height>=height ? raw:nil
+}
+final class SideTabSeparator:NSView {
+ override func draw(_ dirtyRect:NSRect) {
+  NSGradient(starting:.black.withAlphaComponent(0.16),ending:.clear)?.draw(in:bounds,angle:0)
+ }
+ override func hitTest(_ point:NSPoint)->NSView? {nil}
+}
+final class FolderTabFace: NSView {
+ var selected = false
+ var style="folder"
+ var matchedColor:NSColor?
+ var first=false, last=false
+ override func draw(_ dirtyRect: NSRect) {
+  let dark=effectiveAppearance.bestMatch(from:[.aqua,.darkAqua]) == .darkAqua
+  let fallback=dark ? NSColor(srgbRed:0.16,green:0.17,blue:0.18,alpha:1) : .windowBackgroundColor
+  let fill=selected ? (matchedColor ?? fallback) : (style.hasPrefix("folder") ? NSColor.white.withAlphaComponent(dark ? 0.10:0.88) : NSColor(srgbRed:dark ? 0.165:0.835,green:dark ? 0.176:0.839,blue:dark ? 0.184:0.831,alpha:1))
+  let path: NSBezierPath
+  if style.hasPrefix("folder") {path=folderTabPath(in:bounds,selected:selected,compact:style == "folder-compact")}
+  else {
+   let r:CGFloat=style == "side" ? 10:8
+   path=NSBezierPath();path.move(to:CGPoint(x:bounds.minX+(first ? r:0),y:bounds.maxY))
+   path.line(to:CGPoint(x:bounds.maxX-(style == "classic" && last ? r:0),y:bounds.maxY))
+   if style == "classic" && last {path.curve(to:CGPoint(x:bounds.maxX,y:bounds.maxY-r),controlPoint1:CGPoint(x:bounds.maxX,y:bounds.maxY),controlPoint2:CGPoint(x:bounds.maxX,y:bounds.maxY))}
+   path.line(to:CGPoint(x:bounds.maxX,y:bounds.minY));path.line(to:CGPoint(x:bounds.minX+(style == "side" && last ? r:0),y:bounds.minY))
+   if style == "side" && last {path.curve(to:CGPoint(x:bounds.minX,y:bounds.minY+r),controlPoint1:CGPoint(x:bounds.minX,y:bounds.minY),controlPoint2:CGPoint(x:bounds.minX,y:bounds.minY))}
+   path.line(to:CGPoint(x:bounds.minX,y:bounds.maxY-(first ? r:0)))
+   if first {path.curve(to:CGPoint(x:bounds.minX+r,y:bounds.maxY),controlPoint1:CGPoint(x:bounds.minX,y:bounds.maxY),controlPoint2:CGPoint(x:bounds.minX,y:bounds.maxY))}
+   path.close()
+  }
+  fill.setFill();path.fill()
+  NSGraphicsContext.saveGraphicsState();path.addClip()
+  if style.hasPrefix("folder") {
+   let stroke: NSColor
+   if selected, let color=matchedColor { stroke=color.blended(withFraction:tabColorIsDark(color) ? 0.35:0.28,of:tabColorIsDark(color) ? .white:.black) ?? color }
+   else {stroke=selected ? (dark ? NSColor(srgbRed:0.235,green:0.776,blue:0.769,alpha:1):NSColor(srgbRed:0,green:0.761,blue:0.82,alpha:1)) : (dark ? NSColor.white.withAlphaComponent(0.38):NSColor.black.withAlphaComponent(0.45))}
+   stroke.setStroke();path.lineWidth=selected ? 1.5:0.75;path.stroke()
+  } else {
+   // Local edge shading stays inside the bar; no shadow spills onto the app.
+   let edge=NSBezierPath();edge.move(to:CGPoint(x:0,y:bounds.maxY-0.5));edge.line(to:CGPoint(x:bounds.maxX,y:bounds.maxY-0.5))
+   NSColor.white.withAlphaComponent(dark ? 0.06:0.55).setStroke();edge.lineWidth=1;edge.stroke()
+   if !selected {
+    NSColor.black.withAlphaComponent(0.2).setFill(); CGRect(x:0,y:0,width:bounds.width,height:0.5).fill()
+    let shades=4
+    for i in 0..<shades {
+     NSColor.black.withAlphaComponent((dark ? 0.28:0.13)*CGFloat(shades-i)/CGFloat(shades)).setFill()
+     if style == "side" {CGRect(x:0,y:bounds.minY+CGFloat(i),width:bounds.width,height:1).fill()}
+     else {CGRect(x:bounds.maxX-CGFloat(i)-1,y:0,width:1,height:bounds.height).fill()}
+    }
+   }
+  }
+  NSGraphicsContext.restoreGraphicsState()
+ }
+}
+func tabColorIsDark(_ color:NSColor) -> Bool {
+ guard let c=color.usingColorSpace(.sRGB) else {return false}
+ return 0.2126*c.redComponent+0.7152*c.greenComponent+0.0722*c.blueComponent < 0.5
+}
+struct TabWindowSample {
+ let titleColor:NSColor?
+ let sideColor:NSColor?
+ // Transparent masks cover only pixels outside the app's own rounded shape.
+ let corners:[CGImage]
+}
+let tabSeamExtent:CGFloat=32
+// Capture at window aspect ratio, then crop locally. ScreenCaptureKit ignores
+// sourceRect for desktop-independent window capture (Apple's API contract).
+final class TabColorSampler {
+ var samples:[Int:TabWindowSample]=[:]
+ private var attempted:[Int:TimeInterval]=[:]
+ private var busy=false
+ private var lastFailure=""
+ func sample(id:Int) -> TabWindowSample? {
+  let now=Date.timeIntervalSinceReferenceDate
+  guard CGPreflightScreenCaptureAccess() else {report("Screen Recording permission unavailable");return nil}
+  if !busy && now-(attempted[id] ?? 0)>3 {
+   busy=true;attempted[id]=now
+   SCShareableContent.getExcludingDesktopWindows(true,onScreenWindowsOnly:true) { [weak self] content,error in
+    guard let window=content?.windows.first(where: { $0.windowID == CGWindowID(id) }) else {
+     DispatchQueue.main.async {self?.busy=false;self?.report("Window lookup failed: \(error?.localizedDescription ?? "window unavailable")")};return
+    }
+    let filter=SCContentFilter(desktopIndependentWindow:window)
+    let config=SCStreamConfiguration();config.width=max(1,Int(window.frame.width));config.height=max(1,Int(window.frame.height));config.showsCursor=false
+    config.ignoreShadowsSingleWindow=true;config.scalesToFit=true
+    SCScreenshotManager.captureImage(contentFilter:filter,configuration:config) { image,error in
+     let sample=image.flatMap(Self.extract)
+     DispatchQueue.main.async {
+      guard let self else {return};self.busy=false
+      if let sample {self.samples[id]=sample;self.lastFailure=""}
+      else {self.report("Window capture failed: \(error?.localizedDescription ?? "empty sample")")}
+      if self.attempted.count>100 {self.samples=self.samples.filter {$0.key==id};self.attempted=self.attempted.filter {$0.key==id}}
+     }
+    }
+   }
+  }
+  return samples[id]
+ }
+ private func report(_ message:String) {
+  if message != lastFailure {NSLog("Tab color sampling: %@",message);lastFailure=message}
+ }
+ static func extract(_ image:CGImage) -> TabWindowSample? {
+  let w=image.width,h=image.height
+  guard w>80,h>80 else {return nil}
+  let title=image.cropping(to:CGRect(x:40,y:2,width:w-80,height:12)).flatMap(dominantColor)
+  // Sample the edge the rail actually meets, rather than the center of a
+  // potentially differently colored page/sidebar.
+  let side=image.cropping(to:CGRect(x:2,y:40,width:12,height:h-80)).flatMap(dominantColor)
+  return TabWindowSample(titleColor:title,sideColor:side,corners:cornerMasks(image))
+ }
+ static func cornerMasks(_ image:CGImage) -> [CGImage] {
+  let w=image.width,h=image.height,n=Int(tabSeamExtent)
+  guard w>n*2,h>n*2 else {return []}
+  var pixels=[UInt8](repeating:0,count:w*h*4)
+  let ok=pixels.withUnsafeMutableBytes { buffer -> Bool in
+   guard let ctx=CGContext(data:buffer.baseAddress,width:w,height:h,bitsPerComponent:8,bytesPerRow:w*4,space:CGColorSpace(name:CGColorSpace.sRGB)!,bitmapInfo:CGImageAlphaInfo.premultipliedLast.rawValue) else {return false}
+   ctx.draw(image,in:CGRect(x:0,y:0,width:w,height:h));return true
+  }
+  guard ok else {return []}
+  // Top-left, top-right, bottom-left, bottom-right, in CGImage coordinates.
+  let topColor=image.cropping(to:CGRect(x:40,y:2,width:w-80,height:12)).flatMap(dominantColor)
+  let leftColor=image.cropping(to:CGRect(x:2,y:40,width:12,height:h-80)).flatMap(dominantColor)
+  let rightColor=image.cropping(to:CGRect(x:w-14,y:40,width:12,height:h-80)).flatMap(dominantColor)
+  return [(0,0),(w-n,0),(0,h-n),(w-n,h-n)].compactMap { ox,oy in
+   guard let color=(oy==0 ? topColor:(ox==0 ? leftColor:rightColor))?.usingColorSpace(.sRGB) else {return nil}
+   let rgb=[color.redComponent,color.greenComponent,color.blueComponent].map {Int(($0*255).rounded())}
+   var mask=[UInt8](repeating:0,count:n*n*4)
+   for y in 0..<n {for x in 0..<n {
+    let src=((oy+y)*w+ox+x)*4, dst=(y*n+x)*4
+    let outerX=ox==0 ? x:n-1-x,outerY=oy==0 ? y:n-1-y
+    // Repair only the mostly transparent outer cutout. Uniform edge
+    // color avoids copying nearby controls into the corner.
+    let alpha=pixels[src+3]<128 && outerX+outerY<n ? 255:0
+    for c in 0..<3 {mask[dst+c]=UInt8(rgb[c]*alpha/255)}
+    mask[dst+3]=UInt8(alpha)
+   }}
+   let data=Data(mask) as CFData
+   guard let provider=CGDataProvider(data:data) else {return nil}
+   return CGImage(width:n,height:n,bitsPerComponent:8,bitsPerPixel:32,bytesPerRow:n*4,space:CGColorSpace(name:CGColorSpace.sRGB)!,bitmapInfo:CGBitmapInfo(rawValue:CGImageAlphaInfo.premultipliedLast.rawValue),provider:provider,decode:nil,shouldInterpolate:false,intent:.defaultIntent)
+  }
+ }
+ static func dominantColor(_ image:CGImage) -> NSColor? {
+  var pixels=[UInt8](repeating:0,count:64*8*4)
+  let ok=pixels.withUnsafeMutableBytes { buffer -> Bool in
+   guard let ctx=CGContext(data:buffer.baseAddress,width:64,height:8,bitsPerComponent:8,bytesPerRow:256,space:CGColorSpaceCreateDeviceRGB(),bitmapInfo:CGImageAlphaInfo.premultipliedLast.rawValue) else {return false}
+   ctx.draw(image,in:CGRect(x:0,y:0,width:64,height:8));return true
+  }
+  guard ok else {return nil}
+  var bins:[Int:(Int,Int,Int,Int)]=[:]
+  for i in stride(from:0,to:pixels.count,by:4) where pixels[i+3]>240 {
+   let r=Int(pixels[i]),g=Int(pixels[i+1]),b=Int(pixels[i+2]),key=(r/16)*256+(g/16)*16+b/16
+   let old=bins[key] ?? (0,0,0,0);bins[key]=(old.0+1,old.1+r,old.2+g,old.3+b)
+  }
+  guard let best=bins.values.max(by:{$0.0<$1.0}),best.0>16 else {return nil}
+  return NSColor(srgbRed:CGFloat(best.1)/CGFloat(best.0)/255,green:CGFloat(best.2)/CGFloat(best.0)/255,blue:CGFloat(best.3)/CGFloat(best.0)/255,alpha:1)
+ }
+}
+func cancelTabPresses(in view: NSView?) {
+ guard let view else { return }
+ if let card = view as? ColumnCard { card.cancelInteraction() }
+ for child in view.subviews { cancelTabPresses(in: child) }
+}
+func tabDropExposed(point: CGPoint, panelID: Int, members: Set<Int>, windows: [LiveWindow]) -> Bool {
+ guard let front=windows.first(where: { $0.layer == 0 && $0.frame.contains(point) }) else { return true }
+ return front.id == panelID || members.contains(front.id)
+}
+private final class TabBarSurface {
+ let panel = StripPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+ let seamPanel = StripPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+ var signature = ""
+ var memberIDs = Set<Int>()
+ var pressed = false
+ var strip: NSView?
+ init() {
+  seamPanel.animationBehavior = .none;seamPanel.hasShadow=false;seamPanel.level = .normal
+  seamPanel.isFloatingPanel=false;seamPanel.isOpaque=false;seamPanel.backgroundColor = .clear
+  seamPanel.ignoresMouseEvents=true;seamPanel.hidesOnDeactivate=false
+  seamPanel.collectionBehavior=[.canJoinAllSpaces,.ignoresCycle]
+  panel.animationBehavior = .none; panel.hasShadow = false
+  panel.level = .normal; panel.isFloatingPanel = false; panel.isOpaque = false; panel.backgroundColor = .clear
+  panel.hidesOnDeactivate = false; panel.becomesKeyOnlyIfNeeded = true
+  panel.collectionBehavior = [.canJoinAllSpaces, .ignoresCycle]
+ }
+ func hide() {
+  cancelTabPresses(in: panel.contentView)
+  pressed = false; panel.orderOut(nil);seamPanel.orderOut(nil)
+ }
+}
+final class TabBars: NSObject {
+ private var bars: [Int: TabBarSurface] = [:]
+ private var icons: [String: NSImage] = [:]
+ var aliases: [String:String] = [:]
+ var style="folder"
+ var height:CGFloat=34
+ var matchAppColor=false
+ private let sampler=TabColorSampler()
+ var focus: ((Int) -> Void)?
+ var reorder: ((StripDrop) -> Void)?
+ var dragOutside: ((Int,CGPoint,Bool) -> Bool)?
+ var dragFinished: (() -> Void)?
+ private var dragMark: DropInsertionMark?
+ private var dragSource: Int?
+ private var currentWindows: [LiveWindow] = []
+ func clearDragFeedback() { dragMark?.removeFromSuperview(); dragMark=nil }
+ func finishDrag() { clearDragFeedback(); dragSource=nil; dragFinished?() }
+ private func tabInsertion(_ point: CGPoint) -> (bar: TabBarSurface,target: StripDropTarget,before: Bool)? {
+  for bar in bars.values where bar.panel.isVisible {
+   guard let strip=bar.strip, tabDropExposed(point:point,panelID:bar.panel.windowNumber,members:bar.memberIDs.union([bar.seamPanel.windowNumber]),windows:currentWindows) else { continue }
+   let targets=strip.subviews.compactMap { view -> StripDropTarget? in
+    guard let card=view as? ColumnCard, card.entryID > 0 else { return nil }
+    let windowRect=strip.convert(card.frame,to:nil)
+    let screenRect=bar.panel.convertToScreen(windowRect).intersection(bar.panel.frame)
+    guard !screenRect.isNull, screenRect.width > 3 else { return nil }
+    return StripDropTarget(id:card.entryID,frame:screenRect)
+   }
+   if style == "side", bar.panel.frame.insetBy(dx:-8,dy:-8).contains(point), !targets.isEmpty {
+    let ordered=targets.sorted {$0.frame.maxY > $1.frame.maxY}
+    if let target=ordered.first(where:{point.y > $0.frame.midY}) {return (bar,target,true)}
+    return (bar,ordered.last!,false)
+   }
+   if style != "side", let insertion=stripInsertion(at:point,targets:targets.sorted {$0.frame.minX < $1.frame.minX}) { return (bar,insertion.target,insertion.before) }
+  }
+  return nil
+ }
+ private func dragTab(source: Int, point: CGPoint, commit: Bool) {
+  dragSource=source; clearDragFeedback()
+  if let insertion=tabInsertion(point), insertion.target.id != source, let view=insertion.bar.panel.contentView {
+   // A line between folder shoulders means insertion into that tab group.
+   let frame=insertion.target.frame
+   let local=insertion.bar.panel.convertPoint(fromScreen:CGPoint(x:insertion.before ? frame.minX : frame.maxX,y:frame.minY))
+   let mark=DropInsertionMark(frame:style == "side" ? CGRect(x:0,y:insertion.bar.panel.convertPoint(fromScreen:CGPoint(x:frame.minX,y:insertion.before ? frame.maxY:frame.minY)).y-1.5,width:41,height:3):CGRect(x:local.x-1.5,y:local.y,width:3,height:frame.height))
+   view.addSubview(mark); dragMark=mark
+   // Also starts/reuses the explicit drag minimap, clearing its old marker.
+   _ = dragOutside?(source,CGPoint(x:-100000,y:-100000),false)
+   if commit { reorder?(StripDrop(kind:.tab,source:source,target:insertion.target.id,before:insertion.before)) }
+   else { NSCursor.closedHand.set() }
+  } else {
+   let accepted=dragOutside?(source,point,commit) ?? false
+   if !commit { (accepted ? NSCursor.closedHand : NSCursor.operationNotAllowed).set() }
+  }
+  if commit { finishDrag() }
+ }
+ var hasVisibleBars: Bool { bars.values.contains { $0.panel.isVisible } }
+ func update(_ snapshot: NavigatorSnapshot, windows: [LiveWindow]) {
+  currentWindows=windows
+  guard snapshot.tabsVisible, let screen = NSScreen.screens.first(where: { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == snapshot.display }) else {
+   bars.values.forEach { $0.hide() }; finishDrag(); return
+  }
+  var shown = Set<Int>()
+  for (column, members) in snapshot.tabGroups {
+   let ids = Set(members.map { $0.id })
+   guard let live = windows.first(where: { ids.contains($0.id) && $0.layer == 0 }),
+    let frame = tabPresentationFrame(window: live.frame, height: height, style:style, visible: screen.visibleFrame) else { continue }
+   // Do not float over an unrelated full-screen surface on the current Space.
+   if windows.prefix(while: { $0.id != live.id }).contains(where: { $0.layer == 0 && !ids.contains($0.id) && $0.frame.contains(screen.visibleFrame) }) { continue }
+   let bar = bars[column] ?? TabBarSurface(); bars[column] = bar
+   bar.memberIDs=ids
+   shown.insert(column)
+   let selection = tabSelection(members, focused: snapshot.focused, liveID: live.id)
+   let side=style == "side"
+   let contentWidth=frame.width
+   let panelFrame=frame
+   let seamFrame=side ? CGRect(x:live.frame.minX,y:live.frame.minY,width:32,height:live.frame.height) : CGRect(x:live.frame.minX,y:live.frame.maxY-32,width:live.frame.width,height:32)
+   let sample=matchAppColor ? sampler.sample(id:live.id):nil
+   let matched=side ? sample?.sideColor:sample?.titleColor
+   let signature = tabContentSignature(members, selected: selection, width: contentWidth, height: frame.height) + ":\(style):\(sample != nil):\(NSApp.effectiveAppearance.name.rawValue):\(matched?.description ?? "default")" + members.map { aliases[$0.bundle+"\t"+$0.title] ?? "" }.joined(separator:"|")
+   if signature != bar.signature && !bar.pressed {
+    bar.signature = signature
+    let view = NSView(frame: CGRect(x: 0, y: 0, width: contentWidth, height: frame.height))
+    view.wantsLayer = true
+    // A quiet attached seam, without an independently glowing HUD material.
+    view.layer?.backgroundColor = NSColor.clear.cgColor
+    let capacity = max(1, Int((side ? frame.height:contentWidth) / (side ? 32:65)))
+    let overflow = members.count > capacity
+    let visible = visibleTabMembers(members, capacity: capacity, selected: selection)
+    let gap:CGFloat=style.hasPrefix("folder") ? 2.5:0
+    let available = (side ? frame.height:contentWidth) - (overflow ? 30 : 0)
+    let width = max(1,(available-gap*CGFloat(visible.count-1)) / CGFloat(visible.count))
+    for (index, entry) in visible.enumerated() {
+     let card = ColumnCard(frame: side ? CGRect(x:0,y:frame.height-CGFloat(index+1)*width,width:41,height:width) : CGRect(x:CGFloat(index)*(width+gap),y:0,width:width,height:frame.height))
+     card.entryID=entry.id
+     card.diagnosticName="tab column=\(column) target=\(entry.id)"
+     card.onPress = { [weak bar] down in bar?.pressed = down }
+     card.onDrag = { [weak self] point in self?.dragTab(source:entry.id,point:point,commit:false) }
+     card.onDrop = { [weak self] point in self?.dragTab(source:entry.id,point:point,commit:true) }
+     card.onCancelDrag = { [weak self] in self?.finishDrag() }
+     card.onClick = { [weak self] in
+      NSLog("Navigator tab click column=%d target=%d",column,entry.id)
+      self?.focus?(entry.id)
+     }
+     let displayTitle=aliases[entry.bundle+"\t"+entry.title] ?? entry.title
+     card.toolTip = "\(entry.app) — \(displayTitle)\nDrag between tabs to regroup, or to a minimap gap to separate."
+     card.wantsLayer = true
+     let active = selection == entry.id
+     if side && !active {card.setFrameSize(NSSize(width:40,height:card.frame.height))}
+     if !style.hasPrefix("folder") {
+      card.layer?.shadowColor=NSColor.black.cgColor;card.layer?.shadowOpacity=Float(NSApp.effectiveAppearance.bestMatch(from:[.aqua,.darkAqua]) == .darkAqua ? 0.55:0.26)
+      card.layer?.shadowRadius=active ? 2.5:2;card.layer?.shadowOffset=side ? CGSize(width:0,height:active ? 0:-2):CGSize(width:active ? 0:2,height:0)
+     }
+     let face = FolderTabFace(frame:card.bounds); face.selected = active;face.style=style;face.matchedColor=active ? matched:nil;face.first=index==0 && (side ? frame.maxY>=live.frame.maxY:live.frame.minX>=screen.visibleFrame.minX);face.last=index==visible.count-1 && (side ? frame.minY<=live.frame.minY:live.frame.maxX<=screen.visibleFrame.maxX)
+     card.addSubview(face)
+     if icons[entry.bundle] == nil, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: entry.bundle) { icons[entry.bundle] = NSWorkspace.shared.icon(forFile: url.path) }
+     let iconSize:CGFloat=side ? 22:16
+     let contentY:CGFloat=side ? (card.bounds.height-iconSize)/2 : (style == "classic" || style == "folder-compact") ? (frame.height-16)/2 : (height >= 34 ? 8.25:6.25)
+     let icon = NSImageView(frame:CGRect(x:side ? 9:15,y:contentY,width:iconSize,height:iconSize))
+     icon.image=icons[entry.bundle] ?? NSImage(named:NSImage.applicationIconName);card.addSubview(icon)
+     card.setAccessibilityLabel(displayTitle.isEmpty ? entry.app:displayTitle)
+     if !side {
+      let label=NSTextField(labelWithString:displayTitle.isEmpty ? entry.app:displayTitle)
+      label.frame=CGRect(x:38,y:contentY-1,width:max(0,width-51),height:18)
+      label.font = .systemFont(ofSize:style == "classic" ? 12.5:13,weight:active ? .semibold:.regular);label.lineBreakMode = .byTruncatingTail
+      if active, let matched {label.textColor=tabColorIsDark(matched) ? .white:.black}
+      if style == "classic" {
+       let textWidth=min(max(0,width-39),(label.stringValue as NSString).size(withAttributes:[.font:label.font!]).width+2)
+       let start=max(7,(width-23-textWidth)/2);icon.setFrameOrigin(CGPoint(x:start,y:contentY))
+       label.frame=CGRect(x:start+23,y:contentY-1,width:textWidth,height:18)
+      }
+      card.addSubview(label)
+     }
+     view.addSubview(card,positioned:active ? .above:.below,relativeTo:nil)
+    }
+    if overflow {
+     let more = ColumnCard(frame: side ? CGRect(x:0,y:0,width:41,height:30):CGRect(x:available,y:0,width:30,height:frame.height))
+     let face = FolderTabFace(frame:more.bounds); face.style=style; more.addSubview(face)
+     let label = NSTextField(labelWithString: "…"); label.frame = CGRect(x: 7, y: (more.bounds.height-18)/2, width: 20, height: 18); more.addSubview(label)
+     more.diagnosticName="tab overflow column=\(column)"
+     more.toolTip = "All tabs (\(members.count))"
+     more.onPress = { [weak bar] down in bar?.pressed = down }
+     more.onClick = { [weak self, weak more] in
+      guard let self, let more, let event = NSApp.currentEvent else { return }
+      let menu = NSMenu()
+      for member in members {
+       let item = NSMenuItem(title: "\(member.app) — \(self.aliases[member.bundle+"\t"+member.title] ?? member.title)", action: #selector(self.selectMenu(_:)), keyEquivalent: "")
+       item.target = self; item.tag = member.id; item.state = member.id == selection ? .on : .off; menu.addItem(item)
+      }
+      NSMenu.popUpContextMenu(menu, with: event, for: more)
+     }
+     view.addSubview(more)
+    }
+    let clip = NSView(frame: CGRect(origin: .zero, size: panelFrame.size))
+    // Never paint guessed opaque rectangles over app chrome. These masks are
+    // transparent everywhere the captured app is opaque, including controls.
+    let seams=NSView(frame:CGRect(origin:.zero,size:seamFrame.size))
+    if !style.hasPrefix("folder"),let sample,sample.corners.count==4 {
+     let placements:[(Int,CGRect)]=side ? [(0,CGRect(x:0,y:seamFrame.height-32,width:32,height:32)),(2,CGRect(x:0,y:0,width:32,height:32))] : [(0,CGRect(x:0,y:0,width:32,height:32)),(1,CGRect(x:seamFrame.width-32,y:0,width:32,height:32))]
+     for (index,rect) in placements {
+      if !side && ((index==0 && live.frame.minX<screen.visibleFrame.minX) || (index==1 && live.frame.maxX>screen.visibleFrame.maxX)) {continue}
+      let patch=NSImageView(frame:rect);patch.image=NSImage(cgImage:sample.corners[index],size:rect.size);seams.addSubview(patch)
+     }
+    }
+    if side {
+     let shadow=SideTabSeparator(frame:CGRect(x:0,y:0,width:4,height:seamFrame.height));seams.addSubview(shadow)
+    }
+    bar.seamPanel.contentView=seams
+    clip.wantsLayer = true; clip.layer?.masksToBounds = true
+    clip.addSubview(view)
+    bar.strip = view
+    bar.panel.contentView = clip
+   }
+   if !bar.pressed {
+    // Translate without animation; rebuild only when the visible protected span changes.
+    CATransaction.begin(); CATransaction.setDisableActions(true)
+    NSAnimationContext.runAnimationGroup { context in
+     context.duration = 0; context.allowsImplicitAnimation = false
+     if bar.panel.frame.size != panelFrame.size {
+      bar.panel.setFrame(panelFrame, display: false, animate: false)
+     } else if bar.panel.frame.origin != panelFrame.origin {
+      // Translation avoids AppKit's resize/layout path on every swipe frame.
+      bar.panel.setFrameOrigin(panelFrame.origin)
+     }
+     if bar.seamPanel.frame.size != seamFrame.size {bar.seamPanel.setFrame(seamFrame,display:false,animate:false)}
+     else if bar.seamPanel.frame.origin != seamFrame.origin {bar.seamPanel.setFrameOrigin(seamFrame.origin)}
+     if bar.panel.contentView?.frame.size != panelFrame.size { bar.panel.contentView?.setFrameSize(panelFrame.size) }
+     let stripOrigin = CGPoint(x: 0, y: 0)
+     if bar.strip?.frame.origin != stripOrigin { bar.strip?.setFrameOrigin(stripOrigin) }
+    }
+    CATransaction.commit()
+   }
+   // Attach the panel to its group's ordinary window order, not a global
+   // floating level. Unrelated windows in front must also cover these tabs.
+   let hasSeams=side || (style == "classic" && sample?.corners.count == 4)
+   if hasSeams {
+    if !bar.seamPanel.isVisible || tabBarNeedsOrdering(panelID:bar.seamPanel.windowNumber,ownerID:live.id,windows:windows) {
+     bar.seamPanel.order(.above,relativeTo:live.id)
+    }
+   } else {bar.seamPanel.orderOut(nil)}
+   let anchor=hasSeams ? bar.seamPanel.windowNumber:live.id
+   if !bar.panel.isVisible || tabBarNeedsOrdering(panelID:bar.panel.windowNumber,ownerID:anchor,windows:windows) {
+    bar.panel.order(.above, relativeTo:anchor)
+   }
+  }
+  for (key, bar) in bars where !shown.contains(key) { bar.hide() }
+ }
+ @objc private func selectMenu(_ item: NSMenuItem) { NSLog("Navigator tab menu click target=%d",item.tag); focus?(item.tag) }
+}
+
+// WindowServer lists front to back. Avoid redundant order calls each display
+// tick, but repair placement after focus/stack changes, even if owner is stable.
+func tabBarNeedsOrdering(panelID: Int, ownerID: Int, windows: [LiveWindow]) -> Bool {
+ let normal = windows.filter { $0.layer == 0 }.map { $0.id }
+ guard let owner = normal.firstIndex(of: ownerID), owner > 0 else { return true }
+ return normal[owner - 1] != panelID
+}
