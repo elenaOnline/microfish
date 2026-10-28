@@ -180,6 +180,12 @@ struct KeyboardFocusAttempt {
     retries: u8,
     confirmations: u8,
     prepared: bool,
+    /// Other input arrived before the OS was asked to focus the target. That
+    /// input may be about something else entirely (a resize, a swipe), in
+    /// which case the request still has to be made, or it may move the focus
+    /// itself, in which case it must not. The frame's other systems settle
+    /// which; see [`confirm_keyboard_focus`].
+    interrupted: bool,
 }
 
 fn begin_keyboard_focus(
@@ -204,6 +210,7 @@ fn begin_keyboard_focus(
         retries: 0,
         confirmations: 0,
         prepared: false,
+        interrupted: false,
     });
 }
 
@@ -213,14 +220,33 @@ fn cancel_keyboard_focus(
 ) {
     // Consume the entire batch: a short-circuit iterator leaves old cancel
     // events unread, which could cancel the next keyboard request.
-    let cancelled = messages.read().fold(false, |cancelled, event| cancelled | matches!(event,
-        Event::MouseDown { .. } | Event::CancelKeyboardFocusHandoff |
-        Event::Swipe { .. } | Event::VerticalSwipe { .. } | Event::Scroll { .. } | Event::VerticalScrollTick { .. } |
-        Event::Command { command: crate::commands::Command::Window(_) }
-            if !matches!(event, Event::Command { command: crate::commands::Command::Window(crate::commands::Operation::Focus(_)) })
-    ));
-    if cancelled {
+    let (mut clicked, mut interrupted) = (false, false);
+    for event in messages.read() {
+        match event {
+            // The user took the focus themselves.
+            Event::MouseDown { .. } | Event::CancelKeyboardFocusHandoff => clicked = true,
+            Event::Command {
+                command: crate::commands::Command::Window(crate::commands::Operation::Focus(_)),
+            } => {}
+            Event::Swipe { .. }
+            | Event::VerticalSwipe { .. }
+            | Event::Scroll { .. }
+            | Event::VerticalScrollTick { .. }
+            | Event::Command {
+                command: crate::commands::Command::Window(_),
+            } => interrupted = true,
+            _ => {}
+        }
+    }
+    if clicked {
         handoff.0 = None;
+    } else if interrupted && let Some(attempt) = handoff.0.as_mut() {
+        if attempt.prepared {
+            // The OS has been asked once; what is left is only the check.
+            handoff.0 = None;
+        } else {
+            attempt.interrupted = true;
+        }
     }
 }
 
@@ -294,7 +320,26 @@ fn activate_prepared_keyboard_target(
     request_keyboard_native_focus(attempt, native_id, windows, commands);
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Input arrived before the OS was asked to focus the target. A command that
+/// moves the focus itself has already done so by now, and the target no longer
+/// holds it: that command owns the focus. Otherwise the target is still what
+/// the layout shows focused and the OS has to be told - left alone, a row
+/// switch cut short by a resize would leave the keyboard in the window parked
+/// on the row just left.
+fn finish_interrupted_keyboard_focus(
+    attempt: &KeyboardFocusAttempt,
+    windows: &Windows,
+    commands: &mut Commands,
+) {
+    if windows
+        .focused()
+        .is_some_and(|(_, focused)| focused == attempt.target)
+    {
+        request_keyboard_native_focus(attempt, None, windows, commands);
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn confirm_keyboard_focus(
     mut handoff: ResMut<KeyboardFocusHandoff>,
     time: Res<bevy::time::Time>,
@@ -308,6 +353,11 @@ fn confirm_keyboard_focus(
     let Some(attempt) = handoff.0.as_mut() else {
         return;
     };
+    if attempt.interrupted {
+        finish_interrupted_keyboard_focus(attempt, &windows, &mut commands);
+        handoff.0 = None;
+        return;
+    }
     attempt.elapsed += time.delta();
     if attempt.prepared {
         if attempt.elapsed < attempt.next_check {
@@ -1102,6 +1152,7 @@ mod tests {
             retries: 0,
             confirmations: 0,
             prepared: true,
+            interrupted: false,
         })));
         let mut time = bevy::time::Time::<()>::default();
         time.advance_by(Duration::from_millis(150));

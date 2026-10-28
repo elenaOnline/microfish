@@ -3183,6 +3183,11 @@ fn test_focus_into_hidden_virtual_workspace_exposes_target_window() {
             animation_speed: Some(10000.0),
             virtual_workspace_animations: Some(true),
             auto_center: Some(false),
+            // A common setting. With the default (continuous swipe) the edge
+            // invariant is off and a reshuffle on a stale parked frame can
+            // park the window at the far edge once the 2 s restore guard of an
+            // earlier visit has lapsed.
+            continuous_swipe: Some(false),
             // A reshuffle may leave a window up to half hidden where it is,
             // so exposing this one is down to the workspace restore itself.
             window_hidden_ratio: Some(0.5),
@@ -3256,15 +3261,10 @@ fn test_focus_into_hidden_virtual_workspace_exposes_target_window() {
         .on_iteration(11, focus_next(2))
         .on_iteration(12, |world, _state| {
             assert_focused!(world, 2);
-            // Flush with either edge or anywhere between: the window must be
-            // shown whole, not left hanging a quarter off the left edge. Where
-            // exactly depends on whether the restore guard from the earlier
-            // visit to VW1 outlived the focus handoff of the switch to VW0.
-            let x = window_x(world, 2);
-            assert!(
-                (0..=TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH).contains(&x),
-                "the workspace restore must show all of the window it was activated for, \
-                 but it sits at x={x}"
+            assert_eq!(
+                window_x(world, 2),
+                0,
+                "the workspace restore must show all of the window it was activated for"
             );
         })
         .run(commands);
