@@ -247,7 +247,7 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
     let primary = NSButton(title: "Open System Settings", target: nil, action: nil)
     var tile: BuildTile!
     let hint = NSTextField(wrappingLabelWithString: "")
-    static let dragHint = "If dragging doesn’t work, use + in System Settings with the copied path. This helper doesn’t grant access or start Microfish."
+    static let dragHint = "If dragging doesn’t work, use + in System Settings, press ⇧⌘G and paste the copied path. This helper doesn’t grant access or start Microfish."
     static let chooseHint = "Choose the build that needs access. This helper doesn’t grant access or start Microfish."
     var state: BuildState = .none
     private var copyResetTimer: Timer?

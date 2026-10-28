@@ -196,7 +196,9 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
         var next = saved
         // Unapplied edits survive closing the window and restarting the helper.
         if let data = try? Data(contentsOf: pendingURL), let pending = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            for f in SettingsPrefs.fields { if let v = pending[f.key] { f.read(&next, v) } }
+            for f in SettingsPrefs.fields where !Self.perEntry.contains(f.key) { if let v = pending[f.key] { f.read(&next, v) } }
+            for (id, v) in pending["shortcuts.changes"] as? [String: Any] ?? [:] where next.shortcuts[id] != nil { next.shortcuts[id] = v as? String ?? "" }
+            for (k, v) in pending["tabAliases.changes"] as? [String: Any] ?? [:] { next.tabAliases[k] = v as? String }
         }
         restoredDraft = next != saved
         invalid = [:]; draft = next; revision += 1
@@ -238,7 +240,8 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
     var canRevert: Bool { (isDirty || !invalid.isEmpty) && phase != .applying && recordingID == nil }
 
     private func draftChanged(from old: SettingsPrefs) {
-        if case .failed = phase {} else if phase != .applying, isDirty { phase = .idle }
+        // Edits never clear the outcome of the last Apply (failed, waiting, rejected): it stays
+        // visible until the next Apply or Revert.
         if recordingID == nil { recordingNote = nil }
         persist()
         onDraftChanged?()
@@ -247,7 +250,11 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
     private func persist() {
         persistWork?.cancel()
         let changed = draft.changedKeys(from: saved), snapshot = draft, url = pendingURL
-        let payload = Dictionary(uniqueKeysWithValues: SettingsPrefs.fields.filter { changed.contains($0.key) }.map { ($0.key, $0.write(snapshot)) })
+        var payload = Dictionary(uniqueKeysWithValues: SettingsPrefs.fields.filter { changed.contains($0.key) && !Self.perEntry.contains($0.key) }.map { ($0.key, $0.write(snapshot)) })
+        // Shortcuts and tab titles are stored as per-entry changes (null = removed), so restoring a
+        // draft later never reverts entries changed elsewhere or hides newly added actions.
+        if changed.contains("shortcuts") { payload["shortcuts.changes"] = Self.diff(saved.shortcuts, snapshot.shortcuts) }
+        if changed.contains("tabAliases") { payload["tabAliases.changes"] = Self.diff(saved.tabAliases, snapshot.tabAliases) }
         let work = DispatchWorkItem {
             if payload.isEmpty { try? FileManager.default.removeItem(at: url); return }
             try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -256,6 +263,12 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
         persistWork = work
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.3, execute: work)
     }
+    nonisolated static let perEntry: Set<String> = ["shortcuts", "tabAliases"]
+    nonisolated static func diff(_ old: [String: String], _ new: [String: String]) -> [String: Any] {
+        var out: [String: Any] = [:]
+        for key in Set(old.keys).union(new.keys) where old[key] != new[key] { out[key] = new[key] ?? NSNull() }
+        return out
+    }
     func revert() {
         guard canRevert else { return }
         invalid = [:]; draft = saved; revision += 1; restoredDraft = false; recordingNote = nil
@@ -263,6 +276,7 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
     }
     func apply() {
         guard canApply else { return }
+        recordingNote = nil
         var out = raw
         for f in SettingsPrefs.fields where !f.same(draft, saved) { out[f.key] = f.write(draft) }
         let submitted = draft, root = rootURL
@@ -510,6 +524,7 @@ final class SettingsWindow: NSWindow {
         let paneHeight = height(for: pane, next)
         var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: NSSize(width: Self.width, height: paneHeight + footerHeight)))
         frame.origin = NSPoint(x: window.frame.minX, y: window.frame.maxY - frame.height)
+        frame = Self.keepOnScreen(frame, window)
         self.pane = pane; store.currentPane = pane; window.isDocumentEdited = store.isDirty
         window.title = pane.title
         window.toolbar?.selectedItemIdentifier = NSToolbarItem.Identifier(pane.rawValue)
@@ -551,6 +566,7 @@ final class SettingsWindow: NSWindow {
         guard abs(paneHeight - view.frame.height) > 1 else { return }
         var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: NSSize(width: Self.width, height: paneHeight + footerHeight)))
         frame.origin = NSPoint(x: window.frame.minX, y: window.frame.maxY - frame.height)
+        frame = Self.keepOnScreen(frame, window)
         let growing = paneHeight > view.frame.height
         let pin = { view.frame = NSRect(x: 0, y: (window.contentView?.bounds.height ?? 0) - paneHeight, width: Self.width, height: paneHeight) }
         if growing { view.frame = NSRect(x: 0, y: view.frame.maxY - paneHeight, width: Self.width, height: paneHeight) }
@@ -560,6 +576,11 @@ final class SettingsWindow: NSWindow {
                 window.animator().setFrame(frame, display: true)
             }, completionHandler: { MainActor.assumeIsolated { pin() } })
         } else { window.setFrame(frame, display: window.isVisible); pin() }
+    }
+    /// Growing from the top edge must not push Apply under the Dock: lift the window if it would.
+    private static func keepOnScreen(_ frame: NSRect, _ window: NSWindow) -> NSRect {
+        guard let visible = window.screen?.visibleFrame, frame.minY < visible.minY else { return frame }
+        var f = frame; f.origin.y = min(visible.minY, visible.maxY - f.height); return f
     }
     /// Builds the other panes while idle so the first visit to one doesn't stall on SwiftUI setup.
     private func warmPanes() {
@@ -625,7 +646,9 @@ final class SettingsWindow: NSWindow {
         }
         // "Quit Microfish" is nil-targeted to the navigator's full, clean quit (engine and helper
         // together); AppKit disables it until the app delegate implements quitMicrofish:.
-        menu("Microfish", [item("About Microfish", #selector(menuAbout), "", target: self), .separator(), item("Settings…", #selector(menuShow), ",", target: self), .separator(), item("Hide Microfish", #selector(NSApplication.hide(_:)), "h"), item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]), item("Show All", #selector(NSApplication.unhideAllApplications(_:)), ""), .separator(), item("Quit Microfish", Selector(("quitMicrofish:")), "q")])
+        let quit = Selector(("quitMicrofish:"))
+        let quitItems: [NSMenuItem] = (NSApp.delegate as AnyObject?)?.responds(to: quit) == true ? [.separator(), item("Quit Microfish", quit, "q")] : []
+        menu("Microfish", [item("About Microfish", #selector(menuAbout), "", target: self), .separator(), item("Settings…", #selector(menuShow), ",", target: self), .separator(), item("Hide Microfish", #selector(NSApplication.hide(_:)), "h"), item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]), item("Show All", #selector(NSApplication.unhideAllApplications(_:)), "")] + quitItems)
         menu("Edit", [item("Undo", Selector(("undo:")), "z"), item("Redo", Selector(("redo:")), "z", [.command, .shift]), .separator(), item("Cut", #selector(NSText.cut(_:)), "x"), item("Copy", #selector(NSText.copy(_:)), "c"), item("Paste", #selector(NSText.paste(_:)), "v"), item("Select All", #selector(NSText.selectAll(_:)), "a"), .separator(), item("Find Shortcut…", #selector(menuFind), "f", target: self)])
         menu("Window", [item("Minimize", #selector(NSWindow.performMiniaturize(_:)), "m"), item("Close", #selector(NSWindow.performClose(_:)), "w")])
         NSApp.mainMenu = main
@@ -673,8 +696,8 @@ final class SettingsWindow: NSWindow {
             }
         }
         recorder.didStart = { [weak self] in self?.store.recordingStarted = true; SettingsStore.post("Recording. Press the new shortcut.") }
-        recorder.didReject = { [weak self] in
-            self?.store.recordingNote = "Include ⌃, ⌥ or ⌘ in the shortcut"
+        recorder.didReject = { [weak self] unsupported in
+            self?.store.recordingNote = unsupported ? "That key can’t be used in a Microfish shortcut" : "Include ⌃, ⌥ or ⌘ in the shortcut"
             NSSound.beep()
         }
         recorder.didFinish = { [weak self] chord, error in
@@ -792,7 +815,7 @@ struct FooterBar: View {
     private var bar: some View {
         HStack(spacing: 8) {
             if showsResetAll {
-                Button("Reset All") { store.draft.shortcuts = store.defaults }
+                Button("Reset All Shortcuts") { store.draft.shortcuts = store.defaults }
                     .buttonStyle(.link).foregroundStyle(settingsAccent)
                     .disabled(store.draft.shortcuts == store.defaults || store.recordingID != nil)
                     .help("Restore every shortcut to its default")
@@ -819,16 +842,16 @@ struct FooterBar: View {
             if let note = store.recordingNote { return (note, .orange, false) }
             return store.recordingStarted ? ("Recording a shortcut · Esc cancels · Delete clears", settingsAccent, false) : ("Pausing Microfish shortcuts…", .secondary, true)
         }
+        if case .rejected(let message) = store.phase { return ("Engine rejected the change and kept its previous settings · " + message, .red, false) }
+        if case .failed(let message) = store.phase { return ("Couldn’t apply · " + message, .red, false) }
         if let note = store.recordingNote { return (note, .orange, false) }
         if store.conflictCount > 0 { return ("\(store.conflictCount) shortcut conflict\(store.conflictCount == 1 ? "" : "s") to resolve before applying", .red, false) }
-        if let message = store.invalid.sorted(by: { $0.key < $1.key }).first?.value { return (message, .red, false) }
-        if case .failed(let message) = store.phase { return ("Couldn’t apply · " + message, .red, false) }
+        if let message = SettingsPrefs.fields.compactMap({ store.invalid[$0.key] }).first ?? store.invalid.values.sorted().first { return (message, .red, false) }
         if store.isDirty { return (store.restoredDraft ? "Unapplied changes from earlier" : "Unapplied changes", settingsAccent, false) }
         switch store.phase {
         case .waiting: return ("Applied · waiting for engine", .orange, false)
         case .confirmed: return (store.applyNote.map { "Applied · " + $0 } ?? "Applied · engine confirmed", store.applyNote == nil ? .green : .orange, false)
         case .unconfirmed: return ("Saved · engine hasn’t reloaded yet", .orange, false)
-        case .rejected(let message): return ("Saved, but the engine kept its old settings · " + message, .red, false)
         default: return ("Applied", .secondary, false)
         }
     }
@@ -836,7 +859,9 @@ struct FooterBar: View {
         let (text, color, busy) = state
         HStack(spacing: 6) {
             if busy { ProgressView().controlSize(.small) } else { Circle().fill(color).frame(width: 7, height: 7) }
-            Text(text).font(.callout).foregroundStyle(color == .red ? Color.red : .secondary).lineLimit(1).truncationMode(.tail)
+            Text(text).font(.callout).foregroundStyle(color == .red ? Color.red : .secondary)
+                .lineLimit(color == .red ? 2 : 1).truncationMode(.tail).fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
                 .help(text)
             if store.conflictCount > 0 && store.recordingID == nil && store.phase != .applying {
                 Button("Show") { if pane != .shortcuts { store.openPane?(.shortcuts) }; store.revealConflict += 1 }
@@ -852,11 +877,12 @@ struct FooterBar: View {
 /// A label with an optional secondary line beneath it, the grouped-form idiom for hints and ranges.
 struct HintLabel: View {
     let title: String; var hint: String?
+    @Environment(\.isEnabled) private var isEnabled
     init(_ title: String, _ hint: String? = nil) { self.title = title; self.hint = hint }
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(title)
-            if let hint { Text(hint).font(.caption).foregroundStyle(.secondary) }
+            Text(title).foregroundStyle(isEnabled ? .primary : .secondary)
+            if let hint { Text(hint).font(.caption).foregroundStyle(isEnabled ? .secondary : .tertiary).lineLimit(2).truncationMode(.middle) }
         }
     }
 }
@@ -867,6 +893,9 @@ struct NumberField: View {
     let value: Binding<Double>
     var whole = false
     @State private var text = ""
+    /// Red only once the field is left or Return is pressed, so "0" on the way to "0.6" doesn't flash.
+    @State private var showError = false
+    @FocusState private var focused: Bool
     private var range: ClosedRange<Double> { SettingsPrefs.ranges[key] ?? -Double.greatestFiniteMagnitude...Double.greatestFiniteMagnitude }
     static func format(_ v: Double) -> String { v.rounded() == v && abs(v) < 1e9 ? String(Int(v)) : String(v) }
     var body: some View {
@@ -880,14 +909,19 @@ struct NumberField: View {
                     .accessibilityLabel(title + (unit.isEmpty ? "" : ", in " + (unit == "s" ? "seconds" : "points")))
                     .accessibilityHint(hint ?? "")
                     .accessibilityValue(store.invalid[key].map { text + ", invalid. " + $0 } ?? text)
-                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(store.invalid[key] != nil ? Color.red : .clear, lineWidth: 1.5).allowsHitTesting(false))
+                    .focused($focused)
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(showError && store.invalid[key] != nil ? Color.red : .clear, lineWidth: 1.5).allowsHitTesting(false))
+                    .onSubmit { showError = store.invalid[key] != nil }
                     .onChange(of: text) { _, new in commit(new) }
                 Text(unit).foregroundStyle(.secondary).frame(minWidth: 14, alignment: .leading).accessibilityHidden(true)
             }
         } label: { HintLabel(title, hint) }
-        .disabled(!store.draft.rowsEnabled)
         .onAppear { text = Self.format(value.wrappedValue) }
         .onChange(of: store.revision) { _, _ in text = Self.format(value.wrappedValue) }
+        .onChange(of: focused) { _, now in if !now { showError = store.invalid[key] != nil } }
+        // Leaving the pane with a half-typed value returns the field to its last good value, so no
+        // error is left behind where it can't be seen.
+        .onDisappear { if store.invalid[key] != nil { store.invalid[key] = nil; text = Self.format(value.wrappedValue); showError = false } }
     }
     private func commit(_ new: String) {
         let trimmed = new.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")
@@ -895,7 +929,7 @@ struct NumberField: View {
         guard let n = Double(trimmed), n.isFinite else { store.invalid[key] = "\(title) needs a number from \(lo) to \(hi)"; return }
         guard range.contains(n) else { store.invalid[key] = "\(title) must be \(lo)–\(hi)\(unit.isEmpty ? "" : " " + unit)"; return }
         guard !whole || n.rounded() == n else { store.invalid[key] = "\(title) must be a whole number"; return }
-        store.invalid[key] = nil
+        store.invalid[key] = nil; showError = false
         if value.wrappedValue != n { value.wrappedValue = n }
     }
 }
@@ -991,6 +1025,7 @@ struct RowsPane: View {
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(spoken.isEmpty ? "Not set" : spoken + (suffix.map { ", " + $0 } ?? ""))
         } label: { HintLabel(title, hint) }
+        .disabled(!store.draft.rowsEnabled)
     }
     var body: some View {
         Form {
@@ -1069,7 +1104,8 @@ struct ShortcutSlot: View {
         .buttonStyle(.bordered)
         .controlSize(.small)
         .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(recording ? AnyShapeStyle(.tint) : AnyShapeStyle(conflicted ? Color.red : .clear), lineWidth: 1.5).allowsHitTesting(false))
-        .disabled(store.phase == .applying || (store.recordingID != nil && !recording))
+        // Clicking another slot while recording switches the target, as in System Settings.
+        .disabled(store.phase == .applying)
         .help(helpText)
         .accessibilityLabel(name)
         .accessibilityValue(valueText)
@@ -1418,7 +1454,8 @@ struct RulesPane: View {
     /// Menu items don't truncate on their own; keep long document titles to a readable middle cut.
     static func menuTitle(_ w: LiveWindowEntry) -> String {
         let title = w.title.isEmpty ? "Untitled" : w.title
-        let cut = title.count > 60 ? String(title.prefix(34)) + "…" + String(title.suffix(20)) : title
+        let room = max(16, 46 - w.app.count)
+        let cut = title.count > room ? String(title.prefix(room * 2 / 3)) + "…" + String(title.suffix(room / 3)) : title
         return w.app + " — " + cut
     }
     static func describe(_ pattern: String) -> String {
@@ -1451,7 +1488,8 @@ struct RulesPane: View {
                 .disabled(selected == nil)
                 LabeledContent("Always float") {
                     HStack(spacing: 6) {
-                        Button("This window") { if let w = selected { add(w, exact: true) } }.disabled(selected.map { $0.bundle.isEmpty || hasRule($0, exact: true) } ?? true)
+                        Button("This window") { if let w = selected { add(w, exact: true) } }
+                            .help("Floats this app’s windows with exactly this title").disabled(selected.map { $0.bundle.isEmpty || hasRule($0, exact: true) } ?? true)
                         Button("Whole app") { if let w = selected { add(w, exact: false) } }.disabled(selected.map { $0.bundle.isEmpty || hasRule($0, exact: false) } ?? true)
                     }
                 }
