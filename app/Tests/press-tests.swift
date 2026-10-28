@@ -164,14 +164,16 @@ do {
  // 7. Bars do not rebuild while pressed; stale-press recovery still works; the selection catches up on release.
  do {
   let r = Rig(); r.bars.update(snap(3, focused: 7000), windows: live(3, wide))
-  let before = r.bars.stripView(column: 1)!
+  // The strip and its cards are permanent (view reuse), so a rebuild shows as the selected face moving between cards.
+  func selectedTab() -> Int? { r.cards().first { card in card.subviews.contains { ($0 as? FolderTabFace)?.selected == true } }?.entryID }
+  let before = r.cards()
   let c = use(r.card(7002))
   c.mouseDown(with: ev(.leftMouseDown, mid))
   r.bars.update(snap(3, focused: 7002), windows: live(3, wide))   // the engine answered the focus
-  ok(r.bars.stripView(column: 1) === before, "no rebuild while the press is held")
+  ok(selectedTab() == 7000 && zip(before, r.cards()).allSatisfy { $0 === $1 }, "no rebuild while the press is held")
   c.mouseUp(with: ev(.leftMouseUp, mid))
   r.bars.update(snap(3, focused: 7002), windows: live(3, wide))
-  ok(r.bars.stripView(column: 1) !== before, "rebuilt after release with the new selection")
+  ok(selectedTab() == 7002, "rebuilt after release with the new selection")
   ok(r.focused == [7002], "still exactly one focus")
   // Lost mouse-up: stale recovery unwinds the press and a drag; the next press is clean.
   let r2 = Rig(); r2.bars.update(snap(3), windows: live(3, wide))

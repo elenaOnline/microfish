@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Performance-team headless runner: builds src/ + tests into a scratch dir and runs them. No windows.
-Usage: tests/run.py [--scratch DIR] [suite ...]   suites: hud drag spatial team live press queue (default: all)
+Usage: tests/run.py [--scratch DIR] [suite ...]   suites: hud drag spatial team live press queue leak pixel (default: all)
 The hud/drag/spatial suites are the Minimap team's existing ones (read from the main tree's work/)."""
 from pathlib import Path
 import argparse, shutil, subprocess, sys
@@ -34,7 +34,13 @@ def suite_team():
     return build('team', (src/'main.swift').read_text()+'\n'+prelude+body+'\nprint("Minimap team checks passed:", teamChecks)\n')
 def suite_press(): return build('press', (src/'main.swift').read_text()+'\n'+(here/'press-tests.swift').read_text())
 def suite_queue(): return build('queue', (src/'main.swift').read_text()+'\n'+(here/'queue-tests.swift').read_text())
-SUITES = {'hud': suite_hud, 'drag': suite_drag, 'spatial': suite_spatial, 'team': suite_team, 'live': suite_live, 'press': suite_press, 'queue': suite_queue}
+def suite_leak():
+    # Flat NSKeyValueDependency count over view-rebuild churn (tests/leak-churn.py); a stand-in "binary" for the loop below.
+    return here/'leak-churn.py'
+def suite_pixel(): return here/'pixel-diff.py'
+SUITES = {'hud': suite_hud, 'drag': suite_drag, 'spatial': suite_spatial, 'team': suite_team, 'live': suite_live, 'press': suite_press, 'queue': suite_queue, 'leak': suite_leak, 'pixel': suite_pixel}
 for n in (a.suites or list(SUITES)):
-    r = subprocess.run([str(SUITES[n]())], cwd=scratch); print(f'== suite {n}: exit {r.returncode}')
+    exe = SUITES[n]()
+    cmd = [sys.executable, str(exe), '--src', str(src)] if n in ('leak', 'pixel') else [str(exe)]
+    r = subprocess.run(cmd, cwd=scratch); print(f'== suite {n}: exit {r.returncode}')
     if r.returncode: sys.exit(r.returncode)
