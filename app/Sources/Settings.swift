@@ -81,14 +81,14 @@ enum ShortcutLayout {
                                         r(rowsEnabled ? "Row up" : "Focus up in stack", "row_north", "focus_k"), r(rowsEnabled ? "Row down" : "Focus down in stack", "row_south", "focus_j"),
                                         r("Previous view", "view_back"), r("Next display", "display")]),
             Group(id: "Arrange", rows: [r("Swap left", "swap_leftarrow", "swap_h"), r("Swap right", "swap_rightarrow", "swap_l"), r("Swap up in stack", "swap_k"), r("Swap down in stack", "swap_j"),
-                                       r(rowsEnabled ? "Move window to row above · below" : "Swap up · down in stack", "move_row_north", "move_row_south"),
-                                       r("Move column to row above · below", "move_column_north", "move_column_south"),
-                                       r("Center window", "center"), r("Full width", "fullwidth"), r("Float or tile", "float"), r("Undo last layout move", "undo_move")]),
-            Group(id: "Size", rows: [r("Grow · shrink width", "grow", "shrink"), r("Grow · shrink height", "grow_height", "shrink_height"), r("Equalize heights", "equalize")]),
+                                       r(rowsEnabled ? "Move window to row above or below" : "Swap up or down in stack", "move_row_north", "move_row_south"),
+                                       r("Move column to row above or below", "move_column_north", "move_column_south"),
+                                       r("Center window", "center"), r("Full width", "fullwidth"), r("Float or tile", "float"), r("Undo last move", "undo_move")]),
+            Group(id: "Size", rows: [r("Make wider or narrower", "grow", "shrink"), r("Make taller or shorter", "grow_height", "shrink_height"), r("Equalize heights", "equalize")]),
             Group(id: "Stacks & Tabs", rows: [r("Stack into left column", "stack_left"), r("Stack into right column", "stack_right"), r("Unstack", "unstack"), r("Show as tabs", "tabs")]),
-            Group(id: "Columns", rows: (1...9).map { r("Column \($0) · focus, swap", "focus_column_\($0)", "swap_column_\($0)") }),
-            Group(id: "Views", rows: (0...9).map { r("View \($0) · recall, replace", "view_pin_\($0)", "view_save_\($0)") }),
-            Group(id: "Microfish", rows: [r("Quit window manager", "quit")]),
+            Group(id: "Columns", rows: (1...9).map { r("Column \($0): focus or swap", "focus_column_\($0)", "swap_column_\($0)") }),
+            Group(id: "Views", rows: (0...9).map { r("View \($0): go to or replace", "view_pin_\($0)", "view_save_\($0)") }),
+            Group(id: "Microfish", rows: [r("Quit Microfish", "quit")]),
         ]
         let known = Set(catalog.map(\.id))
         layout = layout.map { Group(id: $0.id, rows: $0.rows.compactMap { row in let ids = row.ids.filter(known.contains); return ids.isEmpty ? nil : Row(id: row.id, title: row.title, ids: ids) }) }
@@ -157,6 +157,24 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
     /// A value mid-typing ("0" on the way to "0.6") blocks Apply but stays quiet.
     var flagged: Set<String> = []
     var phase: Phase = .idle { didSet { if phase != oldValue { announce() } } }
+    /// True from a real Apply being confirmed until the confirmation is acknowledged (a few seconds,
+    /// the next edit, or the window being reopened). A confirmation found at open is not shown:
+    /// a window that nothing was applied in has nothing to confirm.
+    var justApplied = false
+    @ObservationIgnored private var appliedClear: DispatchWorkItem?
+    func acknowledgeOutcome() {
+        appliedClear?.cancel(); justApplied = false
+        if phase != .waiting && phase != .applying { applyNote = nil }
+    }
+    private func confirmApplied() {
+        justApplied = true; phase = .confirmed
+        appliedClear?.cancel()
+        // A note (some windows couldn’t be floated) stays until acknowledged; a plain "Applied" fades.
+        guard applyNote == nil else { return }
+        let work = DispatchWorkItem { [weak self] in self?.justApplied = false }
+        appliedClear = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: work)
+    }
     var recordingID: String? { didSet { if recordingID == nil { recordingStarted = false } } }
     /// True once the engine has paused its shortcuts and keys are actually being captured.
     var recordingStarted = false
@@ -249,6 +267,7 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
         // Edits keep the outcome of the last Apply visible (waiting, rejected) until the next Apply,
         // Revert or Dismiss; a failed Apply whose edits have all been undone has nothing left to say.
         if case .failed = phase, !isDirty { phase = .idle }
+        justApplied = false
         if recordingID == nil { recordingNote = nil }
         persist()
         onDraftChanged?()
@@ -288,7 +307,7 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
         for f in SettingsPrefs.fields where !f.same(draft, saved) { out[f.key] = f.write(draft) }
         let submitted = draft, root = rootURL
         let logOffset = SettingsController.engineLogURL(root).flatMap { (try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? NSNumber)?.uint64Value }
-        phase = .applying
+        phase = .applying; justApplied = false
         DispatchQueue.global(qos: .userInitiated).async {
             let result: Result<String, Error> = Result {
                 let directory = root.appendingPathComponent("work/settings-drafts")
@@ -298,13 +317,14 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
                 defer { try? FileManager.default.removeItem(at: path) }
                 let (status, data) = try SettingsController.run("/usr/bin/python3", [root.appendingPathComponent("scripts/apply-settings.py").path, path.path])
                 let message = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-                guard status == 0 else { throw NSError(domain: "Settings", code: Int(status), userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "apply-settings exited with \(status)" : message]) }
+                if status != 0 && message.isEmpty { NSLog("apply-settings exited with %d", status) }
+                guard status == 0 else { throw NSError(domain: "Settings", code: Int(status), userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "Something went wrong while saving." : message]) }
                 return message
             }
             DispatchQueue.main.async {
                 switch result {
                 case .success(let message):
-                    self.applyNote = message.contains("could not be applied") ? "Some open windows couldn’t be floated; new ones follow your rules" : nil
+                    self.applyNote = message.contains("could not be applied") ? "Some open windows couldn’t be floated. New ones follow your rules." : nil
                     self.raw = out; self.saved = submitted; self.restoredDraft = false
                     // Edits made while applying stay pending; anything else has just been saved.
                     self.persist()
@@ -328,7 +348,7 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
                 DispatchQueue.main.async {
                     guard let self, self.phase == .waiting else { timer.invalidate(); return }
                     switch verdict {
-                    case .some(.success): self.phase = .confirmed; timer.invalidate()
+                    case .some(.success): self.confirmApplied(); timer.invalidate()
                     case .some(.failure(let error)): self.phase = .rejected(error.localizedDescription); timer.invalidate()
                     case .none: if Date().timeIntervalSince(started) > 10 { self.phase = .unconfirmed; timer.invalidate() }
                     }
@@ -349,7 +369,7 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
         let iso = ISO8601DateFormatter()  // engine stamps carry microseconds; whole seconds are enough here
         for line in text.split(separator: "\n").reversed() where line.contains("Reloading Lua script") || line.contains("Reloaded Lua script") {
             guard let stamp = iso.date(from: String(line.prefix(19)) + "Z"), stamp >= written.addingTimeInterval(-1) else { return .idle }
-            return line.contains("ERROR") ? .rejected("check the engine log") : .confirmed
+            return line.contains("ERROR") ? .rejected("") : .confirmed
         }
         return .idle
     }
@@ -380,14 +400,35 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
         }
     }
     func label(for id: String) -> String { catalog.first { $0.id == id }.map(ShortcutLayout.actionName) ?? id }
-    private func announce() {
+    /// What the footer says about the last Apply, one string for the footer and for VoiceOver.
+    /// Nothing at rest: a window nothing was applied in has nothing to report.
+    var outcomeText: String? {
         switch phase {
-        case .confirmed: Self.post("Settings applied")
-        case .rejected: Self.post("Microfish kept its previous settings")
-        case .failed(let message): Self.post("Couldn’t apply settings. " + message)
-        case .unconfirmed: Self.post("Settings saved; Microfish hasn’t reloaded yet")
-        default: break
+        case .confirmed: return justApplied ? "Applied" + (applyNote.map { ". " + $0 } ?? "") : nil
+        case .unconfirmed: return "Saved. Microfish hasn’t loaded the changes yet."
+        case .rejected: return "Couldn’t apply these settings. Microfish kept the previous ones."
+        case .failed(let message): return Self.failureText(message)
+        default: return nil
         }
+    }
+    /// The raw text behind a failed or rejected Apply, for the tooltip only.
+    var outcomeDetail: String? {
+        switch phase {
+        case .rejected(let message): return message.isEmpty ? "Open the log for details." : message
+        case .failed(let message): return message
+        default: return nil
+        }
+    }
+    /// Plain wording for the messages apply-settings.py can produce; anything else gets the generic line.
+    nonisolated static func failureText(_ message: String) -> String {
+        let generic = "Couldn’t apply these settings. Microfish kept the previous ones."
+        if message.contains("keep the manager running") { return "Couldn’t reduce rows. Microfish isn’t responding; open it and try again." }
+        if message.contains("retained row") { return "Couldn’t reduce rows. Switch to a row that will remain first." }
+        if message.contains("Move windows out of higher rows") { return "Couldn’t reduce rows. Move windows out of the higher rows first." }
+        return generic
+    }
+    private func announce() {
+        if let text = outcomeText { Self.post(text) }
     }
     static func post(_ text: String) {
         NSAccessibility.post(element: NSApp as Any, notification: .announcementRequested, userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.high.rawValue])
@@ -442,7 +483,7 @@ final class SettingsWindow: NSWindow {
     private let recorder = ShortcutRecorder()
     private let recordingQueue = DispatchQueue(label: "local.paneru.shortcut-recording")
     fileprivate weak var searchField: NSSearchField?
-    private static let paneKey = "MicrofishSettingsPane", originKey = "MicrofishSettingsTopLeft"
+    private static let paneKey = "MicrofishSettingsPane", originKey = "MicrofishSettingsWindowTopLeft"
     static let width: CGFloat = 600
 
     nonisolated init(rootURL: URL) {
@@ -457,6 +498,9 @@ final class SettingsWindow: NSWindow {
 
     nonisolated func show() { MainActor.assumeIsolated { present() } }
     private func present() {
+        // Remember who had the keyboard, so closing Settings can hand it back (see windowWillClose).
+        if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != ProcessInfo.processInfo.processIdentifier { previousApp = front }
+        store.acknowledgeOutcome()
         enterAppMode()
         installMainMenu()
         if window == nil { build() }
@@ -480,21 +524,40 @@ final class SettingsWindow: NSWindow {
         toolbar.allowsDisplayModeCustomization = false
         w.toolbar = toolbar
         window = w
-        let saved = Self.remembered(Self.paneKey).flatMap(SettingsPane.init(rawValue:)) ?? .behavior
-        select(saved, animate: false)
-        if let text = Self.remembered(Self.originKey) {
+        // Read what was remembered before anything can write it: selecting a pane (and any move while
+        // the window is being sized) would otherwise overwrite the stored origin with the unplaced
+        // window's. Nothing is remembered until the window has been put where it belongs.
+        let savedPane = Self.remembered(Self.paneKey).flatMap(SettingsPane.init(rawValue:)) ?? .behavior
+        let savedOrigin = Self.remembered(Self.originKey)
+        placed = false
+        select(savedPane, animate: false)
+        if let text = savedOrigin {
             let p = NSPointFromString(text)
             var frame = w.frame; frame.origin = NSPoint(x: p.x, y: p.y - frame.height)
             if NSScreen.screens.contains(where: { $0.visibleFrame.insetBy(dx: -1, dy: -1).contains(NSPoint(x: frame.midX, y: frame.maxY - 10)) }) { w.setFrame(w.constrainFrameRect(frame, to: nil), display: false) } else { w.center() }
         } else { w.center() }
         w.contentView?.layoutSubtreeIfNeeded()
+        placed = true
+    }
+    /// False while the window is being built; the origin is only remembered once it has been placed.
+    private var placed = false
+    /// The app that was frontmost when Settings was presented.
+    private var previousApp: NSRunningApplication?
+    /// The app to hand the keyboard back to when Settings closes: only while this helper is still the
+    /// active app (if the user already switched elsewhere, leave them there), and never itself.
+    nonisolated static func appToRestore(previous: NSRunningApplication?, helperActive: Bool, helperPID: pid_t) -> NSRunningApplication? {
+        guard helperActive, let previous, !previous.isTerminated, previous.processIdentifier != helperPID else { return nil }
+        return previous
     }
 
     /// The helper's defaults domain is its executable name until the build embeds an Info.plist, then
     /// its bundle identifier; read the old domain once so the window keeps its place across that change.
     private static func remembered(_ key: String) -> String? {
-        UserDefaults.standard.string(forKey: key) ?? UserDefaults(suiteName: "MicrofishNavigator")?.string(forKey: key)
+        UserDefaults.standard.string(forKey: key) ?? legacyDefaultsSuite.flatMap { UserDefaults(suiteName: $0)?.string(forKey: key) }
     }
+    // The origin key is new on purpose: every value stored under the old name ("MicrofishSettingsTopLeft")
+    // was the unplaced window's {0, height}, written by build() before it read the real one.
+    nonisolated(unsafe) static var legacyDefaultsSuite: String? = "MicrofishNavigator"
 
     // MARK: Panes
     private func host(for pane: SettingsPane) -> NSView {
@@ -613,7 +676,7 @@ final class SettingsWindow: NSWindow {
         }
     }
     private func rememberOrigin() {
-        guard let window else { return }
+        guard placed, let window else { return }
         UserDefaults.standard.set(NSStringFromPoint(NSPoint(x: window.frame.minX, y: window.frame.maxY)), forKey: Self.originKey)
     }
     func windowDidMove(_ notification: Notification) { rememberOrigin() }
@@ -622,7 +685,15 @@ final class SettingsWindow: NSWindow {
         // The color panel belongs to this window's outline well; don't leave it floating alone.
         if NSColorPanel.sharedColorPanelExists { NSColorPanel.shared.orderOut(nil) }
         // After the close animation, so the window doesn't vanish mid-close with the Dock tile.
-        DispatchQueue.main.async { [weak self] in self?.leaveAppMode() }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            // Another visible window of ours (About) keeps the app in front.
+            let others = NSApp.windows.contains { $0 !== self.window && $0.isVisible && $0.canBecomeKey }
+            let target = others ? nil : Self.appToRestore(previous: self.previousApp, helperActive: NSApp.isActive, helperPID: ProcessInfo.processInfo.processIdentifier)
+            self.leaveAppMode()
+            self.previousApp = nil
+            if let target { NSApp.yieldActivation(to: target); target.activate() }
+        }
     }
     func windowDidBecomeKey(_ notification: Notification) { store.reloadFromDisk() }
 
@@ -642,8 +713,9 @@ final class SettingsWindow: NSWindow {
 
     // MARK: Menu
     /// The helper is an accessory app with no menu of its own; while Settings is frontmost it needs
-    /// the standard ones so ⌘, ⌘W ⌘M ⌘F and text editing (⌘Z ⌘X ⌘C ⌘V ⌘A) behave. No Quit item:
-    /// the helper owns tabs and the minimap, and launchd does not restart it.
+    /// the standard ones so ⌘, ⌘W ⌘M ⌘F and text editing (⌘Z ⌘X ⌘C ⌘V ⌘A) behave. No Hide, Hide Others or
+    /// Show All: this app's overlays are the window manager's tab bars and minimap, so hiding it (or
+    /// every other app) would hide the user's whole workspace. Quit appears once the navigator can do a full quit.
     private func installMainMenu() {
         guard NSApp.mainMenu == nil || NSApp.mainMenu?.identifier?.rawValue == "MicrofishSettingsMenu" else { return }
         let main = NSMenu(); main.identifier = .init("MicrofishSettingsMenu")
@@ -655,10 +727,11 @@ final class SettingsWindow: NSWindow {
         // together); AppKit disables it until the app delegate implements quitMicrofish:.
         let quit = Selector(("quitMicrofish:"))
         let quitItems: [NSMenuItem] = (NSApp.delegate as AnyObject?)?.responds(to: quit) == true ? [.separator(), item("Quit Microfish", quit, "q")] : []
-        menu("Microfish", [item("About Microfish", #selector(menuAbout), "", target: self), .separator(), item("Settings…", #selector(menuShow), ",", target: self), .separator(), item("Hide Microfish", #selector(NSApplication.hide(_:)), "h"), item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]), item("Show All", #selector(NSApplication.unhideAllApplications(_:)), "")] + quitItems)
+        menu("Microfish", [item("About Microfish", #selector(menuAbout), "", target: self), .separator(), item("Settings…", #selector(menuShow), ",", target: self)] + quitItems)
         menu("Edit", [item("Undo", Selector(("undo:")), "z"), item("Redo", Selector(("redo:")), "z", [.command, .shift]), .separator(), item("Cut", #selector(NSText.cut(_:)), "x"), item("Copy", #selector(NSText.copy(_:)), "c"), item("Paste", #selector(NSText.paste(_:)), "v"), item("Select All", #selector(NSText.selectAll(_:)), "a"), .separator(), item("Find Shortcut…", #selector(menuFind), "f", target: self)])
         menu("Window", [item("Minimize", #selector(NSWindow.performMiniaturize(_:)), "m"), item("Close", #selector(NSWindow.performClose(_:)), "w")])
         NSApp.mainMenu = main
+        NSApp.windowsMenu = main.items.last?.submenu
     }
     @objc private func menuShow() { present() }
     @objc private func menuAbout() {
@@ -781,6 +854,7 @@ final class SettingsWindow: NSWindow {
     var testWindow: NSWindow? { if window == nil { build() }; return window }
     func testSelect(_ pane: SettingsPane) { if window == nil { build() }; select(pane, animate: false) }
     func testHost(_ pane: SettingsPane) -> NSView { host(for: pane) }
+    func testInstallMenu() { installMainMenu() }
     #endif
 }
 
@@ -829,15 +903,17 @@ struct FooterBar: View {
     }
     private var bar: some View {
         HStack(spacing: 8) {
-            if showsResetAll {
+            // The status owns the leading edge on every pane, so it never shifts sideways when the
+            // Shortcuts-only button appears; it can use two lines before anything is cut off.
+            status
+            // Not while a failed Apply's message and its links need the room.
+            if showsResetAll && !store.hasBadOutcome {
                 Button("Reset All Shortcuts") { store.draft.shortcuts = store.defaults }
                     .buttonStyle(.link).foregroundStyle(settingsAccent)
                     .disabled(store.draft.shortcuts == store.defaults || store.recordingID != nil)
                     .help("Restore every shortcut to its default")
-                Spacer()
+                    .padding(.trailing, 4)
             }
-            status
-            if !showsResetAll { Spacer() }
             Button("Revert") { store.revert() }.disabled(!store.canRevert)
                 .help("Discard unapplied changes")
             // Not the default button: Return in a field or the search box must never push a draft
@@ -849,52 +925,60 @@ struct FooterBar: View {
                 .help("Apply all changes (⌘S)")
         }
         .controlSize(.regular)
-        .padding(.horizontal, 20).padding(.vertical, 12)
+        .padding(.horizontal, 20).padding(.vertical, 10)
     }
-    private var state: (String, Color, Bool) {
-        if store.phase == .applying { return ("Applying…", .secondary, true) }
+    /// One line of footer status. `alert` text is shown in the label colour (red text on the window
+    /// background is under 4.5:1); the dot carries the colour.
+    struct Status: Equatable { var text: String; var dot: Color; var busy = false; var alert = false; var help: String? }
+    var state: Status? {
+        if store.phase == .applying { return Status(text: "Applying…", dot: .secondary, busy: true) }
         if store.recordingID != nil {
-            if let note = store.recordingNote { return (note, .orange, false) }
-            return store.recordingStarted ? ("Recording a shortcut · Esc cancels · Delete clears", settingsAccent, false) : ("Pausing Microfish shortcuts…", .secondary, true)
+            if let note = store.recordingNote { return Status(text: note, dot: .orange, alert: true) }
+            return store.recordingStarted ? Status(text: "Press the new shortcut. Esc cancels, Delete clears.", dot: settingsAccent) : Status(text: "Pausing Microfish shortcuts…", dot: .secondary, busy: true)
         }
         // What blocks Apply comes first, then what the last Apply said, then the draft.
-        if store.conflictCount > 0 { return ("\(store.conflictCount) shortcut conflict\(store.conflictCount == 1 ? "" : "s") to resolve before applying", .red, false) }
+        if store.conflictCount > 0 { return Status(text: "\(store.conflictCount) shortcut conflict\(store.conflictCount == 1 ? "" : "s") to resolve before applying", dot: .red, alert: true) }
         let shown = store.invalid.filter { store.flagged.contains($0.key) }
-        if let message = SettingsPrefs.fields.compactMap({ shown[$0.key] }).first ?? shown.values.sorted().first { return (message, .red, false) }
-        if let note = store.recordingNote { return (note, .orange, false) }
-        if case .rejected(let message) = store.phase { return ("Engine rejected the change · " + message, .red, false) }
-        if case .failed(let message) = store.phase { return ("Couldn’t apply · " + message, .red, false) }
-        if store.isDirty { return (store.restoredDraft ? "Unapplied changes from earlier" : "Unapplied changes", settingsAccent, false) }
+        if let message = SettingsPrefs.fields.compactMap({ shown[$0.key] }).first ?? shown.values.sorted().first { return Status(text: message, dot: .red, alert: true) }
+        if let note = store.recordingNote { return Status(text: note, dot: .orange, alert: true) }
+        if store.hasBadOutcome, let text = store.outcomeText { return Status(text: text, dot: .red, alert: true, help: store.outcomeDetail) }
+        if store.isDirty { return Status(text: store.restoredDraft ? "Unapplied changes from earlier" : "Unapplied changes", dot: settingsAccent) }
         switch store.phase {
-        case .waiting: return ("Applied · waiting for engine", .orange, false)
-        case .confirmed: return (store.applyNote.map { "Applied · " + $0 } ?? "Applied · engine confirmed", store.applyNote == nil ? .green : .orange, false)
-        case .unconfirmed: return ("Saved · engine hasn’t reloaded yet", .orange, false)
-        default: return ("Applied", .secondary, false)
+        case .waiting: return Status(text: "Applying…", dot: .secondary, busy: true)
+        case .confirmed: return store.outcomeText.map { Status(text: $0, dot: store.applyNote == nil ? .green : .orange) }
+        case .unconfirmed: return store.outcomeText.map { Status(text: $0, dot: .orange) }
+        default: return nil
         }
     }
     @ViewBuilder private var status: some View {
-        let (text, color, busy) = state
+        let current = state
         HStack(spacing: 6) {
-            if busy { ProgressView().controlSize(.small) } else { Circle().fill(color).frame(width: 7, height: 7) }
-            Text(text).font(.callout).foregroundStyle(color == .red ? Color.red : .secondary)
-                .lineLimit(color == .red ? 2 : 1).truncationMode(.tail).fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
-                .help(text)
-            if store.conflictCount > 0 && store.recordingID == nil && store.phase != .applying {
-                Button("Show") { if pane != .shortcuts { store.openPane?(.shortcuts) }; store.revealConflict += 1 }
-                    .buttonStyle(.link).foregroundStyle(settingsAccent).font(.callout)
-                    .accessibilityLabel("Show conflicting shortcut")
-            }
-            if store.hasBadOutcome && store.conflictCount == 0 && store.flagged.isDisjoint(with: store.invalid.keys) && store.recordingNote == nil && store.recordingID == nil {
-                if case .rejected = store.phase, let log = SettingsController.engineLogURL(store.rootURL) {
-                    Button("Open Log") { NSWorkspace.shared.open(log) }.buttonStyle(.link).foregroundStyle(settingsAccent).font(.callout)
+            if let current {
+                if current.busy { ProgressView().controlSize(.small) } else { Circle().fill(current.dot).frame(width: 7, height: 7) }
+                Text(current.text).font(.callout).foregroundStyle(current.alert ? Color.primary : Color.secondary)
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .help(current.help ?? current.text)
+                if store.conflictCount > 0 && store.recordingID == nil && store.phase != .applying {
+                    Button("Show") { if pane != .shortcuts { store.openPane?(.shortcuts) }; store.revealConflict += 1 }
+                        .buttonStyle(.link).foregroundStyle(settingsAccent).font(.callout)
+                        .accessibilityLabel("Show conflicting shortcut")
                 }
-                Button("Dismiss") { store.dismissOutcome() }.buttonStyle(.link).foregroundStyle(settingsAccent).font(.callout)
+                if store.hasBadOutcome && store.conflictCount == 0 && store.flagged.isDisjoint(with: store.invalid.keys) && store.recordingNote == nil && store.recordingID == nil {
+                    if case .rejected = store.phase, let log = SettingsController.engineLogURL(store.rootURL) {
+                        Button("Open Log") { NSWorkspace.shared.open(log) }.buttonStyle(.link).foregroundStyle(settingsAccent).font(.callout)
+                    }
+                    Button("Dismiss") { store.dismissOutcome() }.buttonStyle(.link).foregroundStyle(settingsAccent).font(.callout)
+                }
             }
         }
+        // Two lines of room in every state, so a long message never changes the bar's height or is cut.
+        .frame(maxWidth: .infinity, minHeight: Self.statusHeight, alignment: .leading)
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Status: " + text)
+        .accessibilityLabel(current.map { "Status: " + $0.text } ?? "")
+        .accessibilityHidden(current == nil)
     }
+    static let statusHeight: CGFloat = 32
 }
 
 /// A label with an optional secondary line beneath it, the grouped-form idiom for hints and ranges.
@@ -1122,7 +1206,7 @@ struct ShortcutSlot: View {
             Group {
                 if recording { Text(store.recordingStarted ? "Press keys…" : "…").foregroundStyle(.tint) }
                 else if chord.isEmpty { Text("Not set").foregroundStyle(.secondary) }
-                else { Text(Chord.display(chord)).monospacedDigit().foregroundStyle(conflicted ? Color.red : .primary) }
+                else { Text(Chord.display(chord)).monospacedDigit().foregroundStyle(Color.primary) }
             }
             .lineLimit(1)
             // One width for every state, so recording or clearing never shifts the row.
@@ -1216,7 +1300,7 @@ struct ShortcutRowView: View {
         } label: {
             VStack(alignment: .leading, spacing: 2) {
                 Text(row.title)
-                if !names.isEmpty { Text("Also used by \(others) — pick another").font(.caption).foregroundStyle(.red).lineLimit(1) }
+                if !names.isEmpty { Text("Also used by \(others). Pick another.").font(.caption).foregroundStyle(Color.primary).lineLimit(2) }
             }
         }
         .listRowBackground(blamed.isEmpty ? nil : Color.red.opacity(0.08))
@@ -1487,8 +1571,16 @@ struct RulesPane: View {
     }
     static func describe(_ pattern: String) -> String {
         if pattern == ".*" { return "All windows" }
-        if pattern.hasPrefix("^"), pattern.hasSuffix("$"), pattern.count >= 2 { return "Window titled “" + SettingsController.unescapeRegex(String(pattern.dropFirst().dropLast())) + "”" }
-        return "Titles matching " + pattern
+        if pattern.hasPrefix("^"), pattern.hasSuffix("$"), pattern.count >= 2, isLiteralTitle(String(pattern.dropFirst().dropLast())) { return "Window titled “" + SettingsController.unescapeRegex(String(pattern.dropFirst().dropLast())) + "”" }
+        return "Titles matching “" + pattern + "”"
+    }
+    /// True when every regex operator in `text` is escaped, so it names one title and nothing else.
+    nonisolated static func isLiteralTitle(_ text: String) -> Bool {
+        var escaping = false
+        for c in text {
+            if escaping { escaping = false } else if c == "\\" { escaping = true } else if ".*+?()[]{}|^$".contains(c) { return false }
+        }
+        return !escaping
     }
     var body: some View {
         Form {
