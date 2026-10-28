@@ -65,6 +65,7 @@ struct NavigatorPreferences {
  var delay = 1.3, fade = 0.22, hyperDelay = 0.2
  var tabStyle = "folder", tabHeight = 34, tabMatchAppColor = false
  var showOnHyper = true
+ var hide = "release"
  var aliases: [String:String] = [:]
  init(_ data: Data? = nil) {
   guard let data, let json = (try? JSONSerialization.jsonObject(with:data)) as? [String:Any] else { return }
@@ -74,6 +75,7 @@ struct NavigatorPreferences {
   if let value=json["minimapFade"] as? Double, value.isFinite { fade=min(5,max(0,value)) }
   if let value=json["hyperHoldDelay"] as? Double, value.isFinite { hyperDelay=min(2,max(0.05,value)) }
   if let value=json["showOnHyper"] as? Bool { showOnHyper=value }
+  if let value=json["minimapHide"] as? String, ["release","timer"].contains(value) { hide=value }
   if let value=json["tabStyle"] as? String, ["folder","folder-compact","classic","side"].contains(value) { tabStyle=value }
   if let value=json["tabHeight"] as? Int, [28,34].contains(value) { tabHeight=value }
   tabMatchAppColor=json["tabMatchAppColor"] as? Bool ?? false
@@ -162,6 +164,110 @@ struct HyperHold {
   if began == nil { began=now }
   if !revealed, now-(began ?? now)>=delay { revealed=true; return true }
   return false
+ }
+}
+
+// Other-key detection for a bare Hyper hold: the session keyDown counter is sampled
+// while the chord is down, so a tap between polls still moves it.
+struct KeyCounterWatch {
+ var base: UInt32?
+ mutating func otherKey(exact: Bool, counter: UInt32) -> Bool {
+  guard exact else { base=counter; return false }
+  if base == nil { base=counter }
+  return counter != base
+ }
+}
+struct Chord: OptionSet {
+ let rawValue: Int
+ static let control=Chord(rawValue:1), option=Chord(rawValue:2), command=Chord(rawValue:4)
+ static let hyper: Chord = [.control,.option,.command]
+ init(rawValue: Int) { self.rawValue=rawValue }
+ init(_ flags: NSEvent.ModifierFlags) {
+  var c=Chord()
+  if flags.contains(.control) { c.insert(.control) }
+  if flags.contains(.option) { c.insert(.option) }
+  if flags.contains(.command) { c.insert(.command) }
+  self=c
+ }
+}
+struct HUDStep {
+ var present: HUDPresence.Kind?
+ var alpha = 1.0
+ var orderOut = false
+ var fast = false
+}
+// Every show/hide decision for the HUD, time-injected so it runs without windows.
+// release: keyboard sessions appear revealDelay after the navigation and leave when the chord is
+// released (command-tab model). timer: appear at once and linger delay+fade. Scroll gestures are
+// always timer-style. Alpha is a pure function of time; the Navigator applies it each fast tick.
+struct HUDPresence {
+ enum Kind { case show, row, scroll }
+ static let revealDelay=0.15, releaseFade=0.12, slop=2.0
+ var mode="release", delay=1.3, fade=0.22
+ var visible=false, timer=false, forced=false, moved=false
+ var chord=Chord(), escapedChord: Chord?
+ var pending: (due: TimeInterval, kind: Kind, chord: Chord)?
+ var anchor: TimeInterval=0, releaseAt: TimeInterval?
+ var origin=CGPoint.zero
+ var fast: Bool { visible || pending != nil }
+ func held(_ mods: Chord) -> Bool { !chord.isEmpty && chord.isSubset(of:mods) }
+ mutating func present(now: TimeInterval, pointer: CGPoint, timer: Bool, chord: Chord) {
+  if !visible { origin=pointer; moved=false }
+  visible=true; self.timer=timer; self.chord=chord; anchor=now; releaseAt=nil; forced=false; pending=nil
+ }
+ mutating func hide() { visible=false; pending=nil; forced=false; releaseAt=nil; moved=false; timer=false }
+ // Returns the kind to render now, or nil (nothing yet, or a reveal is pending).
+ mutating func navigate(_ kind: Kind, chord observed: Chord, mtime: TimeInterval, now: TimeInterval, pointer: CGPoint) -> Kind? {
+  let t=kind == .scroll || mode == "timer"
+  if t || visible { present(now:now,pointer:pointer,timer:t,chord:observed.isEmpty && visible ? chord:observed); return kind }
+  guard !observed.isEmpty else { return nil }
+  let due=pending.flatMap { $0.chord.isSubset(of:observed) ? $0.due:nil } ?? min(mtime,now)+Self.revealDelay
+  pending=(due,kind,observed)
+  return nil
+ }
+ mutating func bareHoldReveal(now: TimeInterval, mods: Chord, pointer: CGPoint) -> Bool {
+  if visible { anchor=now; return false }
+  if let e=escapedChord, e.isSubset(of:mods) { return false }
+  present(now:now,pointer:pointer,timer:mode == "timer",chord:mods)
+  return true
+ }
+ // true: stay and re-render. false: the click committed; the HUD leaves.
+ mutating func clickCommitted(chordHeld: Bool, now: TimeInterval) -> Bool {
+  guard visible else { return true }
+  if mode == "release" && !chordHeld { forced=true; timer=false; releaseAt=nil; return false }
+  anchor=now; return true
+ }
+ mutating func escape(mods: Chord, dragging: Bool) -> Bool {
+  guard !dragging, visible || pending != nil else { return false }
+  let was=visible
+  hide()
+  if !mods.isEmpty { escapedChord=mods }
+  return was
+ }
+ mutating func step(now: TimeInterval, mods: Chord, pointer: CGPoint, frame: CGRect, pressing: Bool, tabDrag: Bool) -> HUDStep {
+  if let e=escapedChord, !e.isSubset(of:mods) { escapedChord=nil }
+  if let p=pending {
+   if !p.chord.isSubset(of:mods) { pending=nil }
+   else if now >= p.due { present(now:now,pointer:pointer,timer:false,chord:p.chord); return HUDStep(present:p.kind,alpha:1,fast:true) }
+  }
+  guard visible else { return HUDStep(alpha:0,fast:pending != nil) }
+  let inside=frame.contains(pointer)
+  if !moved, inside, hypot(pointer.x-origin.x,pointer.y-origin.y) > Self.slop { moved=true }
+  let busy=pressing || tabDrag
+  let hold = busy || (!forced && ((moved && inside) || (timer ? mods.isSuperset(of:[.control,.option]) : held(mods))))
+  if hold { anchor=now; releaseAt=nil; return HUDStep(fast:true) }
+  var out=HUDStep(fast:true)
+  if timer {
+   let t=now-anchor
+   if t >= delay+fade && t > delay { out.orderOut=true }
+   else if t > delay { out.alpha=1-(t-delay)/fade }
+  } else {
+   let start=releaseAt ?? now, len=min(fade,Self.releaseFade)
+   releaseAt=start
+   if now-start >= len { out.orderOut=true } else { out.alpha=1-(now-start)/len }
+  }
+  if out.orderOut { hide(); out.fast=false }
+  return out
  }
 }
 
@@ -390,6 +496,12 @@ final class Navigator: NSObject, NSApplicationDelegate {
  var preferences = NavigatorPreferences()
  var preferencesModified = Date.distantPast
  var hyperHold = HyperHold()
+ var keyWatch = KeyCounterWatch()
+ var presence = HUDPresence()
+ var escapeWasDown = false
+ var fastMode = false
+ var fastTimer: Timer?
+ var workWatch: DispatchSourceFileSystemObject?
  var statusItem: NSStatusItem?
  #if !NAVIGATOR_TESTS
  var settings: SettingsController?
@@ -401,7 +513,6 @@ final class Navigator: NSObject, NSApplicationDelegate {
  var modified = Date.distantPast
  var navigationModifiersHeld = false
  var intentModified = Date.distantPast
- var shown = Date.distantPast
  var scrollNavigation = false
  var rowNavigation = false
  var lastViewportColumn: Int?
@@ -493,7 +604,19 @@ final class Navigator: NSObject, NSApplicationDelegate {
   lifecycle.tolerance = 0.01
   RunLoop.main.add(lifecycle, forMode: .common)
   timer = lifecycle
+  watchWorkDirectory()
  }
+ // The engine publishes by tmp+rename, which modifies the directory: wake at once instead of
+ // waiting for the next poll. Polling stays as the fallback.
+ func watchWorkDirectory() {
+  let fd=open(URL(fileURLWithPath:path).deletingLastPathComponent().path,O_EVTONLY)
+  guard fd >= 0 else { return }
+  let source=DispatchSource.makeFileSystemObjectSource(fileDescriptor:fd,eventMask:.write,queue:.main)
+  source.setEventHandler { [weak self] in self?.tick(forcePoll:true) }
+  source.setCancelHandler { close(fd) }
+  source.resume(); workWatch=source
+ }
+ deinit { workWatch?.cancel(); fastTimer?.invalidate() }
  @objc func openSettings() {
   #if !NAVIGATOR_TESTS
   if settings == nil {
@@ -513,28 +636,48 @@ final class Navigator: NSObject, NSApplicationDelegate {
   if panel?.isVisible == true { render(previous) }
  }
  @objc func displayTick(_ sender: CADisplayLink) { tick() }
+ func screenID(_ screen: NSScreen) -> UInt32? { (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value }
+ func fastNeeded() -> Bool {
+  let f=NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+  return presence.fast || (f.contains(.control) && f.contains(.option))
+ }
  func updateDisplayLink() {
-  let needed = tabBars.hasVisibleBars || (scrollNavigation && panel.isVisible)
-  let screen = NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == snapshot.display }
+  let fast=fastNeeded(); fastMode=fast
+  let needed = tabBars.hasVisibleBars || (scrollNavigation && panel.isVisible) || fast
+  let screen = NSScreen.screens.first { screenID($0) == snapshot.display } ?? (fast ? NSScreen.main : nil)
+  let id = screen.flatMap { screenID($0) }
   if !needed || screen == nil {
    displayLink?.invalidate(); displayLink = nil; displayLinkScreen = nil
-  } else if displayLink == nil || displayLinkScreen != snapshot.display {
+  } else if displayLink == nil || displayLinkScreen != id {
    displayLink?.invalidate()
    displayLink = screen?.displayLink(target: self, selector: #selector(displayTick(_:)))
-   displayLinkScreen = snapshot.display
+   displayLinkScreen = id
    displayLink?.add(to: .main, forMode: .common)
   }
+  if fast && displayLink == nil {
+   if fastTimer == nil {
+    let t=Timer(timeInterval:1.0/60,repeats:true) { [weak self] _ in self?.tick() }
+    RunLoop.main.add(t,forMode:.common); fastTimer=t
+   }
+  } else if let t=fastTimer { t.invalidate(); fastTimer=nil }
  }
- func tick() {
-  let pollSnapshot = Date().timeIntervalSince(lastSnapshotPoll) >= 0.1
+ func presentHUD(_ kind: HUDPresence.Kind) {
+  rowNavigation = kind == .row
+  scrollNavigation = kind == .scroll
+  render(previous)
+ }
+ func tick(forcePoll: Bool = false) {
+  let date=Date(), now=date.timeIntervalSinceReferenceDate
+  let pollSnapshot = forcePoll || date.timeIntervalSince(lastSnapshotPoll) >= 0.1
   if pollSnapshot {
-   lastSnapshotPoll = Date()
+   lastSnapshotPoll = date
    let prefsPath=rootURL.appendingPathComponent("config/preferences.json").path
-   let date=(try? FileManager.default.attributesOfItem(atPath:prefsPath)[.modificationDate] as? Date) ?? .distantPast
-   if date != preferencesModified { reloadPreferences() }
+   let prefsStamp=(try? FileManager.default.attributesOfItem(atPath:prefsPath)[.modificationDate] as? Date) ?? .distantPast
+   if prefsStamp != preferencesModified { reloadPreferences() }
   }
-  if pollSnapshot, let attrs=try? FileManager.default.attributesOfItem(atPath:path), let date=attrs[.modificationDate] as? Date, date != modified {
-   modified=date
+  presence.mode=preferences.hide; presence.delay=preferences.delay; presence.fade=preferences.fade
+  if pollSnapshot, let attrs=try? FileManager.default.attributesOfItem(atPath:path), let stamp=attrs[.modificationDate] as? Date, stamp != modified {
+   modified=stamp
    if let content=try? String(contentsOfFile:path,encoding:.utf8) {
     previous=content
     snapshot = NavigatorSnapshot(content)
@@ -547,16 +690,17 @@ final class Navigator: NSObject, NSApplicationDelegate {
   if (!snapshot.tabGroups.isEmpty && snapshot.tabsVisible) || (scrollNavigation && panel.isVisible) { liveWindows = readLiveWindows() }
   else { liveWindows = [] }
   tabBars.update(snapshot, windows: liveWindows)
+  let flags=NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+  let mods=Chord(flags), pointer=NSEvent.mouseLocation
   let intentPath=path.replacingOccurrences(of:".tsv",with:".intent")
-  if pollSnapshot, let attrs=try? FileManager.default.attributesOfItem(atPath:intentPath), let date=attrs[.modificationDate] as? Date, date != intentModified {
-   intentModified=date
+  if pollSnapshot || fastMode, let attrs=try? FileManager.default.attributesOfItem(atPath:intentPath), let stamp=attrs[.modificationDate] as? Date, stamp != intentModified {
+   intentModified=stamp
    let action=(try? String(contentsOfFile:intentPath,encoding:.utf8)) ?? "hide"
-   if action == "show" || action == "scroll" || action == "row" {
-    rowNavigation = action == "row"
-    scrollNavigation = action == "scroll"; render(previous); shown=Date()
+   if let kind=["show":HUDPresence.Kind.show,"row":.row,"scroll":.scroll][action] {
+    if let k=presence.navigate(kind,chord:mods,mtime:stamp.timeIntervalSinceReferenceDate,now:now,pointer:pointer) { presentHUD(k) }
    }
    else {
-    let inside=panel.frame.contains(NSEvent.mouseLocation)
+    let inside=panel.frame.contains(pointer)
     let dismiss=action != "dismiss" || shouldDismiss(visible:panel.isVisible,inside:inside,pressed:pressingCard)
     if panel.isVisible { NSLog("Navigator intent %@ inside=%d pressed=%d dismissed=%d",action,inside ? 1 : 0,pressingCard ? 1 : 0,dismiss ? 1 : 0) }
     if dismiss { hide() }
@@ -566,27 +710,23 @@ final class Navigator: NSObject, NSApplicationDelegate {
    let column = viewportColumn(previous)
    if column != lastViewportColumn { render(previous) }
   }
-  let flags=NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
   let navigationHeld=flags.contains(.control) && flags.contains(.option) && flags.contains(.command)
   if navigationModifiersHeld && !navigationHeld { sendCommand(["view-end"]) }
   navigationModifiersHeld=navigationHeld
   let exactHyper=isHyperClick(flags)
-  let modifiers: Set<CGKeyCode> = [54,55,56,57,58,59,60,61,62,63]
-  let otherKey=exactHyper && !hyperHold.blocked && (0..<128).contains { !modifiers.contains(CGKeyCode($0)) && CGEventSource.keyState(.combinedSessionState,key:CGKeyCode($0)) }
-  let reveal=hyperHold.update(exactHyper:exactHyper && preferences.showOnHyper,otherKey:otherKey,now:Date.timeIntervalSinceReferenceDate,delay:preferences.hyperDelay)
-  if reveal {
-   // A hold must not change an already-running scroll HUD to focus mode.
-   if !panel.isVisible { scrollNavigation=false; rowNavigation=false; render(previous) }
-   shown=Date()
-  }
-  let held=flags.contains(.control) && flags.contains(.option)
-  let hovered = panel.isVisible && panel.frame.contains(NSEvent.mouseLocation)
-  if panel.isVisible && (held || hovered || pressingCard || tabDragRevealed) { shown = Date(); panel.alphaValue = 1 }
-  let age=Date().timeIntervalSince(shown)
-  if age>preferences.delay && !held {
-   panel.alphaValue=preferences.fade > 0 ? max(0,1-(age-preferences.delay)/preferences.fade) : 0
-   if age>=preferences.delay+preferences.fade { panel.orderOut(nil) }
-  }
+  let otherKey=keyWatch.otherKey(exact:exactHyper,counter:CGEventSource.counterForEventType(.combinedSessionState,eventType:.keyDown))
+  let reveal=hyperHold.update(exactHyper:exactHyper && preferences.showOnHyper,otherKey:otherKey,now:now,delay:preferences.hyperDelay)
+  // Physical Escape (edge) dismisses at once, unless a card press or drag owns it.
+  let escapeDown=CGEventSource.keyState(.combinedSessionState,key:53)
+  if escapeDown && !escapeWasDown && presence.escape(mods:mods,dragging:pressingCard || tabDragRevealed) { hide() }
+  escapeWasDown=escapeDown
+  // A hold must not change an already-running scroll HUD to focus mode.
+  if reveal && presence.bareHoldReveal(now:now,mods:mods,pointer:pointer) { presentHUD(.show) }
+  if presence.visible && !panel.isVisible { presence.hide() }
+  let out=presence.step(now:now,mods:mods,pointer:pointer,frame:panel.frame,pressing:pressingCard,tabDrag:tabDragRevealed)
+  if let k=out.present { presentHUD(k) }
+  else if out.orderOut { hide() }
+  else if presence.visible { panel.alphaValue=CGFloat(out.alpha) }
   updateDisplayLink()
  }
  func hide() {
@@ -594,7 +734,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   clearMinimapDrop(); minimapDropTargets=[]
   pressingCard = false
   panel.orderOut(nil)
-  shown = .distantPast
+  presence.hide()
  }
  // Read window geometry only while the swipe HUD is visible. This neither
  // captures screen pixels nor changes focus, and needs no Accessibility grant.
@@ -617,10 +757,12 @@ final class Navigator: NSObject, NSApplicationDelegate {
  }
  func focusWindow(_ id: Int, updateMinimap: Bool = true) {
   if updateMinimap {
-   scrollNavigation = false
-   rowNavigation = false
-   shown = Date()
-   render(previous)
+   let mods=Chord(NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask))
+   if presence.clickCommitted(chordHeld:presence.held(mods),now:Date.timeIntervalSinceReferenceDate) {
+    scrollNavigation = false
+    rowNavigation = false
+    render(previous)
+   }
   }
   sendCommand(["focus",String(id)])
  }
@@ -660,7 +802,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   cancelTabPresses(in:panel.contentView)
   clearMinimapDrop(); minimapDropTargets=[]; panel.contentView=effect
   panel.setFrame(minimapFrame(size:CGSize(width:width,height:height),visible:screen.visibleFrame,position:preferences.position),display:true)
-  shown=Date(); panel.alphaValue=1; panel.orderFrontRegardless()
+  presence.present(now:Date.timeIntervalSinceReferenceDate,pointer:NSEvent.mouseLocation,timer:true,chord:[]); panel.alphaValue=1; panel.orderFrontRegardless()
  }
  func clearMinimapDrop() { minimapDropMark?.removeFromSuperview(); minimapDropMark=nil }
  func minimapInsertion(_ point: CGPoint) -> (target: StripDropTarget,before: Bool)? {
@@ -715,7 +857,8 @@ final class Navigator: NSObject, NSApplicationDelegate {
  func tabOutsideDrop(source: Int, point: CGPoint, commit: Bool) -> Bool {
   if !tabDragRevealed, !commit {
    tabDragRevealed=true; rowNavigation=false; scrollNavigation=false
-   render(previous); shown=Date()
+   presence.present(now:Date.timeIntervalSinceReferenceDate,pointer:NSEvent.mouseLocation,timer:preferences.hide == "timer",chord:[])
+   render(previous)
   }
   let drop=panel.isVisible ? minimapTabDrop(source:source,point:point,targets:minimapDropTargets,entries:snapshot.entries) : nil
   if let drop, drop.kind == .tab, let insertion=minimapInsertion(point), let view=panel.contentView {
