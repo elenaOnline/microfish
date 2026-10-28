@@ -2,7 +2,7 @@
 //! round trips for the two requests the navigator bridge makes (`WindowSet`) and the
 //! cheapest query (`Query(Active)`). Sends nothing that changes state.
 //!
-//! usage: ipc_probe [count] [gap_ms]
+//! usage: `ipc_probe [count] [gap_ms]`
 use paneru::types::state::StateQueryKind;
 use paneru::types::wire::{self, Request, Response, SendPort};
 use std::time::{Duration, Instant};

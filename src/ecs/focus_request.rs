@@ -126,6 +126,7 @@ fn focus_target(
         .then_some(entity)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn focus_request_handler(
     mut messages: MessageReader<Event>,
     windows: Windows,
@@ -307,7 +308,9 @@ mod tests {
             .push(Pending {
                 entity,
                 respond_to,
-                deadline: Instant::now() - Duration::from_millis(1),
+                deadline: Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .unwrap(),
             });
         harness.advance(Duration::from_millis(60));
         assert_eq!(

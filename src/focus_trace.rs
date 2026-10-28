@@ -429,7 +429,9 @@ mod tests {
         let tracer = Tracer::new();
         tracer.begin("click", Some(1), "ipc_in");
         tracer.with(|slot| {
-            slot.as_mut().unwrap().t0 = Instant::now() - STALE - Duration::from_millis(1);
+            slot.as_mut().unwrap().t0 = Instant::now()
+                .checked_sub(STALE + Duration::from_millis(1))
+                .unwrap();
         });
         tracer.mark("late");
         assert!(tracer.with(|slot| slot.is_none()));
