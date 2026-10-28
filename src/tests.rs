@@ -7,6 +7,7 @@ mod mocks;
 mod parking;
 mod review_a;
 mod rows;
+mod rows_review;
 mod session_restore;
 mod state;
 mod tabbed_display;
