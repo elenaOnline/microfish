@@ -340,8 +340,40 @@ private final class TabBarSurface {
  var memberIDs = Set<Int>()
  var pressed = false { didSet { if pressed && !oldValue { pressedSince = Date.timeIntervalSinceReferenceDate } } }
  var pressedSince: TimeInterval = 0
- var strip: NSView?
+ // The whole view chain from the panel down to the leaves is permanent (see labelDefaults in main.swift): a rebuild
+ // re-fills `strip` rather than replacing the tree.
+ let strip = NSView(frame: .zero)
+ let clip = NSView(frame: .zero)
+ // Cards, their label/icon leaves, the overflow card and the seam patches are pooled for life: on macOS 27 each
+ // NSTextField/NSImageView freed after joining a window leaks NSKeyValueDependency objects (see labelDefaults in
+ // main.swift). A rebuild takes the cards out of the old strip, re-configures them and puts them in the new one.
+ private var cards: [ColumnCard] = [], cardsTaken = 0
+ private var patches: [NSImageView] = [], patchesTaken = 0
+ let more = ColumnCard(frame: .zero)
+ /// The seam panel's content view, kept: it is the permanent parent of the corner patches.
+ let seams = NSView(frame: .zero)
+ func recycleCards() {
+  for card in cards[0..<cardsTaken] { card.removeFromSuperview(); card.recycle() }
+  more.removeFromSuperview(); more.recycle()
+  seams.subviews.forEach { $0.removeFromSuperview() }
+  cardsTaken = 0; patchesTaken = 0
+ }
+ func takeCard(frame: CGRect) -> ColumnCard {
+  if cardsTaken == cards.count { cards.append(ColumnCard(frame: frame)) }
+  let card = cards[cardsTaken]; cardsTaken += 1; card.frame = frame; return card
+ }
+ func takePatch(frame: CGRect, image: NSImage) -> NSImageView {
+  if patchesTaken == patches.count { patches.append(NSImageView(frame: frame)) }
+  let patch = patches[patchesTaken]; patchesTaken += 1; patch.frame = frame; patch.image = image; return patch
+ }
  init() {
+  seamPanel.contentView = seams
+  panel.contentView = clip
+  clip.wantsLayer = true; clip.layer?.masksToBounds = true
+  strip.wantsLayer = true
+  // A quiet attached seam, without an independently glowing HUD material.
+  strip.layer?.backgroundColor = NSColor.clear.cgColor
+  clip.addSubview(strip)
   panel.isExcludedFromWindowsMenu = true; seamPanel.isExcludedFromWindowsMenu = true
   panel.setAccessibilityLabel("Window tabs")
   seamPanel.animationBehavior = .none;seamPanel.hasShadow=false;seamPanel.level = .normal
@@ -382,7 +414,8 @@ final class TabBars: NSObject {
  func finishDrag() { clearDragFeedback(); dragSource=nil; dragFinished?() }
  private func tabInsertion(_ point: CGPoint) -> (bar: TabBarSurface,target: StripDropTarget,before: Bool)? {
   for bar in bars.values where bar.panel.isVisible {
-   guard let strip=bar.strip, tabDropExposed(point:point,panelID:bar.panel.windowNumber,members:bar.memberIDs.union([bar.seamPanel.windowNumber]),windows:currentWindows) else { continue }
+   guard tabDropExposed(point:point,panelID:bar.panel.windowNumber,members:bar.memberIDs.union([bar.seamPanel.windowNumber]),windows:currentWindows) else { continue }
+   let strip=bar.strip
    let targets=strip.subviews.compactMap { view -> StripDropTarget? in
     guard let card=view as? ColumnCard, card.entryID > 0 else { return nil }
     let windowRect=strip.convert(card.frame,to:nil)
@@ -456,10 +489,9 @@ final class TabBars: NSObject {
    let signature = tabContentSignature(members, selected: selection, width: contentWidth, height: frame.height) + ":\(style):\(selectOnPress):\(sample != nil):\(NSApp.effectiveAppearance.name.rawValue):\(matched?.description ?? "default")" + members.map { aliases[$0.bundle+"\t"+$0.title] ?? "" }.joined(separator:"|") + ":\(NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast):\(NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency)"
    if signature != bar.signature && !bar.pressed {
     bar.signature = signature
-    let view = NSView(frame: CGRect(x: 0, y: 0, width: contentWidth, height: frame.height))
-    view.wantsLayer = true
-    // A quiet attached seam, without an independently glowing HUD material.
-    view.layer?.backgroundColor = NSColor.clear.cgColor
+    bar.recycleCards()
+    let view = bar.strip
+    view.frame = CGRect(x: 0, y: 0, width: contentWidth, height: frame.height)
     let capacity = max(1, Int((side ? frame.height:contentWidth) / (side ? 32:65)))
     let overflow = members.count > capacity
     let visible = visibleTabMembers(members, capacity: capacity, selected: selection)
@@ -469,7 +501,7 @@ final class TabBars: NSObject {
     let available = (side ? frame.height:contentWidth) - (overflow ? 30 : 0)
     let width = max(1,(available-gap*CGFloat(visible.count-1)) / CGFloat(visible.count))
     for (index, entry) in visible.enumerated() {
-     let card = ColumnCard(frame: side ? CGRect(x:0,y:frame.height-CGFloat(index+1)*width,width:41,height:width) : CGRect(x:CGFloat(index)*(width+gap),y:0,width:width,height:frame.height))
+     let card = bar.takeCard(frame: side ? CGRect(x:0,y:frame.height-CGFloat(index+1)*width,width:41,height:width) : CGRect(x:CGFloat(index)*(width+gap),y:0,width:width,height:frame.height))
      card.entryID=entry.id
      card.diagnosticName="tab column=\(column) target=\(entry.id)"
      card.onPress = { [weak bar] down in bar?.pressed = down }
@@ -508,13 +540,13 @@ final class TabBars: NSObject {
      }
      let iconSize:CGFloat=side ? 22:16
      let contentY:CGFloat=side ? (card.bounds.height-iconSize)/2 : (style == "classic" || style == "folder-compact") ? (frame.height-16)/2 : (height >= 34 ? 8.25:6.25)
-     let icon = NSImageView(frame:CGRect(x:side ? 9:15,y:contentY,width:iconSize,height:iconSize))
+     let icon = card.takeIcon(frame:CGRect(x:side ? 9:15,y:contentY,width:iconSize,height:iconSize))
      icon.image=icons[entry.bundle] ?? NSImage(named:NSImage.applicationIconName);card.addSubview(icon)
      let tabLabel = displayTitle.isEmpty ? entry.app:displayTitle
      card.setAccessibilityLabel(tabLabel)
      accessibilityItems.append(TabAccessibilityItem(card:card,label:tabLabel,help:help,selected:active,press:{ [weak card] in card?.onClick?() }))
      if !side {
-      let label=NSTextField(labelWithString:displayTitle.isEmpty ? entry.app:displayTitle)
+      let label=card.takeLabel(displayTitle.isEmpty ? entry.app:displayTitle)
       label.frame=CGRect(x:38,y:contentY-1,width:max(0,width-51),height:18)
       label.font = .systemFont(ofSize:style == "classic" ? 12.5:13,weight:active ? .semibold:.regular);label.lineBreakMode = .byTruncatingTail
       if active, let matched {label.textColor=tabColorIsDark(matched) ? .white:.black}
@@ -528,9 +560,9 @@ final class TabBars: NSObject {
      view.addSubview(card,positioned:active ? .above:.below,relativeTo:nil)
     }
     if overflow {
-     let more = ColumnCard(frame: side ? CGRect(x:0,y:0,width:41,height:30):CGRect(x:available,y:0,width:30,height:frame.height))
+     let more = bar.more; more.frame = side ? CGRect(x:0,y:0,width:41,height:30):CGRect(x:available,y:0,width:30,height:frame.height)
      let face = FolderTabFace(frame:more.bounds); face.style=style; face.increaseContrast=increaseContrast;face.reduceTransparency=reduceTransparency; more.addSubview(face)
-     let label = NSTextField(labelWithString: "…"); label.frame = CGRect(x: 7, y: (more.bounds.height-18)/2, width: 20, height: 18); more.addSubview(label)
+     let label = more.takeLabel("…"); label.frame = CGRect(x: 7, y: (more.bounds.height-18)/2, width: 20, height: 18); more.addSubview(label)
      more.diagnosticName="tab overflow column=\(column)"
      more.toolTip = "All tabs (\(members.count))"
      more.onPress = { [weak bar] down in bar?.pressed = down }
@@ -551,25 +583,19 @@ final class TabBars: NSObject {
      view.addSubview(more)
     }
     installTabAccessibility(strip: view, items: accessibilityItems, vertical: side)
-    let clip = NSView(frame: CGRect(origin: .zero, size: panelFrame.size))
     // Never paint guessed opaque rectangles over app chrome. These masks are
     // transparent everywhere the captured app is opaque, including controls.
-    let seams=NSView(frame:CGRect(origin:.zero,size:seamFrame.size))
+    let seams=bar.seams
     if !style.hasPrefix("folder"),let sample,sample.corners.count==4 {
      let placements:[(Int,CGRect)]=side ? [(0,CGRect(x:0,y:seamFrame.height-32,width:32,height:32)),(2,CGRect(x:0,y:0,width:32,height:32))] : [(0,CGRect(x:0,y:0,width:32,height:32)),(1,CGRect(x:seamFrame.width-32,y:0,width:32,height:32))]
      for (index,rect) in placements {
       if !side && ((index==0 && live.frame.minX<screen.visibleFrame.minX) || (index==1 && live.frame.maxX>screen.visibleFrame.maxX)) {continue}
-      let patch=NSImageView(frame:rect);patch.image=NSImage(cgImage:sample.corners[index],size:rect.size);seams.addSubview(patch)
+      let patch=bar.takePatch(frame:rect,image:NSImage(cgImage:sample.corners[index],size:rect.size));seams.addSubview(patch)
      }
     }
     if side {
      let shadow=SideTabSeparator(frame:CGRect(x:0,y:0,width:4,height:seamFrame.height));seams.addSubview(shadow)
     }
-    bar.seamPanel.contentView=seams
-    clip.wantsLayer = true; clip.layer?.masksToBounds = true
-    clip.addSubview(view)
-    bar.strip = view
-    bar.panel.contentView = clip
    }
    if !bar.pressed {
     // Translate without animation; rebuild only when the visible protected span changes.
@@ -586,7 +612,7 @@ final class TabBars: NSObject {
      else if bar.seamPanel.frame.origin != seamFrame.origin {bar.seamPanel.setFrameOrigin(seamFrame.origin)}
      if bar.panel.contentView?.frame.size != panelFrame.size { bar.panel.contentView?.setFrameSize(panelFrame.size) }
      let stripOrigin = CGPoint(x: 0, y: 0)
-     if bar.strip?.frame.origin != stripOrigin { bar.strip?.setFrameOrigin(stripOrigin) }
+     if bar.strip.frame.origin != stripOrigin { bar.strip.setFrameOrigin(stripOrigin) }
     }
     CATransaction.commit()
    }

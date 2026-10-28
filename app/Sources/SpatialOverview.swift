@@ -258,6 +258,14 @@ final class SpatialMapView: NSView {
         self.snapshot = snapshot; map = SpatialMapLayout(snapshot: snapshot, width: requestedWidth)
         setFrameSize(NSSize(width: map.width, height: map.height)); rebuild(); needsDisplay = true
     }
+    /// Back to the state of a newly built map for `snapshot` (SpatialContentView.make re-uses its map view).
+    func reuse(snapshot: SpatialSnapshot, width: CGFloat) {
+        cancelDrag(); pending = nil
+        onFocus = nil; onMove = nil; onDragState = nil; onPin = nil; onEscape = nil
+        pins = [:]; pinPadding = 4; increaseContrastOverride = nil; pressedPin = nil; pressedOverflow = nil
+        requestedWidth = width
+        update(snapshot, force: true)
+    }
     func resizeViewport(width: CGFloat) { if abs(width-requestedWidth) > 0.5 { cancelDrag(); requestedWidth = max(1,width); update(snapshot, force: true) } }
     private func rebuild() {
         subviews.forEach { $0.removeFromSuperview() }
@@ -597,6 +605,33 @@ final class SpatialContentView: NSView {
         scrollView.contentView.setNeedsDisplay(scrollView.contentView.bounds)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    // On macOS 27 AppKit leaks NSKeyValueDependency objects when a control (here the three header NSButtons) that has
+    // joined a window is freed, or when a view above it is. The popover builds this content on every open, so one
+    // instance is kept and re-filled: make() hands out a pooled content view, recycle() takes it back. The scroll
+    // view, map view and header buttons stay; only the tile controls inside the map are rebuilt (they have no
+    // cell, and do not leak).
+    private static var spare: [SpatialContentView] = []
+    static func make(snapshot: SpatialSnapshot, available: NSSize) -> SpatialContentView {
+        guard let reused = spare.popLast() else { return SpatialContentView(snapshot: snapshot, available: available) }
+        reused.refill(snapshot: snapshot, available: available)
+        return reused
+    }
+    /// Takes a closed popover's content back for the next open.
+    static func recycle(_ content: SpatialContentView) {
+        content.mapView.cancelDrag()
+        content.onEscape = nil; content.onSettings = nil; content.onRefresh = nil; content.onViews = nil
+        if !spare.contains(where: { $0 === content }) { spare.append(content) }
+    }
+    private func refill(snapshot: SpatialSnapshot, available: NSSize) {
+        geometry = SpatialPanelGeometry(available: available, rowCount: snapshot.rows.count)
+        mapView.reuse(snapshot: snapshot, width: max(1, geometry.scroll.width-14))
+        message = Self.defaultMessage
+        refreshButton.isEnabled = true
+        setFrameSize(geometry.size)
+        scrollView.frame = geometry.scroll
+        layoutHeader(); scrollView.tile(); mapView.resizeViewport(width: max(1,scrollView.contentSize.width)); centerActiveRow()
+        needsDisplay = true
+    }
     override func resizeSubviews(withOldSize oldSize: NSSize) {
         super.resizeSubviews(withOldSize: oldSize)
         geometry = SpatialPanelGeometry(size: bounds.size)
@@ -704,7 +739,7 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
     func popoverDidClose(_ notification: Notification) {
         item?.button?.highlight(false)
         // Drop the hidden map so snapshot updates stop re-laying-out and re-reading pins while closed.
-        if content?.window == nil { content = nil; popover.contentViewController = nil }
+        if content?.window == nil { let old = content; content = nil; popover.contentViewController = nil; if let old { SpatialContentView.recycle(old) } }
     }
     private func updateGlyph() {
         let state = snapshot
@@ -776,7 +811,7 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
         if pressClosed { return }
         let screen = button.window?.screen ?? NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
         let available = screen?.visibleFrame.size ?? NSSize(width: 800,height: 600)
-        let root = SpatialContentView(snapshot: snapshot, available: available); content = root; loadPins()
+        let root = SpatialContentView.make(snapshot: snapshot, available: available); content = root; loadPins()
         root.onViews = { [weak self, weak root] in if let root { self?.showViews(in:root) } }
         root.refreshButton.isEnabled = !refreshing
         root.onRefresh = { [weak self, weak root] in

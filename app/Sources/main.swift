@@ -1,6 +1,6 @@
 import AppKit
 // Mask the backdrop itself: layer clipping alone can leave compositor corners.
-final class RoundedHUDView: NSVisualEffectView {
+class RoundedHUDView: NSVisualEffectView {
  override func draw(_ dirtyRect:NSRect) {
   super.draw(dirtyRect)
   let dark=hudDark(self),path=NSBezierPath(roundedRect:bounds.insetBy(dx:0.25,dy:0.25),xRadius:16,yRadius:16)
@@ -31,7 +31,24 @@ struct HUDMetrics {
   gap=style == "cards" ? 8:6;gutter=style == "compact" ? 28:30;pad=style == "compact" ? 12:14;left=style == "compact" ? 10:12;radius=style == "cards" ? 10:9;emptyHeight=style == "cards" ? 36:style == "compact" ? 28:30
  }
 }
+// macOS 27 leaks NSKeyValueDependency objects whenever an NSTextField, NSImageView or NSButton that has joined a
+// window is freed, or its parent is freed while it is attached (headless bisect, polish/teams/performance/leak-report.md).
+// The HUD, tab bars and map are rebuilt on every change, so these views are pooled instead: a leaf is created once,
+// keeps the same long-lived parent, and is re-configured, removed and re-added (all measured flat) for the life of the
+// process. A parent that holds leaves is never freed either.
+let labelDefaults = NSTextField(labelWithString:"")
+extension NSTextField {
+ /// Back to the state of a fresh NSTextField(labelWithString:) holding `text`, so a pooled label renders as a new one.
+ func resetAsLabel(_ text:String) {
+  stringValue=text; font=labelDefaults.font; textColor=labelDefaults.textColor; alignment=labelDefaults.alignment
+  lineBreakMode=labelDefaults.lineBreakMode; toolTip=nil; setAccessibilityLabel(nil); isHidden=false; frame = .zero
+ }
+}
 final class HUDEmptySlot:NSView {
+ // The "Empty row" caption is a permanent child: this slot is pooled with it.
+ let caption=NSTextField(labelWithString:"Empty row")
+ override init(frame frameRect:NSRect) { super.init(frame:frameRect); addSubview(caption) }
+ required init?(coder:NSCoder) { fatalError("init(coder:) has not been implemented") }
  override func draw(_ dirtyRect:NSRect) {
   let p=NSBezierPath(roundedRect:bounds.insetBy(dx:0.5,dy:0.5),xRadius:9,yRadius:9)
   (hudDark(self) ? NSColor.white:NSColor.black).withAlphaComponent(hudDark(self) ? 0.24:0.22).setStroke();p.lineWidth=1;p.setLineDash([1,2],count:2,phase:0);p.stroke()
@@ -43,23 +60,41 @@ final class HUDBadge:NSTextField {
  }
 }
 
-func makeFailureHUD(action:String,diagnostic:String,width:CGFloat=340,appearance:NSAppearance?=nil)->RoundedHUDView {
- let height:CGFloat=62
-  let effect=RoundedHUDView(frame:CGRect(x:0,y:0,width:width,height:height))
-  effect.material = .hudWindow; effect.blendingMode = .behindWindow; effect.state = .active
-  effect.wantsLayer=true; effect.layer?.cornerRadius=16; effect.layer?.masksToBounds=true
-  let title=NSTextField(labelWithString:action == "focus" ? "Focus not confirmed" : "Move not confirmed")
+// The command-failure HUD. One instance is kept and re-configured per failure (Navigator.failureView); makeFailureHUD
+// still returns a new one for rendering and tests.
+final class FailureHUDView:RoundedHUDView {
+ let title=NSTextField(labelWithString:"")
+ let warning=NSImageView(frame:CGRect(x:14,y:26,width:20,height:20))
+ let detail=NSTextField(labelWithString:"")
+ override init(frame frameRect:NSRect) {
+  super.init(frame:frameRect)
+  material = .hudWindow; blendingMode = .behindWindow; state = .active
+  wantsLayer=true; layer?.cornerRadius=16; layer?.masksToBounds=true
+  addSubview(title); addSubview(warning); addSubview(detail)
+ }
+ required init?(coder:NSCoder) { fatalError("init(coder:) has not been implemented") }
+ func configure(action:String,diagnostic:String,width:CGFloat,appearance:NSAppearance?) {
+  let height:CGFloat=62
+  setFrameSize(NSSize(width:width,height:height))
+  title.stringValue=action == "focus" ? "Focus not confirmed" : "Move not confirmed"
   let sourceAppearance=appearance ?? NSApp?.effectiveAppearance ?? NSAppearance.currentDrawing()
-  effect.appearance=NSAppearance(named:sourceAppearance.bestMatch(from:[.aqua,.darkAqua]) == .darkAqua ? .vibrantDark:.vibrantLight)
-  let dark=hudDark(effect)
+  self.appearance=NSAppearance(named:sourceAppearance.bestMatch(from:[.aqua,.darkAqua]) == .darkAqua ? .vibrantDark:.vibrantLight)
+  let dark=hudDark(self)
   title.font = .systemFont(ofSize:13,weight:.semibold); title.textColor = hudColor(dark ? 0xFF6961:0xC4000F)
-  title.frame=CGRect(x:44,y:31,width:width-60,height:17); effect.addSubview(title)
-  let warning=NSImageView(frame:CGRect(x:14,y:26,width:20,height:20));warning.image=NSImage(systemSymbolName:"exclamationmark.triangle",accessibilityDescription:"Warning");warning.contentTintColor=hudColor(dark ? 0xFF6961:0xD70015);effect.addSubview(warning)
-  let detail=NSTextField(labelWithString:"The target may have changed. Try again.")
+  title.frame=CGRect(x:44,y:31,width:width-60,height:17)
+  warning.image=NSImage(systemSymbolName:"exclamationmark.triangle",accessibilityDescription:"Warning");warning.contentTintColor=hudColor(dark ? 0xFF6961:0xD70015)
+  detail.stringValue="The target may have changed. Try again."
   detail.font = .systemFont(ofSize:12); detail.frame=CGRect(x:44,y:14,width:width-60,height:16)
-  detail.toolTip=String(diagnostic.prefix(500)); effect.addSubview(detail)
+  detail.toolTip=String(diagnostic.prefix(500))
+  needsDisplay=true
+ }
+}
+func makeFailureHUD(action:String,diagnostic:String,width:CGFloat=340,appearance:NSAppearance?=nil)->RoundedHUDView {
+ let effect=FailureHUDView(frame:CGRect(x:0,y:0,width:width,height:62))
+ effect.configure(action:action,diagnostic:diagnostic,width:width,appearance:appearance)
  return effect
 }
+
 struct NavigatorPreferences {
  var position = "bottom", style = "cards"
  var delay = 1.3, fade = 0.22, hyperDelay = 0.2
@@ -553,6 +588,48 @@ final class ColumnCard: NSView {
  private var escapeTimer: Timer?
  var press = CardPress()
  var hyperSecondaryPress = false
+ // Leaf views this card has owned, kept for life (see labelDefaults): take* hands out the next unused one in the
+ // same state as a new view, recycle() detaches them all and makes the card ready to be configured again.
+ private var labelLeaves:[NSTextField]=[], iconLeaves:[NSImageView]=[], shadowedLeaves:[NSImageView]=[], badgeLeaves:[HUDBadge]=[]
+ private var labelsTaken=0, iconsTaken=0, shadowedTaken=0, badgesTaken=0
+ func takeLabel(_ text:String) -> NSTextField {
+  if labelsTaken == labelLeaves.count { labelLeaves.append(NSTextField(labelWithString:"")) }
+  let label=labelLeaves[labelsTaken]; labelsTaken += 1; label.resetAsLabel(text); return label
+ }
+ func takeBadge(_ text:String) -> HUDBadge {
+  if badgesTaken == badgeLeaves.count { badgeLeaves.append(HUDBadge(labelWithString:"")) }
+  let badge=badgeLeaves[badgesTaken]; badgesTaken += 1; badge.resetAsLabel(text); return badge
+ }
+ func takeIcon(frame:CGRect) -> NSImageView {
+  if iconsTaken == iconLeaves.count { iconLeaves.append(NSImageView(frame:frame)) }
+  let icon=iconLeaves[iconsTaken]; iconsTaken += 1
+  icon.image=nil; icon.frame=frame; icon.toolTip=nil; icon.isHidden=false; icon.contentTintColor=nil
+  return icon
+ }
+ /// The icon of the selected app in a multi-app card: layer-backed with a drop shadow. Kept apart from plain icons so
+ /// the layer and shadow are set up once and never toggled.
+ func takeShadowedIcon(frame:CGRect) -> NSImageView {
+  if shadowedTaken == shadowedLeaves.count {
+   let icon=NSImageView(frame:frame)
+   icon.wantsLayer=true;icon.shadow=NSShadow();icon.shadow?.shadowOffset=NSSize(width:-1,height:0);icon.shadow?.shadowBlurRadius=1.5;icon.shadow?.shadowColor=NSColor.black.withAlphaComponent(0.35)
+   shadowedLeaves.append(icon)
+  }
+  let icon=shadowedLeaves[shadowedTaken]; shadowedTaken += 1
+  icon.image=nil; icon.frame=frame; icon.toolTip=nil; icon.isHidden=false
+  return icon
+ }
+ /// Detach every child (leaves go back to the pool) and clear all interaction, handlers and presentation state.
+ func recycle() {
+  escapeTimer?.invalidate(); escapeTimer=nil
+  subviews.forEach { $0.removeFromSuperview() }
+  labelsTaken=0; iconsTaken=0; shadowedTaken=0; badgesTaken=0
+  onPress=nil; onClick=nil; onSelect=nil; onClickAt=nil; onDrag=nil; onDrop=nil; onCancelDrag=nil
+  selectsOnPress=false; exposedAsButton=false; pressSelected=false; hyperSecondaryPress=false
+  press=CardPress(); drag=CardDrag()
+  entryID=0; diagnosticName="card"; hudStyle="cards"; hudActive=nil
+  toolTip=nil; setAccessibilityLabel(nil); appearance=nil; isHidden=false
+  if let layer { layer.cornerRadius=0; layer.shadowOpacity=0; layer.shadowRadius=3; layer.shadowOffset=CGSize(width:0,height:-3); layer.shadowColor=CGColor(gray:0,alpha:1) }
+ }
  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
  override func hitTest(_ point: NSPoint) -> NSView? {
   bounds.contains(convert(point, from: superview)) ? self : nil
@@ -622,6 +699,55 @@ final class ColumnCard: NSView {
   NSLog("Navigator %@ mouseUp inside=%d accepted=%d",diagnosticName,inside ? 1 : 0,fire ? 1 : 0)
   onPress?(false)
   if fire { if let onClickAt { onClickAt(convert(event.locationInWindow, from:nil)) } else { onClick?() } }
+ }
+}
+
+// The pooled views behind one built minimap HUD (see labelDefaults). Navigator keeps one kit and reclaim()s it before
+// each rebuild; a caller that wants an independent view (render, tests) passes a new kit and never reclaims it.
+final class HUDLane {
+ let scroll=NSScrollView(frame:.zero)
+ let strip=NSView(frame:.zero)
+ init() { scroll.documentView=strip }
+}
+final class HUDKit {
+ /// The HUD's whole view chain is permanent: root, canvas, scroll views and strips are re-filled, never replaced.
+ let root=RoundedHUDView(frame:.zero)
+ let verticalScroll=NSScrollView(frame:.zero)
+ private var lanes:[HUDLane]=[], lanesTaken=0
+ private var cards:[ColumnCard]=[], cardsTaken=0
+ private var slots:[HUDEmptySlot]=[], slotsTaken=0
+ private var labels:[NSTextField]=[], labelsTaken=0
+ /// Parent of the row labels and overflow cues. Persistent, because their parent must outlive them.
+ let canvas=NSView(frame:.zero)
+ func card(frame:CGRect) -> ColumnCard {
+  if cardsTaken == cards.count { cards.append(ColumnCard(frame:frame)) }
+  let card=cards[cardsTaken]; cardsTaken += 1; card.frame=frame; return card
+ }
+ func lane() -> HUDLane {
+  if lanesTaken == lanes.count { lanes.append(HUDLane()) }
+  let lane=lanes[lanesTaken]; lanesTaken += 1
+  lane.strip.subviews.forEach { $0.removeFromSuperview() }
+  return lane
+ }
+ func slot(frame:CGRect) -> HUDEmptySlot {
+  if slotsTaken == slots.count { slots.append(HUDEmptySlot(frame:frame)) }
+  let slot=slots[slotsTaken]; slotsTaken += 1; slot.frame=frame; return slot
+ }
+ func label(_ text:String) -> NSTextField {
+  if labelsTaken == labels.count { labels.append(NSTextField(labelWithString:"")) }
+  let label=labels[labelsTaken]; labelsTaken += 1; label.resetAsLabel(text); return label
+ }
+ /// Takes everything back out of the previous HUD, ready for the next build.
+ func reclaim() {
+  for card in cards[0..<cardsTaken] { card.removeFromSuperview(); card.recycle() }
+  for slot in slots[0..<slotsTaken] { slot.removeFromSuperview() }
+  for label in labels[0..<labelsTaken] { label.removeFromSuperview() }
+  for lane in lanes[0..<lanesTaken] { lane.scroll.removeFromSuperview() }
+  canvas.subviews.forEach { $0.removeFromSuperview() }
+  verticalScroll.documentView=nil; verticalScroll.removeFromSuperview()
+  canvas.removeFromSuperview()
+  root.subviews.forEach { $0.removeFromSuperview() }
+  cardsTaken=0; slotsTaken=0; labelsTaken=0; lanesTaken=0
  }
 }
 
@@ -808,6 +934,8 @@ final class Navigator: NSObject, NSApplicationDelegate {
  var rowNavigation = false
  var lastViewportColumn: Int?
  var pressingCard = false
+ var ordersPanel = true   // false in headless tests: render builds and installs the HUD but never shows the panel
+ let hudKit = HUDKit()
  var minimapDropTargets: [StripDropTarget] = []
  var activeHUDCards: [ColumnCard] = []
  var hudRowLanes: [Int:NSView] = [:]
@@ -1169,12 +1297,18 @@ final class Navigator: NSObject, NSApplicationDelegate {
    NSLog("Navigator command finished %@ status=%d",arguments.first ?? "",outcome.status)
   }
  }
+ // The one failure HUD, re-configured for each failure (a new one per failure would leak, see labelDefaults).
+ let failureHUD=FailureHUDView(frame:CGRect(x:0,y:0,width:340,height:62))
+ func failureView(action:String,diagnostic:String,width:CGFloat) -> RoundedHUDView {
+  failureHUD.configure(action:action,diagnostic:diagnostic,width:width,appearance:nil)
+  return failureHUD
+ }
  func showCommandFailure(_ action: String, diagnostic: String) {
   guard let screen=NSScreen.screens.first(where: { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == snapshot.display }) ?? NSScreen.main else { return }
   let width=min(340,screen.visibleFrame.width-64), height:CGFloat=62
-  let effect=makeFailureHUD(action:action,diagnostic:diagnostic,width:width)
+  let effect=failureView(action:action,diagnostic:diagnostic,width:width)
   cancelTabPresses(in:panel.contentView)
-  clearMinimapDrop(); minimapDropTargets=[]; panel.contentView=effect
+  clearMinimapDrop(); minimapDropTargets=[]; if panel.contentView !== effect { panel.contentView=effect }
   panel.setFrame(minimapFrame(size:CGSize(width:width,height:height),visible:screen.visibleFrame,position:preferences.position),display:true)
   panel.invalidateShadow(); lastRenderSig=nil; renderRequested=false
   presence.present(now:Date.timeIntervalSinceReferenceDate,pointer:NSEvent.mouseLocation,timer:true,chord:[]); presence.deferred=nil
@@ -1250,11 +1384,11 @@ final class Navigator: NSObject, NSApplicationDelegate {
   if commit, let drop { sendCommand(drop.arguments) }
   return drop != nil
  }
- func makeHUDCard(_ members: [Entry], column col: Int, focused: Int, active: Bool, interactive: Bool, frame: CGRect, style: String) -> ColumnCard {
+ func makeHUDCard(_ members: [Entry], column col: Int, focused: Int, active: Bool, interactive: Bool, frame: CGRect, style: String, kit: HUDKit = HUDKit()) -> ColumnCard {
   let cardWidth=frame.width, cardHeight=frame.height
   let compact=style == "compact", titles=style == "titles"
    let chosen=members.first { $0.id == selectedWindow(members,focused:focused) } ?? members[0]
-   let card=ColumnCard(frame:frame)
+   let card=kit.card(frame:frame)
    card.appearance=hudAppearance
    card.diagnosticName="minimap column=\(col) target=\(chosen.id)"
    let sourceID=members.first!.id
@@ -1286,31 +1420,29 @@ final class Navigator: NSObject, NSApplicationDelegate {
     } else { card?.onClick?() }
    }
    for (app,frame) in zip(displayedApps,iconLayout.frames) {
-    let icon=NSImageView(frame:frame)
+    let shadowed=app.id == selectedWindow(members,focused:focused) && apps.count>1
+    let icon=shadowed ? card.takeShadowedIcon(frame:frame) : card.takeIcon(frame:frame)
     if icons[app.bundle]==nil, let url=NSWorkspace.shared.urlForApplication(withBundleIdentifier:app.bundle) { icons[app.bundle]=NSWorkspace.shared.icon(forFile:url.path) }
     icon.image=icons[app.bundle] ?? NSImage(named:NSImage.applicationIconName)
     icon.toolTip=app.app
-    if app.id == selectedWindow(members,focused:focused), apps.count>1 {
-     icon.wantsLayer=true;icon.shadow=NSShadow();icon.shadow?.shadowOffset=NSSize(width:-1,height:0);icon.shadow?.shadowBlurRadius=1.5;icon.shadow?.shadowColor=NSColor.black.withAlphaComponent(0.35)
-    }
     card.addSubview(icon)
    }
    if iconLayout.hiddenCount > 0 {
-    let overflow=NSTextField(labelWithString:"+\(iconLayout.hiddenCount)")
+    let overflow=card.takeLabel("+\(iconLayout.hiddenCount)")
     overflow.frame=NSRect(x:cardWidth-25,y:titles ? 0 : compact ? 14 : 25,width:23,height:13)
     overflow.font = .monospacedDigitSystemFont(ofSize:9,weight:.bold)
     overflow.alignment = .right
     card.addSubview(overflow)
    }
    let alias=preferences.aliases[chosen.bundle+"\t"+chosen.title]
-   let label=NSTextField(labelWithString:titles ? (alias ?? (chosen.title.isEmpty ? chosen.app : chosen.title)) : chosen.app)
+   let label=card.takeLabel(titles ? (alias ?? (chosen.title.isEmpty ? chosen.app : chosen.title)) : chosen.app)
    card.toolTip=apps.map { $0.app }.joined(separator:", ")+" — "+(alias ?? chosen.title)
    label.frame=NSRect(x:iconLayout.labelStart,y:titles ? (cardHeight-16)/2 : compact ? 7:18,width:max(0,cardWidth-iconLayout.labelStart-(titles && members.count>1 ? 28:8)),height:14);label.font = .systemFont(ofSize:titles ? 12:compact ? 10:11,weight:active ? .semibold : .regular)
    label.textColor=hudColor(hudDark(card) ? (active ? 0xF5F5F7:0xE5E5E7):(active ? 0x1D1D1F:0x3A3A3C))
    label.alignment = titles ? .left:.center;label.lineBreakMode = .byTruncatingTail
    card.addSubview(label)
    if members.count>1 {
-    let badge=HUDBadge(labelWithString:"\(members.count)")
+    let badge=card.takeBadge("\(members.count)")
     let bh:CGFloat=compact ? 13:15,bw:CGFloat=max(bh,CGFloat(String(members.count).count)*6+6)
     badge.frame=NSRect(x:cardWidth-bw-(compact ? 4:5),y:titles ? (cardHeight-bh)/2:compact ? 4:5,width:bw,height:bh);badge.font = .monospacedDigitSystemFont(ofSize:9.5,weight:.bold)
     badge.textColor=hudDark(card) ? hudColor(0x062626):.white
@@ -1335,11 +1467,11 @@ final class Navigator: NSObject, NSApplicationDelegate {
   }
  }
  // Build a real HUD view independently of NSPanel ordering for headless rendering.
- func makeRowsHUD(_ rows: HUDRows, focused: Int, viewing: Int?, visible: CGRect, appearance: NSAppearance? = nil, scroll state: HUDScrollState = HUDScrollState()) -> NSView {
+ func makeRowsHUD(_ rows: HUDRows, focused: Int, viewing: Int?, visible: CGRect, appearance: NSAppearance? = nil, scroll state: HUDScrollState = HUDScrollState(), kit: HUDKit = HUDKit()) -> NSView {
   activeHUDCards=[]; hudRowLanes=[:]; hudRowCards=[:]
   let maxColumns=rows.entries.values.map { Set($0.map(\.column)).count }.max() ?? 0
   let layout=HUDRowsLayout(rowCount:rows.indices.count,maxColumns:maxColumns,visible:visible,style:preferences.style)
-  let root=RoundedHUDView(frame:CGRect(origin:.zero,size:layout.size))
+  let root=kit.root; root.frame=CGRect(origin:.zero,size:layout.size)
   let dark=(appearance ?? NSApp?.effectiveAppearance ?? NSAppearance.currentDrawing()).bestMatch(from:[.aqua,.darkAqua]) == .darkAqua
   root.appearance=NSAppearance(named:dark ? .vibrantDark : .vibrantLight)
   root.material = .hudWindow; root.blendingMode = .behindWindow; root.state = .active
@@ -1352,13 +1484,13 @@ final class Navigator: NSObject, NSApplicationDelegate {
   root.setFrameSize(CGSize(width:layout.size.width,height:min(layout.size.height,contentHeight)))
   var rowTop=contentHeight-m.pad
   var currentSpan=(min:CGFloat(0),max:CGFloat(0))
-  let canvas=NSView(frame:CGRect(x:0,y:0,width:layout.size.width,height:contentHeight))
+  let canvas=kit.canvas; canvas.frame=CGRect(x:0,y:0,width:layout.size.width,height:contentHeight)
   for (index,row) in rows.indices.enumerated() {
    let current=row == rows.current
    let rowHeight=heights[index],y=rowTop-rowHeight
    rowTop=y-m.gap
    if current { currentSpan=(y,y+rowHeight) }
-   let label=NSTextField(labelWithString:"\(current ? "●" : "○") \(row)")
+   let label=kit.label("\(current ? "●" : "○") \(row)")
    label.frame=CGRect(x:m.left,y:y+(rowHeight-16)/2,width:m.gutter,height:16)
    label.font = .monospacedSystemFont(ofSize:style == "compact" ? 11:12,weight:current ? .semibold : .regular)
    label.textColor=hudColor(dark ? (current ? 0x3CC6C4:0xA1A1A6):(current ? 0x00777A:0x6E6E73))
@@ -1366,11 +1498,11 @@ final class Navigator: NSObject, NSApplicationDelegate {
    canvas.addSubview(label)
    let entries=rows.entries[row] ?? [], groups=Dictionary(grouping:entries,by:{$0.column}), columns=groups.keys.sorted()
    if columns.isEmpty {
-    let lane=HUDEmptySlot(frame:CGRect(x:m.left+m.gutter,y:y,width:layout.size.width-m.left-m.gutter-m.pad,height:rowHeight))
+    let lane=kit.slot(frame:CGRect(x:m.left+m.gutter,y:y,width:layout.size.width-m.left-m.gutter-m.pad,height:rowHeight))
     canvas.addSubview(lane); hudRowLanes[row]=lane
-    let empty=NSTextField(labelWithString:"Empty row")
+    let empty=lane.caption
     empty.frame=CGRect(x:0,y:(rowHeight-16)/2,width:lane.frame.width,height:16)
-    empty.alignment = .center;empty.font = .systemFont(ofSize:11); empty.textColor = .secondaryLabelColor; lane.addSubview(empty)
+    empty.alignment = .center;empty.font = .systemFont(ofSize:11); empty.textColor = .secondaryLabelColor
     continue
    }
    let preferred=m.card.width
@@ -1379,12 +1511,13 @@ final class Navigator: NSObject, NSApplicationDelegate {
    // with a visible scroller rather than dropping app identities.
    let cardWidth=max(32,min(preferred,(laneWidth-CGFloat(columns.count-1)*m.gap)/CGFloat(columns.count)))
    let stripWidth=max(laneWidth,CGFloat(columns.count)*(cardWidth+m.gap)-m.gap)
-   let strip=NSView(frame:CGRect(x:0,y:0,width:stripWidth,height:rowHeight))
+   let lane=kit.lane(), strip=lane.strip
+   strip.frame=CGRect(x:0,y:0,width:stripWidth,height:rowHeight)
    var activeSpan: (min:CGFloat,max:CGFloat)?
    for (offset,col) in columns.enumerated() {
     let members=groups[col]!
     let active=current && (viewing.map { $0 == col } ?? members.contains { $0.id == focused })
-    let card=makeHUDCard(members,column:col,focused:current ? focused : 0,active:active,interactive:current,frame:CGRect(x:CGFloat(offset)*(cardWidth+m.gap),y:0,width:cardWidth,height:rowHeight),style:style)
+    let card=makeHUDCard(members,column:col,focused:current ? focused : 0,active:active,interactive:current,frame:CGRect(x:CGFloat(offset)*(cardWidth+m.gap),y:0,width:cardWidth,height:rowHeight),style:style,kit:kit)
     if active && activeSpan == nil { activeSpan=(card.frame.minX,card.frame.maxX) }
     let sourceID=members.first!.id
     card.onDrag = { [weak self] point in self?.rowCardDrag(source:sourceID,sourceRow:row,point:point,commit:false) }
@@ -1395,9 +1528,10 @@ final class Navigator: NSObject, NSApplicationDelegate {
     strip.addSubview(card)
     if current { activeHUDCards.append(card) }
    }
-   let scroll=NSScrollView(frame:CGRect(x:m.left+m.gutter,y:y,width:laneWidth,height:rowHeight))
+   let scroll=lane.scroll; scroll.frame=CGRect(x:m.left+m.gutter,y:y,width:laneWidth,height:rowHeight)
    scroll.scrollerStyle = .overlay; scroll.drawsBackground=false; scroll.hasHorizontalScroller=stripWidth > laneWidth+1; scroll.autohidesScrollers=false
-   scroll.documentView=strip; canvas.addSubview(scroll); hudRowLanes[row]=scroll
+   scroll.contentView.scroll(to:.zero); scroll.reflectScrolledClipView(scroll.contentView)
+   canvas.addSubview(scroll); hudRowLanes[row]=scroll
    if stripWidth > laneWidth+1 {
     // Keep the lane where the viewer left it; the active card is always brought into view.
     let kept=min(stripWidth-laneWidth,max(0,state.lanes[row] ?? 0))
@@ -1405,7 +1539,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
     scroll.contentView.scroll(to:CGPoint(x:x,y:0)); scroll.reflectScrolledClipView(scroll.contentView)
    }
    if stripWidth > laneWidth+1 {
-    let overflow=NSTextField(labelWithString:"↔")
+    let overflow=kit.label("↔")
     overflow.frame=CGRect(x:20,y:y+2,width:24,height:13); overflow.font = .systemFont(ofSize:10)
     overflow.textColor = .secondaryLabelColor
     overflow.toolTip="Scroll horizontally for all \(columns.count) columns"
@@ -1414,7 +1548,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
    }
   }
   if contentHeight > root.frame.height {
-   let scroll=NSScrollView(frame:root.bounds); scroll.drawsBackground=false; scroll.hasVerticalScroller=true
+   let scroll=kit.verticalScroll; scroll.frame=root.bounds; scroll.drawsBackground=false; scroll.hasVerticalScroller=true
    scroll.documentView=canvas; root.addSubview(scroll)
    let top=contentHeight-root.frame.height
    let y=revealOffset(current:state.fromTop.map { top-$0 } ?? top,visible:root.frame.height,itemMin:currentSpan.min,itemMax:currentSpan.max,content:contentHeight)
@@ -1453,15 +1587,16 @@ final class Navigator: NSObject, NSApplicationDelegate {
   let scrollState=captureScroll(), presenting = !panel.isVisible
   clearMinimapDrop(); minimapDropTargets=[]; activeHUDCards=[]; hudRowLanes=[:]; hudRowCards=[:]
   lastRenderSig=signature
-  let view=makeRowsHUD(model,focused:focused,viewing:viewing,visible:screen.visibleFrame,scroll:scrollState)
+  hudKit.reclaim()
+  let view=makeRowsHUD(model,focused:focused,viewing:viewing,visible:screen.visibleFrame,scroll:scrollState,kit:hudKit)
   // AppKit resizes an assigned content view to the panel’s existing size.
   // Capture the desired size first; a newly created panel is zero-sized.
   panel.setFrame(minimapFrame(size:view.frame.size,visible:screen.visibleFrame,position:preferences.position),display:false)
-  panel.contentView=view
+  if panel.contentView !== view { panel.contentView=view }
   panel.invalidateShadow()
   refreshHUDDropTargets()
   if presenting { panel.alphaValue=1; panel.ignoresMouseEvents=false }
-  panel.orderFrontRegardless()
+  if ordersPanel { panel.orderFrontRegardless() }
  }
 }
 #if !NAVIGATOR_TESTS
