@@ -389,10 +389,14 @@ pub(super) fn window_focused_trigger(
         {
             // Behavior trace: a focus change revealing a hidden row is the
             // moment a window "jumps" rows, so it is worth a line in the log.
+            // The Space ids show a reveal across Spaces: a window filed under a
+            // row of a Space that is not the one on screen.
             info!(
-                "focus on window {window_id} ({}) reveals row {}",
+                "focus on window {window_id} ({}) reveals row {} (Space {:?}, active Space {:?})",
                 app.name(),
-                owner_row + 1
+                owner_row + 1,
+                owning_workspace_id,
+                active_workspace_id
             );
             entity_commands.try_insert(ActiveWorkspaceMarker);
         }

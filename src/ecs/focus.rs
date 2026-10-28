@@ -204,7 +204,14 @@ impl KeyboardHold {
     /// A front switch to `psn`: the engine's own is the hold taking effect, any
     /// other process (an app, Spotlight, Raycast) ends it.
     pub(super) fn front_switched(&mut self, psn: ProcessSerialNumber) {
-        if self.0.is_some_and(|held| held.own != psn) {
+        let Some(held) = self.0 else {
+            return;
+        };
+        if held.own == psn {
+            // The live proof that the hold took: without it the parked window
+            // would still be the keyboard target.
+            info!("empty row: the engine is front, keystrokes reach no window");
+        } else {
             info!("empty row: front switch to another process, keyboard released");
             self.release();
         }
