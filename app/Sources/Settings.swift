@@ -150,12 +150,16 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
     let rootURL: URL
     private(set) var raw: [String: Any] = [:]
     private(set) var saved = SettingsPrefs()
-    var draft = SettingsPrefs() { didSet { if draft != oldValue { draftChanged() } } }
+    var draft = SettingsPrefs() { didSet { if draft != oldValue { draftChanged(from: oldValue) } } }
     private(set) var catalog: [ShortcutAction] = []
     var invalid: [String: String] = [:]
-    var phase: Phase = .idle
-    var recordingID: String?
+    var phase: Phase = .idle { didSet { if phase != oldValue { announce() } } }
+    var recordingID: String? { didSet { if recordingID == nil { recordingStarted = false } } }
+    /// True once the engine has paused its shortcuts and keys are actually being captured.
+    var recordingStarted = false
     var recordingNote: String?
+    /// Bumped to ask the Shortcuts pane to reveal its first conflict.
+    var revealConflict = 0
     /// Set when the backend saved everything but couldn't float some already-open windows.
     var applyNote: String?
     /// Bumped whenever fields must re-read the draft (Revert, external reload).
@@ -166,11 +170,14 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
     var selectedWindowID: Int?
     var lastFocusedWindowID: Int?
     var currentPane: SettingsPane = .behavior
+    /// Screen Recording access for tab color matching; refreshed whenever the window is shown.
+    var canSampleScreen = CGPreflightScreenCaptureAccess()
 
     @ObservationIgnored var beginRecording: ((String) -> Void)?
     @ObservationIgnored var cancelRecording: (() -> Void)?
     @ObservationIgnored var onApplied: (() -> Void)?
     @ObservationIgnored var openPane: ((SettingsPane) -> Void)?
+    @ObservationIgnored var onDraftChanged: (() -> Void)?
     @ObservationIgnored private var persistWork: DispatchWorkItem?
     @ObservationIgnored private var confirmTimer: Timer?
 
@@ -205,22 +212,39 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
         guard newSaved != saved else { return }
         var next = draft
         for f in SettingsPrefs.fields where f.same(draft, saved) { f.adopt(&next, newSaved) }
+        // Shortcuts and tab titles rebase per entry: an outside change to one shortcut must not be
+        // undone because the user is editing another.
+        for (id, value) in newSaved.shortcuts where draft.shortcuts[id] == saved.shortcuts[id] { next.shortcuts[id] = value }
+        for key in Set(saved.tabAliases.keys).union(newSaved.tabAliases.keys) where draft.tabAliases[key] == saved.tabAliases[key] { next.tabAliases[key] = newSaved.tabAliases[key] }
         raw = newRaw; saved = newSaved; draft = next; revision += 1
     }
     var isDirty: Bool { draft != saved }
-    var conflicts: [String: [String]] {
+    var conflicts: [String: [String]] { Self.conflicts(draft.shortcuts) }
+    var conflictCount: Int { Self.conflictCount(draft.shortcuts) }
+    nonisolated static func conflicts(_ shortcuts: [String: String]) -> [String: [String]] {
         var byChord: [String: [String]] = [:]
-        for (id, chord) in draft.shortcuts where !chord.isEmpty { byChord[chord, default: []].append(id) }
+        for (id, chord) in shortcuts where !chord.isEmpty { byChord[chord, default: []].append(id) }
         var out: [String: [String]] = [:]
         for ids in byChord.values where ids.count > 1 { for id in ids { out[id] = ids.filter { $0 != id }.sorted() } }
         return out
     }
-    var conflictCount: Int { Set(draft.shortcuts.filter { conflicts[$0.key] != nil }.map(\.value)).count }
+    /// Number of key combinations claimed by more than one action.
+    nonisolated static func conflictCount(_ shortcuts: [String: String]) -> Int {
+        var seen: [String: Int] = [:]
+        for chord in shortcuts.values where !chord.isEmpty { seen[chord, default: 0] += 1 }
+        return seen.values.filter { $0 > 1 }.count
+    }
     var canApply: Bool { isDirty && invalid.isEmpty && conflictCount == 0 && phase != .applying && recordingID == nil && !catalog.isEmpty }
     var canRevert: Bool { (isDirty || !invalid.isEmpty) && phase != .applying && recordingID == nil }
 
-    private func draftChanged() {
+    private func draftChanged(from old: SettingsPrefs) {
         if case .failed = phase {} else if phase != .applying, isDirty { phase = .idle }
+        if recordingID == nil { recordingNote = nil }
+        persist()
+        onDraftChanged?()
+        if conflictCount > Self.conflictCount(old.shortcuts) { Self.post("Shortcut conflict: \(conflictCount) to resolve before applying") }
+    }
+    private func persist() {
         persistWork?.cancel()
         let changed = draft.changedKeys(from: saved), snapshot = draft, url = pendingURL
         let payload = Dictionary(uniqueKeysWithValues: SettingsPrefs.fields.filter { changed.contains($0.key) }.map { ($0.key, $0.write(snapshot)) })
@@ -234,7 +258,7 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
     }
     func revert() {
         guard canRevert else { return }
-        invalid = [:]; draft = saved; revision += 1; restoredDraft = false
+        invalid = [:]; draft = saved; revision += 1; restoredDraft = false; recordingNote = nil
         if case .failed = phase { phase = .idle }
     }
     func apply() {
@@ -261,8 +285,9 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
                 case .success(let message):
                     self.applyNote = message.contains("could not be applied") ? "Some open windows couldn’t be floated; new ones follow your rules" : nil
                     self.raw = out; self.saved = submitted; self.restoredDraft = false
-                    try? FileManager.default.removeItem(at: self.pendingURL)
-                    self.phase = .waiting; self.onApplied?(); self.watchEngine(logOffset: logOffset)
+                    // Edits made while applying stay pending; anything else has just been saved.
+                    self.persist()
+                    self.phase = .waiting; self.onApplied?(); self.onDraftChanged?(); self.watchEngine(logOffset: logOffset)
                 case .failure(let error):
                     self.phase = .failed(error.localizedDescription)
                 }
@@ -277,13 +302,15 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
         guard let log = SettingsController.engineLogURL(rootURL), let offset = logOffset else { phase = .unconfirmed; return }
         let started = Date()
         confirmTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] timer in
-            let verdict = SettingsController.reloadVerdict(log, from: offset)
-            MainActor.assumeIsolated {
-                guard let self, self.phase == .waiting else { timer.invalidate(); return }
-                switch verdict {
-                case .some(.success): self.phase = .confirmed; timer.invalidate()
-                case .some(.failure(let error)): self.phase = .rejected(error.localizedDescription); timer.invalidate()
-                case .none: if Date().timeIntervalSince(started) > 10 { self.phase = .unconfirmed; timer.invalidate() }
+            DispatchQueue.global(qos: .utility).async {
+                let verdict = SettingsController.reloadVerdict(log, from: offset)
+                DispatchQueue.main.async {
+                    guard let self, self.phase == .waiting else { timer.invalidate(); return }
+                    switch verdict {
+                    case .some(.success): self.phase = .confirmed; timer.invalidate()
+                    case .some(.failure(let error)): self.phase = .rejected(error.localizedDescription); timer.invalidate()
+                    case .none: if Date().timeIntervalSince(started) > 10 { self.phase = .unconfirmed; timer.invalidate() }
+                    }
                 }
             }
         }
@@ -332,9 +359,42 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
         }
     }
     func label(for id: String) -> String { catalog.first { $0.id == id }.map(ShortcutLayout.actionName) ?? id }
+    private func announce() {
+        switch phase {
+        case .confirmed: Self.post("Settings applied")
+        case .rejected: Self.post("Microfish kept its previous settings")
+        case .failed(let message): Self.post("Couldn’t apply settings. " + message)
+        case .unconfirmed: Self.post("Settings saved; Microfish hasn’t reloaded yet")
+        default: break
+        }
+    }
+    static func post(_ text: String) {
+        NSAccessibility.post(element: NSApp as Any, notification: .announcementRequested, userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.high.rawValue])
+    }
+    // App names and icons for rules, resolved once per bundle.
+    @ObservationIgnored private var apps: [String: (String, NSImage?)] = [:]
+    func app(_ bundle: String) -> (name: String, icon: NSImage?) {
+        if let hit = apps[bundle] { return hit }
+        var result: (String, NSImage?) = (bundle.isEmpty ? "Any app" : bundle, nil)
+        if !bundle.isEmpty, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) {
+            result = (FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: ""), NSWorkspace.shared.icon(forFile: url.path))
+        }
+        apps[bundle] = result
+        return result
+    }
 }
 
 // MARK: - Window controller
+
+/// Reports when SwiftUI invalidates the pane's ideal size. A grouped Form inside a fixed frame does not
+/// always do so when rows come and go, so draft changes also trigger a re-measure.
+final class PaneHostingView<Content: View>: NSHostingView<Content> {
+    var onIdealSizeChange: (() -> Void)?
+    override func invalidateIntrinsicContentSize() {
+        super.invalidateIntrinsicContentSize()
+        onIdealSizeChange?()
+    }
+}
 
 final class SettingsWindow: NSWindow {
     // Escape cancels a running shortcut capture before anything else sees it.
@@ -369,6 +429,7 @@ final class SettingsWindow: NSWindow {
         super.init()
         MainActor.assumeIsolated {
             store.openPane = { [weak self] in self?.select($0, animate: true) }
+            store.onDraftChanged = { [weak self] in self?.draftDidChange() }
             configureRecorder()
         }
     }
@@ -377,9 +438,9 @@ final class SettingsWindow: NSWindow {
     private func present() {
         installMainMenu()
         if window == nil { build() }
-        store.reloadFromDisk(); store.refreshWindows()
+        store.reloadFromDisk(); store.refreshWindows(); store.canSampleScreen = CGPreflightScreenCaptureAccess()
         window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
         warmPanes()
     }
 
@@ -394,6 +455,7 @@ final class SettingsWindow: NSWindow {
         installFooter(in: w.contentView!)
         let toolbar = NSToolbar(identifier: "MicrofishSettingsToolbar")
         toolbar.delegate = self; toolbar.displayMode = .iconAndLabel; toolbar.allowsUserCustomization = false
+        toolbar.allowsDisplayModeCustomization = false
         w.toolbar = toolbar
         window = w
         let saved = UserDefaults.standard.string(forKey: Self.paneKey).flatMap(SettingsPane.init(rawValue:)) ?? .behavior
@@ -410,8 +472,9 @@ final class SettingsWindow: NSWindow {
     private func host(for pane: SettingsPane) -> NSView {
         if let view = hosts[pane] { return view }
         let root = SettingsPaneView(pane: pane, store: store, controller: self).frame(width: Self.width)
-        let view = NSHostingView(rootView: root)
+        let view = PaneHostingView(rootView: root)
         view.sizingOptions = [.intrinsicContentSize]
+        view.onIdealSizeChange = { [weak self] in self?.scheduleRefit() }
         hosts[pane] = view
         return view
     }
@@ -440,7 +503,7 @@ final class SettingsWindow: NSWindow {
         let paneHeight = height(for: pane, next)
         var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: NSSize(width: Self.width, height: paneHeight + footerHeight)))
         frame.origin = NSPoint(x: window.frame.minX, y: window.frame.maxY - frame.height)
-        self.pane = pane; store.currentPane = pane
+        self.pane = pane; store.currentPane = pane; window.isDocumentEdited = store.isDirty
         window.title = pane.title
         window.toolbar?.selectedItemIdentifier = NSToolbarItem.Identifier(pane.rawValue)
         UserDefaults.standard.set(pane.rawValue, forKey: Self.paneKey)
@@ -461,6 +524,35 @@ final class SettingsWindow: NSWindow {
             window.setFrame(frame, display: window.isVisible)
         }
         settleFocus()
+    }
+    private var refitScheduled = false
+    private func draftDidChange() { window?.isDocumentEdited = store.isDirty; scheduleRefit() }
+    /// SwiftUI invalidates before its new ideal size is settled, so measure again shortly after.
+    private func scheduleRefit() {
+        guard !refitScheduled else { return }
+        refitScheduled = true
+        for (i, delay) in [0.0, 0.06, 0.2].enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                if i == 2 { self?.refitScheduled = false }
+                self?.refit()
+            }
+        }
+    }
+    func refit() {
+        guard let window, let view = hosts[pane], view.superview != nil, pane != .shortcuts else { return }
+        let paneHeight = height(for: pane, view)
+        guard abs(paneHeight - view.frame.height) > 1 else { return }
+        var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: NSSize(width: Self.width, height: paneHeight + footerHeight)))
+        frame.origin = NSPoint(x: window.frame.minX, y: window.frame.maxY - frame.height)
+        let growing = paneHeight > view.frame.height
+        let pin = { view.frame = NSRect(x: 0, y: (window.contentView?.bounds.height ?? 0) - paneHeight, width: Self.width, height: paneHeight) }
+        if growing { view.frame = NSRect(x: 0, y: view.frame.maxY - paneHeight, width: Self.width, height: paneHeight) }
+        if window.isVisible && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = window.animationResizeTime(frame)
+                window.animator().setFrame(frame, display: true)
+            }, completionHandler: { MainActor.assumeIsolated { pin() } })
+        } else { window.setFrame(frame, display: window.isVisible); pin() }
     }
     /// Builds the other panes while idle so the first visit to one doesn't stall on SwiftUI setup.
     private func warmPanes() {
@@ -490,7 +582,11 @@ final class SettingsWindow: NSWindow {
         UserDefaults.standard.set(NSStringFromPoint(NSPoint(x: window.frame.minX, y: window.frame.maxY)), forKey: Self.originKey)
     }
     func windowDidMove(_ notification: Notification) { rememberOrigin() }
-    func windowWillClose(_ notification: Notification) { store.cancelRecording?() }
+    func windowWillClose(_ notification: Notification) {
+        store.cancelRecording?()
+        // The color panel belongs to this window's outline well; don't leave it floating alone.
+        if NSColorPanel.sharedColorPanelExists { NSColorPanel.shared.orderOut(nil) }
+    }
     func windowDidBecomeKey(_ notification: Notification) { store.reloadFromDisk() }
 
     // MARK: Toolbar
@@ -547,6 +643,11 @@ final class SettingsWindow: NSWindow {
                 }
             }
         }
+        recorder.didStart = { [weak self] in self?.store.recordingStarted = true; SettingsStore.post("Recording. Press the new shortcut.") }
+        recorder.didReject = { [weak self] in
+            self?.store.recordingNote = "Include ⌃, ⌥ or ⌘ in the shortcut"
+            NSSound.beep()
+        }
         recorder.didFinish = { [weak self] chord, error in
             guard let self else { return }
             if let id = self.store.recordingID, let chord { self.store.draft.shortcuts[id] = chord }
@@ -579,7 +680,8 @@ final class SettingsWindow: NSWindow {
         guard (try? handle.seek(toOffset: offset)) != nil, let data = try? handle.readToEnd(), !data.isEmpty else { return nil }
         let plain = String(decoding: data, as: UTF8.self).replacingOccurrences(of: "\u{1B}\\[[0-9;]*m", with: "", options: .regularExpression)
         for line in plain.split(separator: "\n") {
-            if line.contains("ERROR Reloading Lua script") {
+            // Real shape: "ERROR paneru::lua::worker: src/lua/worker.rs:342: Reloading Lua script '…': err"
+            if line.contains("Reloading Lua script") && line.contains("ERROR") {
                 let detail = line.components(separatedBy: "Reloading Lua script").last?.trimmingCharacters(in: .whitespaces) ?? ""
                 return .failure(NSError(domain: "Settings", code: 3, userInfo: [NSLocalizedDescriptionKey: String(detail.prefix(160))]))
             }
@@ -662,7 +764,7 @@ struct FooterBar: View {
         HStack(spacing: 8) {
             if showsResetAll {
                 Button("Reset All") { store.draft.shortcuts = store.defaults }
-                    .buttonStyle(.link)
+                    .buttonStyle(.link).foregroundStyle(settingsAccent)
                     .disabled(store.draft.shortcuts == store.defaults || store.recordingID != nil)
                     .help("Restore every shortcut to its default")
                 Spacer()
@@ -671,14 +773,23 @@ struct FooterBar: View {
             if !showsResetAll { Spacer() }
             Button("Revert") { store.revert() }.disabled(!store.canRevert)
                 .help("Discard unapplied changes")
-            Button("Apply") { store.apply() }.keyboardShortcut(.defaultAction).disabled(!store.canApply)
+            // Not the default button: Return in a field or the search box must never push a draft
+            // spanning every pane to the live window manager. ⌘S applies from anywhere.
+            Button("Apply") { store.apply() }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut("s", modifiers: .command)
+                .disabled(!store.canApply)
+                .help("Apply all changes (⌘S)")
         }
         .controlSize(.regular)
         .padding(.horizontal, 20).padding(.vertical, 12)
     }
     private var state: (String, Color, Bool) {
         if store.phase == .applying { return ("Applying…", .secondary, true) }
-        if store.recordingID != nil { return ("Recording a shortcut · Esc cancels", settingsAccent, false) }
+        if store.recordingID != nil {
+            if let note = store.recordingNote { return (note, .orange, false) }
+            return store.recordingStarted ? ("Recording a shortcut · Esc cancels · Delete clears", settingsAccent, false) : ("Pausing Microfish shortcuts…", .secondary, true)
+        }
         if let note = store.recordingNote { return (note, .orange, false) }
         if store.conflictCount > 0 { return ("\(store.conflictCount) shortcut conflict\(store.conflictCount == 1 ? "" : "s") to resolve before applying", .red, false) }
         if let message = store.invalid.sorted(by: { $0.key < $1.key }).first?.value { return (message, .red, false) }
@@ -698,8 +809,10 @@ struct FooterBar: View {
             if busy { ProgressView().controlSize(.small) } else { Circle().fill(color).frame(width: 7, height: 7) }
             Text(text).font(.callout).foregroundStyle(color == .red ? Color.red : .secondary).lineLimit(1).truncationMode(.tail)
                 .help(text)
-            if store.conflictCount > 0 && pane != .shortcuts && store.recordingID == nil {
-                Button("Show") { store.openPane?(.shortcuts) }.buttonStyle(.link).font(.callout)
+            if store.conflictCount > 0 && store.recordingID == nil && store.phase != .applying {
+                Button("Show") { if pane != .shortcuts { store.openPane?(.shortcuts) }; store.revealConflict += 1 }
+                    .buttonStyle(.link).foregroundStyle(settingsAccent).font(.callout)
+                    .accessibilityLabel("Show conflicting shortcut")
             }
         }
         .accessibilityElement(children: .contain)
@@ -737,11 +850,13 @@ struct NumberField: View {
                     .frame(width: 64)
                     .accessibilityLabel(title + (unit.isEmpty ? "" : ", in " + (unit == "s" ? "seconds" : "points")))
                     .accessibilityHint(hint ?? "")
+                    .accessibilityValue(store.invalid[key].map { text + ", invalid. " + $0 } ?? text)
                     .overlay(RoundedRectangle(cornerRadius: 5).stroke(store.invalid[key] != nil ? Color.red : .clear, lineWidth: 1.5).allowsHitTesting(false))
                     .onChange(of: text) { _, new in commit(new) }
                 Text(unit).foregroundStyle(.secondary).frame(minWidth: 14, alignment: .leading).accessibilityHidden(true)
             }
         } label: { HintLabel(title, hint) }
+        .disabled(!store.draft.rowsEnabled)
         .onAppear { text = Self.format(value.wrappedValue) }
         .onChange(of: store.revision) { _, _ in text = Self.format(value.wrappedValue) }
     }
@@ -763,7 +878,12 @@ struct ValueSlider: View {
     var body: some View {
         LabeledContent {
             HStack(spacing: 10) {
-                Slider(value: value, in: range, step: step).labelsHidden().frame(width: 170)
+                // Quantized in the binding rather than with `step:`, which would draw a tick per step.
+                Slider(value: Binding(get: { value.wrappedValue }, set: { new in
+                    let snapped = min(range.upperBound, max(range.lowerBound, (new / step).rounded() * step))
+                    let clean = (snapped * 1000).rounded() / 1000
+                    if clean != value.wrappedValue { value.wrappedValue = clean }
+                }), in: range).labelsHidden().frame(width: 170)
                     .accessibilityLabel(title).accessibilityValue(String(format: format, value.wrappedValue))
                 Text(String(format: format, value.wrappedValue)).monospacedDigit().foregroundStyle(.secondary).frame(width: 34, alignment: .trailing).accessibilityHidden(true)
             }
@@ -789,14 +909,19 @@ struct BehaviorPane: View {
                 NumberField(store: store, key: "windowGap", title: "Window padding", hint: "Per side · 0–100", unit: "pt", value: $store.draft.windowGap, whole: true)
             }
             Section("Trackpad & Scrolling") {
-                Picker("Swipe with", selection: $store.draft.swipeFingers) { Text("3 fingers").tag(3); Text("4 fingers").tag(4) }
-                    .pickerStyle(.segmented).fixedSize()
+                LabeledContent("Swipe with") {
+                    Picker("Swipe with", selection: $store.draft.swipeFingers) { Text("3 fingers").tag(3); Text("4 fingers").tag(4) }
+                        .labelsHidden().pickerStyle(.segmented).fixedSize()
+                }
                 ValueSlider(title: "Swipe sensitivity", value: $store.draft.swipeSensitivity, range: 0.1...2, step: 0.05)
                 ValueSlider(title: "Swipe deceleration", value: $store.draft.swipeDeceleration, range: 1...10, step: 0.5, format: "%.1f")
                 Toggle("Reverse swipe direction", isOn: $store.draft.reverseSwipe)
-                Picker("Scroll the strip while holding", selection: $store.draft.scrollModifier) {
-                    Text("Hyper  ⌃⌥⌘").tag("hyper"); Text("Control-Option  ⌃⌥").tag("controlOption")
-                }.fixedSize()
+                LabeledContent("Scroll the strip while holding") {
+                    Picker("Scroll the strip while holding", selection: $store.draft.scrollModifier) {
+                        Text("Hyper  ⌃⌥⌘").tag("hyper"); Text("Control-Option  ⌃⌥").tag("controlOption")
+                    }
+                    .labelsHidden().fixedSize()
+                }
             }
         }
         .toggleStyle(.switch)
@@ -818,23 +943,25 @@ struct Keycap: View {
 struct RowsPane: View {
     @Bindable var store: SettingsStore
     /// Builds a legend entry from the live bindings, so a rebound key never shows a stale cap.
-    private func legend(_ title: String, _ ids: [String], _ suffix: String? = nil) -> some View {
+    private func legend(_ title: String, _ ids: [String], hint: String? = nil, _ suffix: String? = nil) -> some View {
         let parsed = ids.compactMap { store.draft.shortcuts[$0].flatMap(Chord.parse) }
         let mods = parsed.first?.mods ?? []
         let shared = parsed.allSatisfy { $0.mods == mods }
         let hyper: Set<String> = ["ctrl", "alt", "cmd"]
         func caps(_ m: Set<String>) -> [String] { m.isSuperset(of: hyper) ? ["Hyper"] + (m.contains("shift") ? ["⇧"] : []) : [Chord.modifiers(m)] }
         let spoken = ids.compactMap { store.draft.shortcuts[$0] }.filter { !$0.isEmpty }.map(Chord.spoken).joined(separator: ", or ")
-        return LabeledContent(title) {
+        return LabeledContent {
             HStack(spacing: 4) {
                 if parsed.isEmpty { Text("Not set").foregroundStyle(.secondary) }
-                else if shared { ForEach(caps(mods) + parsed.map { Chord.key($0.key) }, id: \.self) { Keycap(text: $0) } }
-                else { ForEach(parsed.indices, id: \.self) { i in ForEach(caps(parsed[i].mods) + [Chord.key(parsed[i].key)], id: \.self) { Keycap(text: $0) } } }
+                else {
+                    let labels = shared ? caps(mods) + parsed.map { Chord.key($0.key) } : parsed.flatMap { caps($0.mods) + [Chord.key($0.key)] }
+                    ForEach(Array(labels.enumerated()), id: \.offset) { Keycap(text: $0.element) }
+                }
                 if let suffix { Text(suffix).font(.caption).foregroundStyle(.secondary) }
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(spoken.isEmpty ? "Not set" : spoken + (suffix.map { ", " + $0 } ?? ""))
-        }
+        } label: { HintLabel(title, hint) }
     }
     var body: some View {
         Form {
@@ -847,14 +974,17 @@ struct RowsPane: View {
                 legend("Move along the strip", ["focus_leftarrow", "focus_rightarrow"])
                 legend("Move window to another row", ["move_row_north", "move_row_south"])
                 legend("Move whole column to another row", ["move_column_north", "move_column_south"])
-                legend("New row at either end", ["row_north", "row_south"])
+                legend("New row", ["row_north", "row_south"], hint: "Change row past the top or bottom row")
             } header: {
                 Text("Keys · Hyper is ⌃⌥⌘, or hold Caps Lock")
             } footer: {
-                Text("Empty rows disappear after you leave them; the row you’re on is always kept. Added rows last for the session. With rows off, ↑ ↓ and J K move within a stack and whole-column row commands are inactive.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Empty rows disappear after you leave them; the row you’re on is always kept. Added rows last for the session. With rows off, ↑ ↓ and J K move within a stack and whole-column row commands are inactive.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Button("Change these keys in Shortcuts") { store.openPane?(.shortcuts) }
+                        .buttonStyle(.link).foregroundStyle(settingsAccent).font(.caption)
+                }
             }
-            .opacity(store.draft.rowsEnabled ? 1 : 0.55)
         }
         .toggleStyle(.switch)
     }
@@ -884,11 +1014,13 @@ struct ShortcutSearchField: NSViewRepresentable {
 struct ShortcutSlot: View {
     @Bindable var store: SettingsStore
     let id: String
+    /// Second binding of the same action in a paired row ("Focus left" ← and H).
+    var alternate = false
     var body: some View {
         let chord = store.draft.shortcuts[id] ?? ""
         let recording = store.recordingID == id
         let conflicted = store.conflicts[id] != nil
-        let name = store.label(for: id)
+        let name = store.label(for: id) + (alternate ? ", alternate" : "")
         let fallback = store.defaults[id] ?? ""
         let helpText: String = fallback.isEmpty || fallback == chord ? name : name + " · default " + Chord.display(fallback)
         let valueText: String = recording ? "Recording. Press a shortcut, Escape cancels, Delete clears." : chord.isEmpty ? "Not set" : Chord.spoken(chord) + (conflicted ? ", conflicts" : "")
@@ -897,7 +1029,7 @@ struct ShortcutSlot: View {
             if recording { store.cancelRecording?() } else { store.beginRecording?(id) }
         } label: {
             Group {
-                if recording { Text("Press keys…").foregroundStyle(.tint) }
+                if recording { Text(store.recordingStarted ? "Press keys…" : "…").foregroundStyle(.tint) }
                 else if chord.isEmpty { Text("Not set").foregroundStyle(.secondary) }
                 else { Text(Chord.display(chord)).monospacedDigit().foregroundStyle(conflicted ? Color.red : .primary) }
             }
@@ -941,12 +1073,24 @@ struct ShortcutsPane: View {
                 Text("Click a shortcut, then press keys · Esc cancels").font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             .padding(.horizontal, 20).padding(.top, 14).padding(.bottom, 2)
-            Form {
-                if store.catalog.isEmpty { Text("The shortcut catalogue couldn’t be read, so shortcuts can’t be changed.").foregroundStyle(.secondary) }
-                if visible.isEmpty && !store.catalog.isEmpty { Text("No shortcuts match “\(query)”").foregroundStyle(.secondary).frame(maxWidth: .infinity) }
-                ForEach(visible, id: \.0.id) { group, rows in
-                    Section(group.id) {
-                        ForEach(rows) { row in ShortcutRowView(store: store, row: row) }
+            if visible.isEmpty && !store.catalog.isEmpty {
+                ContentUnavailableView.search(text: query).frame(maxHeight: .infinity)
+            } else {
+                ScrollViewReader { proxy in
+                    Form {
+                        if store.catalog.isEmpty { Text("Shortcuts couldn’t be loaded, so they can’t be changed.").foregroundStyle(.secondary) }
+                        ForEach(visible, id: \.0.id) { group, rows in
+                            Section(group.id) {
+                                ForEach(rows) { row in ShortcutRowView(store: store, row: row).id(row.id) }
+                            }
+                        }
+                    }
+                    .onChange(of: store.revealConflict) { _, _ in
+                        // Clear any filter that hides the conflict, then bring the first one into view.
+                        query = ""
+                        let conflicted = Set(store.conflicts.keys)
+                        guard let target = groups.flatMap(\.rows).first(where: { $0.ids.contains(where: conflicted.contains) }) else { return }
+                        DispatchQueue.main.async { withAnimation { proxy.scrollTo(target.id, anchor: .center) } }
                     }
                 }
             }
@@ -963,22 +1107,24 @@ struct ShortcutRowView: View {
         // both did), both rows carry it.
         let edited: (String) -> Bool = { store.draft.shortcuts[$0] != store.saved.shortcuts[$0] }
         let blamed = conflictIDs.filter { id in edited(id) || !(store.conflicts[id] ?? []).contains(where: edited) }
-        let others = Array(Set(blamed.flatMap { store.conflicts[$0] ?? [] })).sorted().map(store.label(for:))
+        let names = Array(Set(blamed.flatMap { store.conflicts[$0] ?? [] })).sorted().map(store.label(for:))
+        let others = names.count > 2 ? names.prefix(2).joined(separator: ", ") + " and \(names.count - 2) more" : names.joined(separator: " and ")
         let changed = row.ids.contains { (store.draft.shortcuts[$0] ?? "") != (store.defaults[$0] ?? "") }
+        let sameAction = row.ids.count == 2 && store.label(for: row.ids[0]) == store.label(for: row.ids[1])
         LabeledContent {
             HStack(spacing: 6) {
-                if changed {
-                    Button { for id in row.ids { store.draft.shortcuts[id] = store.defaults[id] ?? "" } } label: { Image(systemName: "arrow.uturn.backward") }
-                        .buttonStyle(.borderless).foregroundStyle(.secondary)
-                        .help("Restore default").accessibilityLabel("Restore default for \(row.title)")
-                        .disabled(store.recordingID != nil)
-                }
-                ForEach(row.ids, id: \.self) { ShortcutSlot(store: store, id: $0) }
+                // Always laid out so the slots stay in one column; shown only when the row differs.
+                Button { for id in row.ids { store.draft.shortcuts[id] = store.defaults[id] ?? "" } } label: { Image(systemName: "arrow.uturn.backward") }
+                    .buttonStyle(.borderless).foregroundStyle(.secondary)
+                    .help("Restore default").accessibilityLabel("Restore default for \(row.title)")
+                    .disabled(store.recordingID != nil || !changed)
+                    .opacity(changed ? 1 : 0).accessibilityHidden(!changed)
+                ForEach(Array(row.ids.enumerated()), id: \.element) { i, id in ShortcutSlot(store: store, id: id, alternate: sameAction && i == 1) }
             }
         } label: {
             VStack(alignment: .leading, spacing: 2) {
                 Text(row.title)
-                if !others.isEmpty { Text("Also used by \(others.joined(separator: ", ")) — pick another").font(.caption).foregroundStyle(.red) }
+                if !names.isEmpty { Text("Also used by \(others) — pick another").font(.caption).foregroundStyle(.red).lineLimit(1) }
             }
         }
         .listRowBackground(blamed.isEmpty ? nil : Color.red.opacity(0.08))
@@ -1012,6 +1158,7 @@ private func tabStyleImage(_ style: String) -> NSImage {
 struct TabStylePicker: View {
     @Binding var style: String
     @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.colorScheme) private var scheme
     private var base: String { style == "folder-compact" ? "folder" : style }
     var body: some View {
         HStack(spacing: 10) {
@@ -1021,7 +1168,7 @@ struct TabStylePicker: View {
                     if !on { style = value }
                 } label: {
                     VStack(spacing: 6) {
-                        Image(nsImage: tabStyleImage(value))
+                        Image(nsImage: tabStyleImage(value)).id(scheme)  // redraw the thumbnail when the appearance flips
                             .padding(6).frame(maxWidth: .infinity)
                             .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .quaternarySystemFill)))
                             .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(on ? AnyShapeStyle(.tint) : AnyShapeStyle(contrast == .increased ? Color.primary.opacity(0.6) : Color(nsColor: .separatorColor)), lineWidth: on ? 2.5 : contrast == .increased ? 1.5 : 1))
@@ -1034,8 +1181,13 @@ struct TabStylePicker: View {
                 .accessibilityAddTraits(on ? [.isSelected] : [])
             }
         }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Tab style")
+        // VoiceOver reads it as what it is: one choice of three.
+        .accessibilityRepresentation {
+            Picker("Tab style", selection: Binding(get: { base }, set: { if $0 != base { style = $0 } })) {
+                Text("Folder").tag("folder"); Text("Classic").tag("classic"); Text("Side").tag("side")
+            }
+            .pickerStyle(.radioGroup)
+        }
     }
 }
 
@@ -1065,7 +1217,7 @@ struct OutlinePreview: View {
 struct AppearancePane: View {
     @Bindable var store: SettingsStore
     @State private var hexText = ""
-    @State private var canSample = CGPreflightScreenCaptureAccess()
+    @FocusState private var hexFocused: Bool
     private var color: Binding<Color> {
         Binding(get: { Color(nsColor: Self.nsColor(store.draft.borderColor)) }, set: { new in
             if let rgb = NSColor(new).usingColorSpace(.sRGB) {
@@ -1084,54 +1236,61 @@ struct AppearancePane: View {
     var body: some View {
         Form {
             Section("Focused Window Outline") {
-                HStack(alignment: .center, spacing: 16) {
-                    VStack(spacing: 0) {
-                        LabeledContent("Color") {
-                            HStack(spacing: 8) {
-                                TextField("Hex color", text: $hexText).labelsHidden().textFieldStyle(.roundedBorder).frame(width: 84).font(.body.monospacedDigit())
-                                    .onSubmit(commitHex).onChange(of: hexText) { _, _ in if Self.validHex(hexText) { commitHex() } }
-                                ColorPicker("Outline color", selection: color, supportsOpacity: false).labelsHidden()
-                            }
-                        }
-                        .padding(.vertical, 6)
-                        Divider()
-                        NumberField(store: store, key: "borderWidth", title: "Width", hint: "0 hides the outline · up to 12", unit: "pt", value: $store.draft.borderWidth).padding(.vertical, 6)
-                        Divider()
-                        NumberField(store: store, key: "borderRadius", title: "Corner radius", hint: "0–60", unit: "pt", value: $store.draft.borderRadius).padding(.vertical, 6)
+                OutlinePreview(color: Color(nsColor: Self.nsColor(store.draft.borderColor)), width: store.draft.borderWidth, radius: store.draft.borderRadius)
+                    .frame(maxWidth: .infinity).padding(.vertical, 4)
+                LabeledContent("Color") {
+                    HStack(spacing: 8) {
+                        TextField("Hex color", text: $hexText).labelsHidden().textFieldStyle(.roundedBorder).frame(width: 84).font(.body.monospacedDigit())
+                            .focused($hexFocused)
+                            .overlay(RoundedRectangle(cornerRadius: 5).stroke(store.invalid["borderColor"] != nil ? Color.red : .clear, lineWidth: 1.5).allowsHitTesting(false))
+                            .accessibilityLabel("Outline color, hex")
+                            .onSubmit(commitHex)
+                            .onChange(of: hexText) { _, _ in checkHex() }
+                            .onChange(of: hexFocused) { _, focused in if !focused { commitHex() } }
+                        ColorPicker("Outline color", selection: color, supportsOpacity: false).labelsHidden()
                     }
-                    OutlinePreview(color: Color(nsColor: Self.nsColor(store.draft.borderColor)), width: store.draft.borderWidth, radius: store.draft.borderRadius)
                 }
+                NumberField(store: store, key: "borderWidth", title: "Width", hint: "0 hides the outline · up to 12", unit: "pt", value: $store.draft.borderWidth)
+                NumberField(store: store, key: "borderRadius", title: "Corner radius", hint: "0–60", unit: "pt", value: $store.draft.borderRadius)
             }
             Section("Tab Bars") {
                 TabStylePicker(style: $store.draft.tabStyle).padding(.vertical, 4)
                 if store.draft.tabStyle.hasPrefix("folder") {
                     Toggle(isOn: compact) { HintLabel("Compact folder tabs", "Every tab the same short height · \(store.draft.tabHeight == 34 ? 25 : 20) pt") }
                 }
-                Picker(selection: $store.draft.tabHeight) { Text("Standard").tag(28); Text("Roomy").tag(34) } label: {
+                LabeledContent {
+                    Picker("Tab height", selection: $store.draft.tabHeight) { Text("Standard").tag(28); Text("Roomy").tag(34) }
+                        .labelsHidden().pickerStyle(.segmented).fixedSize()
+                } label: {
                     HintLabel("Tab height", store.draft.tabStyle == "side" ? "Side tabs fill the window’s height" : "Folder and Classic · Standard 28 pt, Roomy 34 pt")
                 }
-                .pickerStyle(.segmented).fixedSize()
                 Toggle(isOn: $store.draft.tabMatchAppColor) {
-                    HintLabel("Match selected tab to app color", canSample ? "Samples only the selected window" : "Needs Screen Recording access; until then tabs use theme colors")
+                    HintLabel("Match selected tab to app color", store.canSampleScreen ? "Samples only the selected window" : "Needs Screen Recording access; until then tabs use theme colors")
                 }
-                if store.draft.tabMatchAppColor && !canSample {
+                if store.draft.tabMatchAppColor && !store.canSampleScreen {
                     LabeledContent("Screen Recording") {
-                        Button("Allow Screen Recording…") { _ = CGRequestScreenCaptureAccess(); canSample = CGPreflightScreenCaptureAccess() }
+                        Button("Allow Screen Recording…") { _ = CGRequestScreenCaptureAccess(); store.canSampleScreen = CGPreflightScreenCaptureAccess() }
                     }
                 }
                 LabeledContent("Rename individual tabs") {
-                    Button("Open Window Rules") { store.openPane?(.rules) }.buttonStyle(.link)
+                    Button("Open Window Rules") { store.openPane?(.rules) }.buttonStyle(.link).foregroundStyle(settingsAccent)
                 }
             }
         }
         .toggleStyle(.switch)
-        .onAppear { hexText = store.draft.borderColor.uppercased(); canSample = CGPreflightScreenCaptureAccess() }
+        .onAppear { hexText = store.draft.borderColor.uppercased() }
         .onChange(of: store.draft.borderColor) { _, new in if new.caseInsensitiveCompare(hexText) != .orderedSame { hexText = new.uppercased() } }
-        .onChange(of: store.revision) { _, _ in hexText = store.draft.borderColor.uppercased() }
+        .onChange(of: store.revision) { _, _ in hexText = store.draft.borderColor.uppercased(); store.invalid["borderColor"] = nil }
     }
     static func validHex(_ s: String) -> Bool { s.range(of: #"^#?[0-9A-Fa-f]{6}$"#, options: .regularExpression) != nil }
+    /// Live while typing: a complete value applies, a partial one is marked rather than half-applied.
+    private func checkHex() {
+        let t = hexText.trimmingCharacters(in: .whitespaces)
+        if Self.validHex(t) { commitHex() } else { store.invalid["borderColor"] = "Outline color needs six hex digits, like #009193" }
+    }
     private func commitHex() {
         let t = hexText.trimmingCharacters(in: .whitespaces)
+        store.invalid["borderColor"] = nil
         guard Self.validHex(t) else { hexText = store.draft.borderColor.uppercased(); return }
         let hex = "#" + t.replacingOccurrences(of: "#", with: "").uppercased()
         if hex.caseInsensitiveCompare(store.draft.borderColor) != .orderedSame { store.draft.borderColor = hex }
@@ -1154,7 +1313,7 @@ struct MinimapPositionDiagram: View {
                 let on = position == name
                 Button { position = name } label: {
                     RoundedRectangle(cornerRadius: 3).fill(on ? AnyShapeStyle(.tint) : AnyShapeStyle(Color(nsColor: .controlBackgroundColor)))
-                        .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(on ? AnyShapeStyle(.tint) : AnyShapeStyle(contrast == .increased ? Color.primary.opacity(0.6) : Color(nsColor: .separatorColor)), lineWidth: contrast == .increased ? 1.5 : 1))
+                        .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(on ? AnyShapeStyle(.tint) : AnyShapeStyle(Color.secondary.opacity(contrast == .increased ? 1 : 0.6)), lineWidth: contrast == .increased ? 1.5 : 1))
                 }
                 .buttonStyle(.plain)
                 .frame(width: rect.width, height: rect.height)
@@ -1178,14 +1337,18 @@ struct MinimapPane: View {
                 LabeledContent {
                     MinimapPositionDiagram(position: $store.draft.minimapPosition).padding(.vertical, 4)
                 } label: { HintLabel("Position", store.draft.minimapPosition.capitalized) }
-                Picker("Show", selection: $store.draft.minimapStyle) { Text("Cards").tag("cards"); Text("Compact").tag("compact"); Text("Titles").tag("titles") }
-                    .pickerStyle(.segmented).fixedSize()
+                LabeledContent("Show") {
+                    Picker("Show", selection: $store.draft.minimapStyle) { Text("Cards").tag("cards"); Text("Compact").tag("compact"); Text("Titles").tag("titles") }
+                        .labelsHidden().pickerStyle(.segmented).fixedSize()
+                }
             }
             Section("Timing") {
-                Picker(selection: $store.draft.minimapHide) { Text("When Hyper is released").tag("release"); Text("After a delay").tag("timer") } label: {
+                LabeledContent {
+                    Picker("Hide", selection: $store.draft.minimapHide) { Text("When Hyper is released").tag("release"); Text("After a delay").tag("timer") }
+                        .labelsHidden().pickerStyle(.menu).fixedSize()
+                } label: {
                     HintLabel("Hide", store.draft.minimapHide == "release" ? "Stays while Hyper is held, like ⌘Tab" : "Counts down after each navigation")
                 }
-                .pickerStyle(.menu).fixedSize()
                 NumberField(store: store, key: "minimapDelay", title: "Hide after", hint: store.draft.minimapHide == "release" ? "Swipes and scrolling always use this · 0.1–10" : "Counted from the end of navigation · 0.1–10", unit: "s", value: $store.draft.minimapDelay)
                 NumberField(store: store, key: "minimapFade", title: "Fade", hint: store.draft.minimapHide == "release" ? "0–3 · at most 0.12 s when Hyper is released" : "0–3", unit: "s", value: $store.draft.minimapFade)
             }
@@ -1219,9 +1382,15 @@ struct RulesPane: View {
         guard !hasRule(w, exact: exact) else { return }
         store.draft.floatingRules.append(FloatRule(id: UUID().uuidString, bundle: w.bundle, titlePattern: exact ? exactPattern(w) : ".*", enabled: true))
     }
-    static func appName(_ bundle: String) -> String {
-        guard !bundle.isEmpty, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) else { return bundle.isEmpty ? "Any app" : bundle }
-        return FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
+    static func removeButton(_ action: (() -> Void)?) -> some View {
+        Button { action?() } label: { Image(systemName: "minus.circle") }
+            .buttonStyle(.borderless).foregroundStyle(.secondary).help("Remove rule")
+    }
+    /// Menu items don't truncate on their own; keep long document titles to a readable middle cut.
+    static func menuTitle(_ w: LiveWindowEntry) -> String {
+        let title = w.title.isEmpty ? "Untitled" : w.title
+        let cut = title.count > 60 ? String(title.prefix(34)) + "…" + String(title.suffix(20)) : title
+        return w.app + " — " + cut
     }
     static func describe(_ pattern: String) -> String {
         if pattern == ".*" { return "All windows" }
@@ -1236,7 +1405,7 @@ struct RulesPane: View {
                         if store.windows.isEmpty { Text(store.windowsNote ?? "No windows").foregroundStyle(.secondary) }
                         else {
                             Picker("Selected window", selection: $store.selectedWindowID) {
-                                ForEach(store.windows) { w in Text("\(w.app) — \(w.title.isEmpty ? "Untitled" : w.title)").tag(Optional(w.id)) }
+                                ForEach(store.windows) { w in Text(Self.menuTitle(w)).tag(Optional(w.id)) }
                             }
                             .labelsHidden().frame(maxWidth: 330)
                         }
@@ -1259,17 +1428,33 @@ struct RulesPane: View {
                 }
             }
             Section {
-                Toggle(isOn: $store.draft.floatPip) { HintLabel("Picture in Picture", "Titles “Picture in Picture”, “Picture-in-Picture” or “PiP”") }
+                LabeledContent {
+                    HStack(spacing: 8) {
+                        Toggle("Picture in Picture", isOn: $store.draft.floatPip).labelsHidden()
+                        Self.removeButton(nil).hidden()  // keeps every switch in one column
+                    }
+                } label: {
+                    Label { HintLabel("Picture in Picture", "Titles “Picture in Picture”, “Picture-in-Picture” or “PiP”") } icon: {
+                        Image(systemName: "pip").frame(width: 20).foregroundStyle(.secondary)
+                    }
+                }
                 if store.draft.floatingRules.isEmpty {
                     Text("No custom rules yet — select a window above to add one").foregroundStyle(.secondary).frame(maxWidth: .infinity).padding(.vertical, 8)
                 } else {
                     ForEach($store.draft.floatingRules) { $rule in
-                        HStack(spacing: 8) {
-                            Toggle(isOn: $rule.enabled) { HintLabel(Self.appName(rule.bundle), Self.describe(rule.titlePattern)) }
-                            Button { store.draft.floatingRules.removeAll { $0.id == rule.id } } label: { Image(systemName: "minus.circle") }
-                                .buttonStyle(.borderless).foregroundStyle(.secondary)
-                                .help("Remove rule").accessibilityLabel("Remove rule for \(Self.appName(rule.bundle))")
+                        let app = store.app(rule.bundle)
+                        let remove = { store.draft.floatingRules.removeAll { $0.id == rule.id } }
+                        LabeledContent {
+                            HStack(spacing: 8) {
+                                Toggle(app.name, isOn: $rule.enabled).labelsHidden()
+                                Self.removeButton(remove).accessibilityLabel("Remove rule for \(app.name)")
+                            }
+                        } label: {
+                            Label { HintLabel(app.name, Self.describe(rule.titlePattern)) } icon: {
+                                if let icon = app.icon { Image(nsImage: icon).resizable().frame(width: 20, height: 20) } else { Image(systemName: "macwindow").frame(width: 20).foregroundStyle(.secondary) }
+                            }
                         }
+                        .contextMenu { Button("Remove Rule", action: remove) }
                     }
                 }
             } header: { Text("Floating Rules") } footer: {

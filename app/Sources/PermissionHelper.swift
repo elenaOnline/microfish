@@ -71,6 +71,9 @@ final class BuildTile: NSView, NSDraggingSource {
     let revealButton: NSButton
     let copyButton: NSButton
     private var dragOrigin: NSPoint?
+    /// Only actual paths are monospaced; sentences use the system font.
+    static let pathFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+    static let sentenceFont = NSFont.systemFont(ofSize: 11)
 
     init(reveal: NSButton, copy: NSButton) {
         revealButton = reveal; copyButton = copy
@@ -84,7 +87,7 @@ final class BuildTile: NSView, NSDraggingSource {
 
         nameLabel.font = .systemFont(ofSize: 13, weight: .semibold)
         nameLabel.lineBreakMode = .byTruncatingMiddle
-        pathLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        pathLabel.font = BuildTile.pathFont
         pathLabel.textColor = .secondaryLabelColor
         pathLabel.lineBreakMode = .byTruncatingMiddle
         for label in [nameLabel, pathLabel] {
@@ -124,6 +127,7 @@ final class BuildTile: NSView, NSDraggingSource {
             iconView.contentTintColor = nil
             nameLabel.stringValue = url.lastPathComponent
             pathLabel.stringValue = url.path
+            pathLabel.font = BuildTile.pathFont
             toolTip = url.path
             buttons.isHidden = false
             setAccessibilityElement(true)
@@ -135,6 +139,7 @@ final class BuildTile: NSView, NSDraggingSource {
             warningIcon()
             nameLabel.stringValue = "Build missing or not executable"
             pathLabel.stringValue = path
+            pathLabel.font = BuildTile.pathFont
             toolTip = path
             buttons.isHidden = true
             setAccessibilityElement(true)
@@ -146,6 +151,7 @@ final class BuildTile: NSView, NSDraggingSource {
             warningIcon()
             nameLabel.stringValue = "No build selected"
             pathLabel.stringValue = "Choose the build to give access."
+            pathLabel.font = BuildTile.sentenceFont
             toolTip = nil
             buttons.isHidden = true
             setAccessibilityElement(true)
@@ -207,10 +213,25 @@ final class BuildTile: NSView, NSDraggingSource {
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation { .copy }
 }
 
+// MARK: - Link button
+
+/// Borderless text button whose title lines up with neighbouring labels: NSButton insets its title a few points
+/// from the frame, so report that inset as an alignment-rect inset and the stack view places the glyphs on the edge.
+final class LinkButton: NSButton {
+    static let titleInset: CGFloat = 2.5
+    override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsets(top: 0, left: LinkButton.titleInset, bottom: 0, right: 0) }
+}
+
 // MARK: - Window
 
 final class HelperWindow: NSWindow {
     override func cancelOperation(_ sender: Any?) { performClose(sender) }
+#if PERMISSION_RENDER
+    // Render harness only: stay where WindowCapture parked it (off every screen), never key.
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+#endif
 }
 
 // MARK: - Delegate
@@ -220,9 +241,12 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
     var root = Bundle.main.bundleURL.deletingLastPathComponent()
     let revealButton = NSButton(title: "Show in Finder", target: nil, action: nil)
     let copyButton = NSButton(title: "Copy Path", target: nil, action: nil)
-    let chooseLink = NSButton(title: "Choose Build…", target: nil, action: nil)
+    let chooseLink = LinkButton(title: "Choose Build…", target: nil, action: nil)
     let primary = NSButton(title: "Open System Settings", target: nil, action: nil)
     var tile: BuildTile!
+    let hint = NSTextField(wrappingLabelWithString: "")
+    static let dragHint = "If dragging doesn’t work, use + in System Settings with the copied path. This helper doesn’t grant access or start Microfish."
+    static let chooseHint = "Choose the build that needs access. This helper doesn’t grant access or start Microfish."
     var state: BuildState = .none
     private var copyResetTimer: Timer?
 
@@ -230,7 +254,7 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
         buildMenu()
         _ = buildWindow()
         refresh()
-        window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+        window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate()
     }
     func applicationDidBecomeActive(_ notification: Notification) { if window != nil { refresh() } }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -275,10 +299,10 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
         copyButton.widthAnchor.constraint(equalToConstant: copyButton.fittingSize.width).isActive = true
         tile = BuildTile(reveal: revealButton, copy: copyButton)
 
-        let hint = NSTextField(wrappingLabelWithString: "If dragging doesn’t work, use + in Settings with the copied path. This helper doesn’t grant access or start Microfish.")
+        hint.stringValue = PermissionHelper.dragHint
         hint.font = .systemFont(ofSize: 11); hint.textColor = .secondaryLabelColor
-        hint.preferredMaxLayoutWidth = 380
-        hint.widthAnchor.constraint(equalToConstant: 380).isActive = true
+        hint.preferredMaxLayoutWidth = 350
+        hint.widthAnchor.constraint(equalToConstant: 350).isActive = true
 
         chooseLink.isBordered = false
         chooseLink.font = .systemFont(ofSize: 11)
@@ -293,6 +317,7 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
         primary.bezelColor = Teal.button
         primary.target = self
         primary.setContentHuggingPriority(.required, for: .horizontal)
+        primary.setContentCompressionResistancePriority(.required, for: .horizontal)
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
         let footer = NSStackView(views: [left, spacer, primary])
@@ -352,7 +377,7 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
         add(file, "Close", #selector(NSWindow.performClose(_:)), "w")
 
         let edit = submenu("Edit")
-        add(edit, "Copy", #selector(copyPath), "c", target: self)
+        add(edit, "Copy Path", #selector(copyPath), "c", target: self)
 
         let windowMenu = submenu("Window")
         add(windowMenu, "Minimize", #selector(NSWindow.performMiniaturize(_:)), "m")
@@ -388,10 +413,12 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
             primary.title = "Open System Settings"; primary.action = #selector(openSettings)
             primary.setAccessibilityLabel("Open \(paneName) in System Settings")
             chooseLink.isHidden = false
+            hint.stringValue = PermissionHelper.dragHint
         } else {
             primary.title = "Choose Build…"; primary.action = #selector(choose)
             primary.setAccessibilityLabel("Choose the build")
             chooseLink.isHidden = true
+            hint.stringValue = PermissionHelper.chooseHint
         }
         fitWindow()
     }

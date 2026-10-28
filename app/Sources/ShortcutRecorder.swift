@@ -6,6 +6,10 @@ final class ShortcutRecorder: NSObject {
     var suspend: ((@escaping (Result<() -> Void, Error>) -> Void) -> Void)?
     private var resume: (() -> Void)?
     var didFinish: ((String?, String?) -> Void)?
+    /// Called once the engine has paused its shortcuts and keys are being captured.
+    var didStart: (() -> Void)?
+    /// Called when a key is pressed without ⌃, ⌥ or ⌘ (it is ignored; recording continues).
+    var didReject: (() -> Void)?
     private var monitor: Any?
     private var observers: [NSObjectProtocol] = []
     private var generation = 0
@@ -34,9 +38,10 @@ final class ShortcutRecorder: NSObject {
                         if event.keyCode == 53 { self.cancel(); return nil }
                         // Plain Delete clears the binding, as in System Settings' shortcut fields.
                         if [51, 117].contains(event.keyCode), event.modifierFlags.intersection([.control, .option, .command, .shift]).isEmpty { self.finish("", nil); return nil }
-                        guard let chord = Self.chord(event) else { return nil }
+                        guard let chord = Self.chord(event) else { self.didReject?(); return nil }
                         self.finish(chord, nil); return nil
                     }
+                    self.didStart?()
                     self.timer = Timer.scheduledTimer(withTimeInterval: 12, repeats: false) { [weak self] _ in self?.finish(nil, "Recording timed out.") }
                 }
             }
