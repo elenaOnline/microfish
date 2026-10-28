@@ -2392,7 +2392,14 @@ fn test_config_defaults() {
     assert_eq!(config.border_color(), (1.0, 1.0, 1.0));
     assert_eq!(config.border_opacity(), 1.0);
     assert_eq!(config.border_width(), 2.0);
-    assert_eq!(config.border_radius(), BorderRadiusOption::Auto);
+    // `Auto` is resolved only where the corner radius can be measured (macOS
+    // 26); elsewhere it falls back to a fixed radius.
+    let radius = if macos_major_version() == 26 {
+        BorderRadiusOption::Auto
+    } else {
+        BorderRadiusOption::Value(10.0)
+    };
+    assert_eq!(config.border_radius(), radius);
     assert_eq!(config.menubar_height(), None);
 }
 
