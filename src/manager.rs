@@ -13,8 +13,9 @@ use objc2_core_foundation::{
 };
 use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds,
-    CGGetActiveDisplayList, CGWarpMouseCursorPosition, CGWindowListCopyWindowInfo,
-    CGWindowListOption, kCGNullWindowID, kCGWindowNumber,
+    CGGetActiveDisplayList, CGRectMakeWithDictionaryRepresentation, CGWarpMouseCursorPosition,
+    CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowBounds,
+    kCGWindowNumber,
 };
 use std::path::Path;
 use std::ptr::null_mut;
@@ -188,6 +189,11 @@ pub trait WindowManagerApi: Send + Sync {
     fn dim_windows(&self, windows: &[WinID], level: f32);
 
     fn windows_on_screen(&self) -> Option<Vec<WinID>>;
+
+    /// The bounds the window server reports for every on-screen window, in
+    /// the global top-left-origin points accessibility uses. One query for all
+    /// windows, so it never waits on an app the way a per-window AX read can.
+    fn on_screen_window_bounds(&self) -> Option<Vec<(WinID, IRect)>>;
 }
 
 /// `WindowManager` is a Bevy resource that holds a boxed `WindowManagerApi` trait object.
@@ -594,6 +600,29 @@ impl WindowManagerApi for WindowManagerOS {
                 })
                 .collect::<Vec<_>>()
         })
+    }
+
+    fn on_screen_window_bounds(&self) -> Option<Vec<(WinID, IRect)>> {
+        let options =
+            CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements;
+        let window_list_info = CGWindowListCopyWindowInfo(options, kCGNullWindowID)?;
+        let array = unsafe { window_list_info.cast_unchecked::<CFDictionary<CFString, CFType>>() };
+        Some(
+            array
+                .iter()
+                .filter_map(|dict| {
+                    let id = dict
+                        .get(unsafe { kCGWindowNumber })?
+                        .downcast_ref::<CFNumber>()?
+                        .as_i32()?;
+                    let bounds = dict.get(unsafe { kCGWindowBounds })?;
+                    let bounds = bounds.downcast_ref::<CFDictionary>()?;
+                    let mut rect = CGRect::default();
+                    unsafe { CGRectMakeWithDictionaryRepresentation(Some(bounds), &raw mut rect) }
+                        .then(|| (id, irect_from(rect)))
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 }
 

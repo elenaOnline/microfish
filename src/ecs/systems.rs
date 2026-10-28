@@ -973,47 +973,141 @@ pub(super) fn window_resized_update_frame(
     }
 }
 
+/// How much of a parked window may show before it counts as displaced. The
+/// engine itself leaves a `PARKED_STRIP_SLIVER` of 10 pt, and `AppKit` adds up to
+/// ~40 pt of title bar or toolbar on top of that, so the clamp's echo of our own
+/// move stays well inside it. A window showing this much in both directions,
+/// roughly a title bar's worth of content, is one a person would see.
+const PARKED_VISIBLE_LIMIT: i32 = 64;
+/// Waits between corrective moves for one window: the first correction is
+/// immediate, each later one waits for the next entry, and the last repeats.
+/// A window that fights forever costs five moves in its first minute and
+/// one per minute after, never a flicker.
+const CORRECTION_BACKOFF: [Duration; 5] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(4),
+    Duration::from_secs(15),
+    Duration::from_secs(60),
+];
+/// A window seen parked this long since its last displacement starts over with
+/// a fresh, immediate first correction.
+const PARKED_SETTLE: Duration = Duration::from_secs(30);
+
+/// Whether `frame` shows a person-visible part of a display it should not.
+/// A display where the window would show just as much at its logical `target`
+/// is not counted: nothing sent to the app can improve on that.
+fn intrudes_on_displays(frame: IRect, target: crate::manager::Origin, displays: &[IRect]) -> bool {
+    let shown = |rect: IRect, display: IRect| {
+        let overlap = rect.intersect(display);
+        overlap.width() >= PARKED_VISIBLE_LIMIT && overlap.height() >= PARKED_VISIBLE_LIMIT
+    };
+    let at_target = IRect::from_corners(target, target + frame.size());
+    displays
+        .iter()
+        .any(|display| shown(frame, *display) && !shown(at_target, *display))
+}
+
+struct ParkingEpisode {
+    target: crate::manager::Origin,
+    corrections: usize,
+    retry_at: Duration,
+    parked_since: Option<Duration>,
+}
+
 /// A parking correction must not become a feedback loop with an app's own
-/// frame constraints. Keep a finite budget until the row is shown again or
-/// layout chooses a different target. Successful echoes do not reset it.
-#[derive(Default)]
-pub(crate) struct ParkingCorrections(EntityHashMap<(crate::manager::Origin, u8)>);
+/// frame constraints. Each hidden-row window has an episode: the first
+/// displacement is corrected at once, later ones back off exponentially. The
+/// episode ends when the row is shown, layout picks a new target, or the window
+/// has stayed parked for [`PARKED_SETTLE`]. Echoes of our own successful move
+/// do not touch it.
+#[derive(Default, bevy::ecs::resource::Resource)]
+pub(crate) struct ParkingCorrections {
+    episodes: EntityHashMap<ParkingEpisode>,
+    /// Windows the window server showed displaced at the last audit. The AX
+    /// move that parked them may not have landed yet, so a second sighting is
+    /// needed before the audit acts.
+    suspects: bevy::ecs::entity::EntityHashSet,
+}
 
 impl ParkingCorrections {
-    fn allows(
-        &mut self,
-        entity: Entity,
-        target: crate::manager::Origin,
-        actual: crate::manager::Origin,
-    ) -> bool {
-        let entry = self.0.entry(entity).or_insert((target, 0));
-        if entry.0 != target {
-            *entry = (target, 0);
+    /// Drops episodes of windows whose row is no longer hidden.
+    fn retain_hidden(&mut self, strips: &Query<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>) {
+        let hidden = |entity: &Entity| {
+            strips
+                .iter()
+                .any(|(strip, active)| !active && strip.contains(*entity))
+        };
+        self.episodes.retain(|entity, _| hidden(entity));
+        self.suspects.retain(|entity| hidden(entity));
+    }
+
+    /// Whether [`Self::displaced`] would allow a correction now.
+    fn may_correct(&self, entity: Entity, target: crate::manager::Origin, now: Duration) -> bool {
+        self.episodes
+            .get(&entity)
+            .is_none_or(|episode| episode.target != target || now >= episode.retry_at)
+    }
+
+    /// A hidden-row window was seen displaced. Returns whether to send the
+    /// corrective move now; when not, the audit will find it again later.
+    fn displaced(&mut self, entity: Entity, target: crate::manager::Origin, now: Duration) -> bool {
+        let episode = self
+            .episodes
+            .entry(entity)
+            .or_insert_with(|| ParkingEpisode::new(target));
+        if episode.target != target {
+            *episode = ParkingEpisode::new(target);
         }
-        // Small edge clamps are harmless; fighting them exposes flickering slivers.
-        if (target.x - actual.x).abs() <= 8 && (target.y - actual.y).abs() <= 8 {
+        episode.parked_since = None;
+        if now < episode.retry_at {
             return false;
         }
-        if entry.1 >= 2 {
-            return false;
-        }
-        entry.1 += 1;
+        let wait = CORRECTION_BACKOFF[episode.corrections.min(CORRECTION_BACKOFF.len() - 1)];
+        episode.retry_at = now + wait;
+        episode.corrections += 1;
         true
+    }
+
+    /// A hidden-row window was seen parked.
+    fn parked(&mut self, entity: Entity, target: crate::manager::Origin, now: Duration) {
+        self.suspects.remove(&entity);
+        let Some(episode) = self.episodes.get_mut(&entity) else {
+            return;
+        };
+        let since = *episode.parked_since.get_or_insert(now);
+        if episode.target != target || now.saturating_sub(since) >= PARKED_SETTLE {
+            self.episodes.remove(&entity);
+        }
     }
 }
 
+impl ParkingEpisode {
+    fn new(target: crate::manager::Origin) -> Self {
+        Self {
+            target,
+            corrections: 0,
+            retry_at: Duration::ZERO,
+            parked_since: None,
+        }
+    }
+}
+
+fn display_frames(displays: &Query<&Display>) -> Vec<IRect> {
+    displays.iter().map(Display::bounds).collect()
+}
+
 #[instrument(level = Level::TRACE, skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn window_moved_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: MovableWindows,
     strips: Query<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>,
-    mut corrections: Local<ParkingCorrections>,
+    displays: Query<&Display>,
+    time: Res<Time>,
+    mut corrections: ResMut<ParkingCorrections>,
 ) {
-    corrections.0.retain(|entity, _| {
-        strips
-            .iter()
-            .any(|(strip, active)| !active && strip.contains(*entity))
-    });
+    corrections.retain_hidden(&strips);
     let mut handled = HashSet::new();
     for event in messages.read() {
         let Event::WindowMoved { window_id } = event else {
@@ -1051,7 +1145,13 @@ pub(crate) fn window_moved_update_frame(
             .iter()
             .any(|(strip, active)| !active && strip.all_windows().contains(&entity));
         if hidden_row {
-            if corrections.allows(entity, position.0, new_frame.min) {
+            // Judge by what shows, not by distance from the corner: AppKit
+            // keeps a title bar on screen, so a parked window never sits
+            // exactly where it was sent.
+            let now = time.elapsed();
+            if !intrudes_on_displays(new_frame, position.0, &display_frames(&displays)) {
+                corrections.parked(entity, position.0, now);
+            } else if corrections.displaced(entity, position.0, now) {
                 window.reposition(position.0);
             }
             // Preserve the layout target even if an app refuses correction.
@@ -1060,6 +1160,71 @@ pub(crate) fn window_moved_update_frame(
         let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
         if old_frame.min != new_frame.min {
             position.0 = new_frame.min;
+        }
+    }
+}
+
+/// Safety net for [`window_moved_update_frame`]: an app can move a hidden-row
+/// window without telling us, or after its correction was backed off. Every
+/// `PARKING_AUDIT_FREQ` (in `ecs.rs`), while any hidden row holds windows, ask
+/// the window server once where everything is. No per-window AX read happens unless a
+/// window is already shown displaced twice in a row, and the backoff in
+/// [`ParkingCorrections`] bounds those.
+#[instrument(level = Level::TRACE, skip_all)]
+pub(crate) fn audit_parked_windows(
+    mut windows: MovableWindows,
+    strips: Query<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    displays: Query<&Display>,
+    window_manager: Res<WindowManager>,
+    time: Res<Time>,
+    mut corrections: ResMut<ParkingCorrections>,
+) {
+    corrections.retain_hidden(&strips);
+    let hidden = strips
+        .iter()
+        .filter(|(_, active)| !active)
+        .flat_map(|(strip, _)| strip.all_windows())
+        .collect::<Vec<_>>();
+    if hidden.is_empty() {
+        return;
+    }
+    let Some(on_screen) = window_manager.on_screen_window_bounds() else {
+        return;
+    };
+    let displays = display_frames(&displays);
+    let now = time.elapsed();
+    for entity in hidden {
+        let Ok((_, mut window, position, _, unmanaged, repositioning)) = windows.get_mut(entity)
+        else {
+            continue;
+        };
+        if repositioning || matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
+            continue;
+        }
+        // A window the server does not list is off screen altogether.
+        let shown = on_screen
+            .iter()
+            .find(|(id, _)| *id == window.id())
+            .map(|(_, frame)| *frame);
+        if !shown.is_some_and(|frame| intrudes_on_displays(frame, position.0, &displays)) {
+            corrections.parked(entity, position.0, now);
+            continue;
+        }
+        // First sighting only marks the window; the next audit decides.
+        if corrections.suspects.insert(entity) || !corrections.may_correct(entity, position.0, now)
+        {
+            continue;
+        }
+        // Our own AX cache holds the position we asked for, which would make
+        // `reposition` skip the move; read the real frame first.
+        match window.update_frame() {
+            Ok(frame) if !intrudes_on_displays(frame, position.0, &displays) => {
+                corrections.parked(entity, position.0, now);
+            }
+            Ok(_) if corrections.displaced(entity, position.0, now) => {
+                window.reposition(position.0);
+            }
+            _ => {}
         }
     }
 }
@@ -1925,28 +2090,92 @@ mod tests {
 mod parking_correction_tests {
     use super::*;
     use crate::manager::Origin;
-    #[test]
-    fn corrections_are_bounded_and_successful_echoes_do_not_rearm() {
-        let mut budget = ParkingCorrections::default();
-        let entity = Entity::from_bits(123);
-        let target = Origin::new(1500, 970);
-        let escaped = Origin::new(16, 50);
-        for attempt in 0..20 {
-            assert_eq!(budget.allows(entity, target, escaped), attempt < 2);
-            assert!(!budget.allows(entity, target, target));
-        }
-        assert!(budget.allows(entity, target + Origin::new(10, 0), escaped));
-        budget.0.remove(&entity); // Showing the row starts a new parking episode.
-        assert!(budget.allows(entity, target, escaped));
+
+    const DISPLAY: IRect = IRect {
+        min: Origin::new(0, 0),
+        max: Origin::new(1512, 982),
+    };
+
+    fn at(secs: f32) -> Duration {
+        Duration::from_secs_f32(secs)
     }
+
     #[test]
-    fn small_edge_clamps_do_not_trigger_correction() {
-        let mut budget = ParkingCorrections::default();
+    fn corrections_back_off_and_successful_echoes_do_not_rearm() {
+        let mut episodes = ParkingCorrections::default();
         let entity = Entity::from_bits(123);
         let target = Origin::new(1500, 970);
-        for _ in 0..100 {
-            assert!(!budget.allows(entity, target, target + Origin::new(-2, -4)));
+        let waits = [0.0, 0.25, 1.25, 5.25, 20.25, 80.25, 140.25];
+        let mut now = 0.0;
+        for wait in waits {
+            // Seen displaced every half second between corrections.
+            while now < wait {
+                assert!(!episodes.displaced(entity, target, at(now)), "at {now}");
+                now += 0.25;
+            }
+            assert!(episodes.displaced(entity, target, at(wait)), "at {wait}");
+            episodes.parked(entity, target, at(wait));
+            assert!(
+                episodes.episodes.contains_key(&entity),
+                "an echo of our own move keeps the episode"
+            );
+            now = wait + 0.25;
         }
-        assert!(budget.allows(entity, target, Origin::new(16, 50)));
+        let mut episodes = ParkingCorrections::default();
+        assert!(episodes.displaced(entity, target, at(0.0)));
+        // A new target starts a new episode.
+        assert!(episodes.displaced(entity, target + Origin::new(10, 0), at(0.1)));
+        // Showing the row drops the episode (the systems call `retain_hidden`).
+        episodes.episodes.remove(&entity);
+        assert!(episodes.displaced(entity, target, at(0.2)));
+    }
+
+    #[test]
+    fn staying_parked_ends_the_episode() {
+        let mut episodes = ParkingCorrections::default();
+        let entity = Entity::from_bits(123);
+        let target = Origin::new(1500, 970);
+        assert!(episodes.displaced(entity, target, at(0.0)));
+        assert!(!episodes.displaced(entity, target, at(0.1)));
+        episodes.parked(entity, target, at(2.0));
+        episodes.parked(entity, target, at(31.0));
+        assert!(episodes.episodes.contains_key(&entity));
+        episodes.parked(entity, target, at(32.0));
+        assert!(!episodes.episodes.contains_key(&entity));
+        assert!(episodes.displaced(entity, target, at(32.1)));
+    }
+
+    #[test]
+    fn only_a_visible_intrusion_is_displacement() {
+        let target = Origin::new(1502, 972);
+        let size = Origin::new(1496, 932);
+        let frame = |origin: Origin| IRect::from_corners(origin, origin + size);
+        let displays = [DISPLAY];
+        // Exactly parked, and the clamped and slivered landings seen live.
+        for origin in [target, Origin::new(1502, 931), Origin::new(1480, 950)] {
+            assert!(!intrudes_on_displays(frame(origin), target, &displays));
+        }
+        // Back on screen where the user would see it.
+        assert!(intrudes_on_displays(
+            frame(Origin::new(16, 50)),
+            target,
+            &displays
+        ));
+        // A strip along one edge is a sliver, not an intrusion.
+        assert!(!intrudes_on_displays(
+            frame(Origin::new(16, 940)),
+            target,
+            &displays
+        ));
+    }
+
+    #[test]
+    fn a_display_that_shows_the_target_anyway_is_not_judged() {
+        // Parked at the corner of a display with another to its right: the
+        // target itself shows on that neighbour, so it cannot be a displacement.
+        let right = IRect::from_corners(Origin::new(1512, 0), Origin::new(3024, 982));
+        let target = Origin::new(1502, 100);
+        let frame = IRect::from_corners(target, target + Origin::new(400, 400));
+        assert!(!intrudes_on_displays(frame, target, &[DISPLAY, right]));
     }
 }

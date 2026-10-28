@@ -75,8 +75,10 @@ pub fn register_systems(app: &mut bevy::app::App) {
     const CLOSED_WINDOW_CHECK_FREQ: Duration = Duration::from_secs(1);
     const LOW_POWER_MODE_CHECK: Duration = Duration::from_mins(1);
     const APP_OBSERVABILITY_CHECK_FREQ: Duration = Duration::from_millis(200);
+    const PARKING_AUDIT_FREQ: Duration = Duration::from_secs(2);
 
     app.init_resource::<view_history::History>();
+    app.init_resource::<systems::ParkingCorrections>();
     app.add_systems(Startup, view_history::initialize);
     app.add_systems(PreUpdate, view_history::observe.after(systems::pump_events));
     app.add_systems(Last, view_history::finish);
@@ -194,6 +196,12 @@ pub fn register_systems(app: &mut bevy::app::App) {
             script_state::periodic_script_state_save.run_if(on_timer(Duration::from_mins(5))),
             script_state::script_state_cleanup_on_exit,
         ),
+    );
+    app.add_systems(
+        Update,
+        systems::audit_parked_windows
+            .run_if(not(resource_exists::<Initializing>))
+            .run_if(on_timer(PARKING_AUDIT_FREQ)),
     );
     app.add_systems(
         PostUpdate,

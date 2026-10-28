@@ -56,6 +56,12 @@ pub(crate) struct MockWindowData {
     pub(crate) requested_padding: (Option<i32>, Option<i32>),
     pub(crate) child_role: bool,
     pub(crate) resize_behavior: Option<MockResizeBehavior>,
+    /// `AppKit` keeps a title bar on screen: a requested origin below this y
+    /// lands here instead, without any notification.
+    pub(crate) lowest_origin_y: Option<i32>,
+    /// An app that fights being parked: after every engine move to anywhere
+    /// else it puts itself back here and reports the move.
+    pub(crate) fights_back_to: Option<Origin>,
 }
 
 impl Default for MockWindowData {
@@ -78,6 +84,8 @@ impl Default for MockWindowData {
             requested_padding: (None, None),
             child_role: false,
             resize_behavior: None,
+            lowest_origin_y: None,
+            fights_back_to: None,
         }
     }
 }
@@ -500,6 +508,16 @@ impl MockState {
         Ok(window.frame)
     }
 
+    /// Where the window really is, as the window server would report it.
+    pub fn window_frame(&self, id: WinID) -> IRect {
+        self.inner
+            .force_read()
+            .windows
+            .get(&id)
+            .map(|window| window.frame)
+            .expect("window exists")
+    }
+
     pub fn take_geometry_writes(&self) -> Vec<WinID> {
         std::mem::take(&mut self.inner.force_write().geometry_writes)
     }
@@ -559,10 +577,24 @@ impl MockState {
         mw.expect_reposition().returning(move |origin| {
             let mut inner = s_move.inner.force_write();
             inner.geometry_writes.push(id);
+            let mut fought = false;
             if let Some(w) = inner.windows.get_mut(&id) {
                 let size = w.frame.size();
+                let mut origin = origin;
+                if let Some(lowest) = w.lowest_origin_y {
+                    origin.y = origin.y.min(lowest);
+                }
+                if let Some(back) = w.fights_back_to.filter(|back| *back != origin) {
+                    origin = back;
+                    fought = true;
+                }
                 w.frame.min = origin;
                 w.frame.max = origin + size;
+            }
+            if fought {
+                inner
+                    .event_queue
+                    .push_back(Event::WindowMoved { window_id: id });
             }
         });
 
@@ -901,6 +933,18 @@ impl MockState {
                 .iter()
                 .filter_map(|(id, window)| window.visible.then_some(id))
                 .copied()
+                .collect::<Vec<_>>();
+            Some(windows)
+        });
+
+        let s = self.clone();
+        wm.expect_on_screen_window_bounds().returning(move || {
+            let windows = s
+                .inner
+                .force_read()
+                .windows
+                .iter()
+                .filter_map(|(id, window)| window.visible.then_some((*id, window.frame)))
                 .collect::<Vec<_>>();
             Some(windows)
         });
