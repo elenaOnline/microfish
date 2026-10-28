@@ -1846,7 +1846,8 @@ pub(crate) fn update_flash_messages(
     // order — the OSD ends up flickering between strings, and the moment
     // any one of them expires its `is_finished()` branch calls
     // `flash_manager.remove()` even though the newer ones are still
-    // alive. Keep the newest (most time remaining), despawn the rest,
+    // alive. Keep the newest (the one started last: a fresh confirmation
+    // replaces a longer warning still up), despawn the rest,
     // and render exactly once.
     let mut alive: Option<(Entity, &FlashMessage, &Timeout)> = None;
     let mut stale: Vec<Entity> = Vec::new();
@@ -1858,7 +1859,7 @@ pub(crate) fn update_flash_messages(
         match alive {
             None => alive = Some((entity, flash, timeout)),
             Some((prev_entity, _, prev_timeout)) => {
-                if timeout.timer.remaining() > prev_timeout.timer.remaining() {
+                if timeout.timer.elapsed() < prev_timeout.timer.elapsed() {
                     stale.push(prev_entity);
                     alive = Some((entity, flash, timeout));
                 } else {

@@ -145,8 +145,22 @@ fn press_new_window(pid: Pid) -> bool {
         return false;
     };
     let deadline = std::time::Instant::now() + MENU_WALK_BUDGET;
-    let Some(item) = find_new_window_item(&menu_bar, MENU_WALK_DEPTH, deadline) else {
-        debug!("no enabled ⌘N item found in pid {pid} within the walk budget");
+    // Skip the Apple menu (the first item): it never holds the app's ⌘N, and
+    // walking it first spends the budget before File in a big-menu app.
+    let item = menu_bar
+        .get_attribute::<CFArray<AXUIWrapper>>(&CFString::from_static_str(
+            accessibility_sys::kAXChildrenAttribute,
+        ))
+        .ok()
+        .and_then(|menus| {
+            menus
+                .to_vec()
+                .iter()
+                .skip(1)
+                .find_map(|menu| find_new_window_item(menu, MENU_WALK_DEPTH - 1, deadline))
+        });
+    let Some(item) = item else {
+        debug!("no enabled ⌘N item found in pid {pid} (or the walk ran out of time)");
         return false;
     };
     let press = CFString::from_static_str(accessibility_sys::kAXPressAction);

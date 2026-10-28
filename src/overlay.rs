@@ -1,6 +1,6 @@
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSAccessibilityAnnouncementKey, NSAccessibilityAnnouncementRequestedNotification,
     NSAccessibilityNotificationUserInfoKey, NSAccessibilityPostNotificationWithUserInfo,
@@ -378,6 +378,24 @@ const FONT_WEIGHT_SEMIBOLD: f64 = 0.3;
 /// Row badge (`workspace_popup_status`): a square HUD tile holding the number.
 const BADGE_SIDE: f64 = 64.0;
 
+/// The backdrop's own rounded mask, as the helper's `RoundedHUDView` sets it:
+/// layer clipping alone can leave square compositor corners on the material.
+fn rounded_mask(size: NSSize) -> Retained<NSImage> {
+    let image = NSImage::initWithSize(NSImage::alloc(), size);
+    #[allow(deprecated)]
+    image.lockFocus();
+    NSColor::whiteColor().setFill();
+    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+        NSRect::new(NSPoint::new(0.0, 0.0), size),
+        HUD_RADIUS,
+        HUD_RADIUS,
+    )
+    .fill();
+    #[allow(deprecated)]
+    image.unlockFocus();
+    image
+}
+
 /// What a flash says: a one-line note, a row badge, or a warning with a detail
 /// line (the failure HUD's layout).
 #[derive(Clone, Debug, PartialEq)]
@@ -621,6 +639,7 @@ impl FlashMessageManager {
             .unwrap_or_else(|| cg_abs_to_cocoa(fallback, primary_screen_height(mtm)));
             let max_width = (visible.size.width - 2.0 * HUD_EDGE_INSET).min(480.0);
             let size = panel.configure(mtm, content, max_width);
+            panel.effect.setMaskImage(Some(&rounded_mask(size)));
             panel
                 .window
                 .setFrame_display(flash_frame(visible, size), true);

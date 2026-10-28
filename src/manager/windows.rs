@@ -191,8 +191,8 @@ fn first_rejection(window_id: WinID) -> bool {
     reported.insert(window_id)
 }
 
-/// The one line per window that says what the engine did with it and why (INFO
-/// for real windows, DEBUG for tooltips and other non-window elements):
+/// The one line per window that says what the engine did with it and why (DEBUG
+/// only for non-window elements such as tooltips that stay unmanaged):
 /// `admission: window 4711 (Preview) role AXWindow subrole AXFloatingWindow
 /// resizable true: unmanaged: panel`.
 pub fn log_admission(
@@ -203,9 +203,9 @@ pub fn log_admission(
     decision: &str,
 ) {
     let resizable = resizable.map_or_else(|| "?".to_string(), |resizable| resizable.to_string());
-    // Tooltips, popovers and other non-window elements are routine; only real
-    // windows (role AXWindow) are worth an INFO line.
-    if admission.role == "AXWindow" {
+    // Tooltips, popovers and other non-window elements left unmanaged are
+    // routine; every real window and anything managed keeps its INFO line.
+    if admission.role == "AXWindow" || !decision.starts_with("unmanaged") {
         info!(
             "admission: window {window_id} ({app_name}) role {} subrole {} resizable {resizable}: {decision}",
             admission.role, admission.subrole,
