@@ -75,7 +75,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
     const CLOSED_WINDOW_CHECK_FREQ: Duration = Duration::from_secs(1);
     const LOW_POWER_MODE_CHECK: Duration = Duration::from_mins(1);
     const APP_OBSERVABILITY_CHECK_FREQ: Duration = Duration::from_millis(200);
-    const PARKING_AUDIT_FREQ: Duration = Duration::from_secs(2);
+    // The audit decides for itself when it is due; see `ParkingCorrections::audit_due`.
+    const PARKING_AUDIT_TICK: Duration = Duration::from_millis(250);
 
     app.init_resource::<view_history::History>();
     app.init_resource::<systems::ParkingCorrections>();
@@ -201,7 +202,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
         Update,
         systems::audit_parked_windows
             .run_if(not(resource_exists::<Initializing>))
-            .run_if(on_timer(PARKING_AUDIT_FREQ)),
+            .run_if(on_timer(PARKING_AUDIT_TICK)),
     );
     app.add_systems(
         PostUpdate,
