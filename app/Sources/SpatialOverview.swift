@@ -415,7 +415,7 @@ final class SpatialMapView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let dark=mapDark(self),teal=mapTeal(self),background=mapColor(dark ? 0x2B2E2F:0xFAFAFA)
         background.setFill();bounds.fill()
-        if snapshot.rows.isEmpty {text("No spatial window data yet",in:bounds.insetBy(dx:20,dy:30),color:.secondaryLabelColor);return}
+        if snapshot.rows.isEmpty {text("No windows yet",in:bounds.insetBy(dx:20,dy:30),color:.secondaryLabelColor);return}
         for row in snapshot.rows {
             guard let frame=map.rowFrames[row] else {continue}
             let active=row==snapshot.activeRow
@@ -656,6 +656,14 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
     var onRefresh: ((@escaping (Bool) -> Void) -> Void)?
     private var refreshing = false
     var pinsPath = ""
+    // The refresh script ends a failed run with one plain sentence (SystemExit); show it, not a log path.
+    // A crash ends with a traceback instead, which is not for the panel.
+    func refreshFailure() -> String {
+        let log=URL(fileURLWithPath:pinsPath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("work/refresh.log")
+        let last=((try? String(contentsOf:log,encoding:.utf8)) ?? "").split(separator:"\n").last.map(String.init)?.trimmingCharacters(in:.whitespaces) ?? ""
+        let plain = !last.isEmpty && last.count < 160 && !last.contains("Error:") && !last.hasPrefix("File ") && !last.hasPrefix("Traceback")
+        return plain ? last : "Couldn’t refresh windows."
+    }
     var onViewAction: ((String, Int?) -> Void)?
     private var item: NSStatusItem?
     private var menu: NSMenu?
@@ -776,7 +784,7 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
             self.onRefresh? { [weak self] success in
                 guard let self else { return }
                 self.refreshing = false; self.content?.refreshButton.isEnabled = true
-                self.content?.message = success ? "Windows refreshed" : "Refresh failed · see work/refresh.log"
+                self.content?.message = success ? "Windows refreshed" : self.refreshFailure()
             }
         }
         root.onEscape = { [weak self] in self?.popover.performClose(nil) }

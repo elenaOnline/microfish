@@ -830,7 +830,6 @@ final class Navigator: NSObject, NSApplicationDelegate {
   let menu=NSMenu()
   let heading=NSMenuItem(title:"Microfish",action:nil,keyEquivalent:""); heading.isEnabled=false; menu.addItem(heading)
   let settingsItem=NSMenuItem(title:"Settings…",action:#selector(openSettings),keyEquivalent:""); settingsItem.target=self; menu.addItem(settingsItem)
-  let reload=NSMenuItem(title:"Reload preferences",action:#selector(reloadFromMenu),keyEquivalent:""); reload.target=self; menu.addItem(reload)
   menu.addItem(.separator())
   let quit=NSMenuItem(title:"Quit Microfish",action:#selector(quitMicrofish(_:)),keyEquivalent:"q"); quit.keyEquivalentModifierMask = .command; quit.target=self; menu.addItem(quit)
   return menu
@@ -888,7 +887,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   let status=NSStatusBar.system.statusItem(withLength:NSStatusItem.variableLength)
   if let image=NSImage(systemSymbolName:"slider.horizontal.3",accessibilityDescription:"Microfish Settings") {
    image.isTemplate=true; status.button?.image=image
-  } else { status.button?.title="P" }
+  } else { status.button?.title="Microfish" }
   status.button?.toolTip="Microfish Settings"
   status.button?.setAccessibilityLabel("Microfish Settings")
   let menu=makeStatusMenu()
@@ -978,7 +977,6 @@ final class Navigator: NSObject, NSApplicationDelegate {
   settings?.show()
   #endif
  }
- @objc func reloadFromMenu() { reloadPreferences() }
  func reloadPreferences() {
   let url=rootURL.appendingPathComponent("config/preferences.json")
   preferences=NavigatorPreferences(try? Data(contentsOf:url))
