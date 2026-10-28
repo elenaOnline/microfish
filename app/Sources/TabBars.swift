@@ -124,10 +124,16 @@ final class FolderTabFace: NSView {
  var style="folder"
  var matchedColor:NSColor?
  var first=false, last=false
+ // System Increase Contrast / Reduce Transparency. Both default off, which
+ // is exactly the accepted look; TabBars sets them from NSWorkspace.
+ var increaseContrast=false, reduceTransparency=false
  override func draw(_ dirtyRect: NSRect) {
   let dark=effectiveAppearance.bestMatch(from:[.aqua,.darkAqua]) == .darkAqua
   let fallback=dark ? NSColor(srgbRed:0.16,green:0.17,blue:0.18,alpha:1) : .windowBackgroundColor
-  let fill=selected ? (matchedColor ?? fallback) : (style.hasPrefix("folder") ? NSColor.white.withAlphaComponent(dark ? 0.10:0.88) : NSColor(srgbRed:dark ? 0.165:0.835,green:dark ? 0.176:0.839,blue:dark ? 0.184:0.831,alpha:1))
+  var inactive=NSColor.white.withAlphaComponent(dark ? 0.10:0.88)
+  // Translucent folder fills would show the desktop through; settle them onto the window colour.
+  if reduceTransparency { inactive=fallback.blended(withFraction:dark ? 0.10:0.88,of:.white) ?? inactive }
+  let fill=selected ? (matchedColor ?? fallback) : (style.hasPrefix("folder") ? inactive : NSColor(srgbRed:dark ? 0.165:0.835,green:dark ? 0.176:0.839,blue:dark ? 0.184:0.831,alpha:1))
   let path: NSBezierPath
   if style.hasPrefix("folder") {path=folderTabPath(in:bounds,selected:selected,compact:style == "folder-compact")}
   else {
@@ -146,8 +152,11 @@ final class FolderTabFace: NSView {
   if style.hasPrefix("folder") {
    let stroke: NSColor
    if selected, let color=matchedColor { stroke=color.blended(withFraction:tabColorIsDark(color) ? 0.35:0.28,of:tabColorIsDark(color) ? .white:.black) ?? color }
-   else {stroke=selected ? (dark ? NSColor(srgbRed:0.235,green:0.776,blue:0.769,alpha:1):NSColor(srgbRed:0,green:0.761,blue:0.82,alpha:1)) : (dark ? NSColor.white.withAlphaComponent(0.38):NSColor.black.withAlphaComponent(0.45))}
-   stroke.setStroke();path.lineWidth=selected ? 1.5:0.75;path.stroke()
+   else {
+    let strong=increaseContrast
+    stroke=selected ? (dark ? NSColor(srgbRed:0.235,green:0.776,blue:0.769,alpha:1):(strong ? NSColor(srgbRed:0,green:0.44,blue:0.48,alpha:1):NSColor(srgbRed:0,green:0.761,blue:0.82,alpha:1))) : (dark ? NSColor.white.withAlphaComponent(strong ? 1:0.38):NSColor.black.withAlphaComponent(strong ? 1:0.45))
+   }
+   stroke.setStroke();path.lineWidth=selected ? (increaseContrast ? 2:1.5):(increaseContrast ? 1.25:0.75);path.stroke()
   } else {
    // Local edge shading stays inside the bar; no shadow spills onto the app.
    let edge=NSBezierPath();edge.move(to:CGPoint(x:0,y:bounds.maxY-0.5));edge.line(to:CGPoint(x:bounds.maxX,y:bounds.maxY-0.5))
@@ -183,9 +192,13 @@ final class TabColorSampler {
  private var attempted:[Int:TimeInterval]=[:]
  private var busy=false
  private var lastFailure=""
+ private var preflightAt:TimeInterval=0
+ private var preflightAllowed=false
  func sample(id:Int) -> TabWindowSample? {
   let now=Date.timeIntervalSinceReferenceDate
-  guard CGPreflightScreenCaptureAccess() else {report("Screen Recording permission unavailable");return nil}
+  // Re-asking TCC on every display-link tick is wasted work; once a second is plenty.
+  if now-preflightAt>1 { preflightAllowed=CGPreflightScreenCaptureAccess(); preflightAt=now }
+  guard preflightAllowed else {report("Screen Recording permission unavailable");return nil}
   if !busy && now-(attempted[id] ?? 0)>3 {
    busy=true;attempted[id]=now
    SCShareableContent.getExcludingDesktopWindows(true,onScreenWindowsOnly:true) { [weak self] content,error in
@@ -276,14 +289,62 @@ func tabDropExposed(point: CGPoint, panelID: Int, members: Set<Int>, windows: [L
  guard let front=windows.first(where: { $0.layer == 0 && $0.frame.contains(point) }) else { return true }
  return front.id == panelID || members.contains(front.id)
 }
+// The tab cards are drawn views with no native accessibility. Expose them to
+// VoiceOver / Voice Control as the standard tab pattern: a tab group of radio
+// buttons whose value is the selection and whose press focuses the window.
+final class TabAccessibilityElement: NSAccessibilityElement {
+ var onPress: (() -> Void)?
+ override func accessibilityPerformPress() -> Bool {
+  guard let onPress else { return false }
+  onPress(); return true
+ }
+}
+struct TabAccessibilityItem {
+ let card: NSView
+ let label: String
+ let help: String
+ let selected: Bool?   // nil: a plain button (overflow), not a tab
+ let press: () -> Void
+}
+func installTabAccessibility(strip: NSView, items: [TabAccessibilityItem], vertical: Bool) {
+ var elements: [TabAccessibilityElement] = []
+ for item in items {
+  item.card.setAccessibilityElement(false)
+  for child in item.card.subviews { child.setAccessibilityElement(false) }
+  let element = TabAccessibilityElement()
+  element.setAccessibilityParent(strip)
+  element.setAccessibilityRole(item.selected == nil ? .button : .radioButton)
+  element.setAccessibilityLabel(item.label)
+  element.setAccessibilityHelp(item.help)
+  element.setAccessibilityFrameInParentSpace(item.card.frame)
+  element.setAccessibilityEnabled(true)
+  if let selected = item.selected { element.setAccessibilityValue(selected ? 1:0); element.setAccessibilitySelected(selected) }
+  element.onPress = item.press
+  elements.append(element)
+ }
+ strip.setAccessibilityElement(true)
+ strip.setAccessibilityRole(.tabGroup)
+ strip.setAccessibilityLabel("Window tabs")
+ strip.setAccessibilityOrientation(vertical ? .vertical:.horizontal)
+ strip.setAccessibilityChildren(elements)
+ strip.setAccessibilityTabs(elements.filter { $0.accessibilityRole() == .radioButton })
+}
+// A Mouse-up can be lost (Space switch, app deactivation mid-press), which
+// would freeze the bar's tracking. Hardware says no button is down: recover.
+func tabPressIsStale(pressed: Bool, since: TimeInterval, now: TimeInterval, buttonsDown: Int) -> Bool {
+ pressed && buttonsDown == 0 && now - since > 1.5
+}
 private final class TabBarSurface {
  let panel = StripPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
  let seamPanel = StripPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
  var signature = ""
  var memberIDs = Set<Int>()
- var pressed = false
+ var pressed = false { didSet { if pressed && !oldValue { pressedSince = Date.timeIntervalSinceReferenceDate } } }
+ var pressedSince: TimeInterval = 0
  var strip: NSView?
  init() {
+  panel.isExcludedFromWindowsMenu = true; seamPanel.isExcludedFromWindowsMenu = true
+  panel.setAccessibilityLabel("Window tabs")
   seamPanel.animationBehavior = .none;seamPanel.hasShadow=false;seamPanel.level = .normal
   seamPanel.isFloatingPanel=false;seamPanel.isOpaque=false;seamPanel.backgroundColor = .clear
   seamPanel.ignoresMouseEvents=true;seamPanel.hidesOnDeactivate=false
@@ -294,6 +355,8 @@ private final class TabBarSurface {
   panel.collectionBehavior = [.canJoinAllSpaces, .ignoresCycle]
  }
  func hide() {
+  // Called for every absent bar on every tick; once hidden it must cost nothing.
+  guard pressed || panel.isVisible || seamPanel.isVisible else { return }
   cancelTabPresses(in: panel.contentView)
   pressed = false; panel.orderOut(nil);seamPanel.orderOut(nil)
  }
@@ -301,6 +364,7 @@ private final class TabBarSurface {
 final class TabBars: NSObject {
  private var bars: [Int: TabBarSurface] = [:]
  private var icons: [String: NSImage] = [:]
+ private var iconMisses: [String: TimeInterval] = [:]
  var aliases: [String:String] = [:]
  var style="folder"
  var height:CGFloat=34
@@ -352,11 +416,16 @@ final class TabBars: NSObject {
   }
   if commit { finishDrag() }
  }
+ var ordersPanels = true
+ func stripView(column: Int) -> NSView? { bars[column]?.strip }
+ func panelFrame(column: Int) -> CGRect? { bars[column]?.panel.frame }
  var hasVisibleBars: Bool { bars.values.contains { $0.panel.isVisible } }
  func update(_ snapshot: NavigatorSnapshot, windows: [LiveWindow]) {
   currentWindows=windows
   guard snapshot.tabsVisible, let screen = NSScreen.screens.first(where: { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == snapshot.display }) else {
-   bars.values.forEach { $0.hide() }; finishDrag(); return
+   bars.values.forEach { $0.hide() }
+   if dragSource != nil || dragMark != nil { finishDrag() }
+   return
   }
   var shown = Set<Int>()
   for (column, members) in snapshot.tabGroups {
@@ -367,6 +436,7 @@ final class TabBars: NSObject {
    if windows.prefix(while: { $0.id != live.id }).contains(where: { $0.layer == 0 && !ids.contains($0.id) && $0.frame.contains(screen.visibleFrame) }) { continue }
    let bar = bars[column] ?? TabBarSurface(); bars[column] = bar
    bar.memberIDs=ids
+   if tabPressIsStale(pressed:bar.pressed,since:bar.pressedSince,now:Date.timeIntervalSinceReferenceDate,buttonsDown:Int(NSEvent.pressedMouseButtons)) { bar.pressed=false; clearDragFeedback() }
    shown.insert(column)
    let selection = tabSelection(members, focused: snapshot.focused, liveID: live.id)
    let side=style == "side"
@@ -375,7 +445,7 @@ final class TabBars: NSObject {
    let seamFrame=side ? CGRect(x:live.frame.minX,y:live.frame.minY,width:32,height:live.frame.height) : CGRect(x:live.frame.minX,y:live.frame.maxY-32,width:live.frame.width,height:32)
    let sample=matchAppColor ? sampler.sample(id:live.id):nil
    let matched=side ? sample?.sideColor:sample?.titleColor
-   let signature = tabContentSignature(members, selected: selection, width: contentWidth, height: frame.height) + ":\(style):\(sample != nil):\(NSApp.effectiveAppearance.name.rawValue):\(matched?.description ?? "default")" + members.map { aliases[$0.bundle+"\t"+$0.title] ?? "" }.joined(separator:"|")
+   let signature = tabContentSignature(members, selected: selection, width: contentWidth, height: frame.height) + ":\(style):\(sample != nil):\(NSApp.effectiveAppearance.name.rawValue):\(matched?.description ?? "default")" + members.map { aliases[$0.bundle+"\t"+$0.title] ?? "" }.joined(separator:"|") + ":\(NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast):\(NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency)"
    if signature != bar.signature && !bar.pressed {
     bar.signature = signature
     let view = NSView(frame: CGRect(x: 0, y: 0, width: contentWidth, height: frame.height))
@@ -385,6 +455,8 @@ final class TabBars: NSObject {
     let capacity = max(1, Int((side ? frame.height:contentWidth) / (side ? 32:65)))
     let overflow = members.count > capacity
     let visible = visibleTabMembers(members, capacity: capacity, selected: selection)
+    var accessibilityItems: [TabAccessibilityItem] = []
+    let increaseContrast=NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast, reduceTransparency=NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
     let gap:CGFloat=style.hasPrefix("folder") ? 2.5:0
     let available = (side ? frame.height:contentWidth) - (overflow ? 30 : 0)
     let width = max(1,(available-gap*CGFloat(visible.count-1)) / CGFloat(visible.count))
@@ -401,7 +473,8 @@ final class TabBars: NSObject {
       self?.focus?(entry.id)
      }
      let displayTitle=aliases[entry.bundle+"\t"+entry.title] ?? entry.title
-     card.toolTip = "\(entry.app) — \(displayTitle)\nDrag between tabs to regroup, or to a minimap gap to separate."
+     let help = "Drag between tabs to regroup, or to a minimap gap to separate."
+     card.toolTip = "\(displayTitle.isEmpty ? entry.app : "\(entry.app) — \(displayTitle)")\n\(help)"
      card.wantsLayer = true
      let active = selection == entry.id
      if side && !active {card.setFrameSize(NSSize(width:40,height:card.frame.height))}
@@ -409,14 +482,21 @@ final class TabBars: NSObject {
       card.layer?.shadowColor=NSColor.black.cgColor;card.layer?.shadowOpacity=Float(NSApp.effectiveAppearance.bestMatch(from:[.aqua,.darkAqua]) == .darkAqua ? 0.55:0.26)
       card.layer?.shadowRadius=active ? 2.5:2;card.layer?.shadowOffset=side ? CGSize(width:0,height:active ? 0:-2):CGSize(width:active ? 0:2,height:0)
      }
-     let face = FolderTabFace(frame:card.bounds); face.selected = active;face.style=style;face.matchedColor=active ? matched:nil;face.first=index==0 && (side ? frame.maxY>=live.frame.maxY:live.frame.minX>=screen.visibleFrame.minX);face.last=index==visible.count-1 && (side ? frame.minY<=live.frame.minY:live.frame.maxX<=screen.visibleFrame.maxX)
+     let face = FolderTabFace(frame:card.bounds); face.selected = active;face.style=style;face.matchedColor=active ? matched:nil;face.increaseContrast=increaseContrast;face.reduceTransparency=reduceTransparency
+     face.first=index==0 && (side ? frame.maxY>=live.frame.maxY:live.frame.minX>=screen.visibleFrame.minX);face.last=index==visible.count-1 && (side ? frame.minY<=live.frame.minY:live.frame.maxX<=screen.visibleFrame.maxX)
      card.addSubview(face)
-     if icons[entry.bundle] == nil, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: entry.bundle) { icons[entry.bundle] = NSWorkspace.shared.icon(forFile: url.path) }
+     if icons[entry.bundle] == nil, (iconMisses[entry.bundle] ?? 0) < Date.timeIntervalSinceReferenceDate {
+      // An app Launch Services cannot resolve would otherwise be looked up on every rebuild (every frame of a live resize).
+      if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: entry.bundle) { icons[entry.bundle] = NSWorkspace.shared.icon(forFile: url.path) }
+      else { iconMisses[entry.bundle] = Date.timeIntervalSinceReferenceDate + 10 }
+     }
      let iconSize:CGFloat=side ? 22:16
      let contentY:CGFloat=side ? (card.bounds.height-iconSize)/2 : (style == "classic" || style == "folder-compact") ? (frame.height-16)/2 : (height >= 34 ? 8.25:6.25)
      let icon = NSImageView(frame:CGRect(x:side ? 9:15,y:contentY,width:iconSize,height:iconSize))
      icon.image=icons[entry.bundle] ?? NSImage(named:NSImage.applicationIconName);card.addSubview(icon)
-     card.setAccessibilityLabel(displayTitle.isEmpty ? entry.app:displayTitle)
+     let tabLabel = displayTitle.isEmpty ? entry.app:displayTitle
+     card.setAccessibilityLabel(tabLabel)
+     accessibilityItems.append(TabAccessibilityItem(card:card,label:tabLabel,help:help,selected:active,press:{ [weak card] in card?.onClick?() }))
      if !side {
       let label=NSTextField(labelWithString:displayTitle.isEmpty ? entry.app:displayTitle)
       label.frame=CGRect(x:38,y:contentY-1,width:max(0,width-51),height:18)
@@ -433,22 +513,27 @@ final class TabBars: NSObject {
     }
     if overflow {
      let more = ColumnCard(frame: side ? CGRect(x:0,y:0,width:41,height:30):CGRect(x:available,y:0,width:30,height:frame.height))
-     let face = FolderTabFace(frame:more.bounds); face.style=style; more.addSubview(face)
+     let face = FolderTabFace(frame:more.bounds); face.style=style; face.increaseContrast=increaseContrast;face.reduceTransparency=reduceTransparency; more.addSubview(face)
      let label = NSTextField(labelWithString: "…"); label.frame = CGRect(x: 7, y: (more.bounds.height-18)/2, width: 20, height: 18); more.addSubview(label)
      more.diagnosticName="tab overflow column=\(column)"
      more.toolTip = "All tabs (\(members.count))"
      more.onPress = { [weak bar] down in bar?.pressed = down }
-     more.onClick = { [weak self, weak more] in
-      guard let self, let more, let event = NSApp.currentEvent else { return }
+     let showMenu: (NSEvent?) -> Void = { [weak self, weak more] event in
+      guard let self, let more else { return }
       let menu = NSMenu()
       for member in members {
        let item = NSMenuItem(title: "\(member.app) — \(self.aliases[member.bundle+"\t"+member.title] ?? member.title)", action: #selector(self.selectMenu(_:)), keyEquivalent: "")
        item.target = self; item.tag = member.id; item.state = member.id == selection ? .on : .off; menu.addItem(item)
       }
-      NSMenu.popUpContextMenu(menu, with: event, for: more)
+      if let event { NSMenu.popUpContextMenu(menu, with: event, for: more) }
+      else { menu.popUp(positioning: nil, at: NSPoint(x: 0, y: more.bounds.height), in: more) }
      }
+     more.onClick = { showMenu(NSApp.currentEvent) }
+     more.setAccessibilityLabel("More tabs")
+     accessibilityItems.append(TabAccessibilityItem(card:more,label:"More tabs",help:"All tabs (\(members.count))",selected:nil,press:{ showMenu(nil) }))
      view.addSubview(more)
     }
+    installTabAccessibility(strip: view, items: accessibilityItems, vertical: side)
     let clip = NSView(frame: CGRect(origin: .zero, size: panelFrame.size))
     // Never paint guessed opaque rectangles over app chrome. These masks are
     // transparent everywhere the captured app is opaque, including controls.
@@ -490,6 +575,7 @@ final class TabBars: NSObject {
    }
    // Attach the panel to its group's ordinary window order, not a global
    // floating level. Unrelated windows in front must also cover these tabs.
+   guard ordersPanels else { continue }   // headless tests build and place strips without ever showing a window
    let hasSeams=side || (style == "classic" && sample?.corners.count == 4)
    if hasSeams {
     if !bar.seamPanel.isVisible || tabBarNeedsOrdering(panelID:bar.seamPanel.windowNumber,ownerID:live.id,windows:windows) {
