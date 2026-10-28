@@ -542,7 +542,12 @@ impl FlashPanel {
                 13.0,
                 FONT_WEIGHT_MEDIUM,
             )));
-            let text = self.title.intrinsicContentSize();
+            // Measured size plus slack: under a vibrant appearance the label's
+            // cell asks for a few points more than `sizeToFit` reports, which
+            // truncated short notes. The text is centred, so slack is invisible.
+            self.title.sizeToFit();
+            let mut text = self.title.frame().size;
+            text.width += 8.0;
             let width = (text.width.ceil() + 2.0 * NOTE_PADDING)
                 .max(120.0)
                 .min(max_width.max(120.0));
