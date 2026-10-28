@@ -1,7 +1,7 @@
 import AppKit
 final class Launcher: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        guard let script = Bundle.main.object(forInfoDictionaryKey: "MicrofishLaunchScript") as? String else { fail("The launch script is not configured."); return }
+        guard let script = Bundle.main.object(forInfoDictionaryKey: "MicrofishLaunchScript") as? String else { fail("This copy of Microfish.app is incomplete. Rebuild it with scripts/build-microfish-app.py --install."); return }
         DispatchQueue.global(qos: .userInitiated).async {
             let task = Process(); task.executableURL = URL(fileURLWithPath: "/bin/zsh"); task.arguments = [script]
             let pipe = Pipe(); task.standardOutput = pipe; task.standardError = pipe
@@ -11,7 +11,7 @@ final class Launcher: NSObject, NSApplicationDelegate {
                 task.waitUntilExit()
                 DispatchQueue.main.async {
                     if task.terminationStatus == 0 { NSApp.terminate(nil) }
-                    else { self.fail(output.isEmpty ? "Microfish could not start." : output) }
+                    else { self.fail(output.isEmpty ? "No details were reported." : output.trimmingCharacters(in: .whitespacesAndNewlines)) }
                 }
             } catch { DispatchQueue.main.async { self.fail(error.localizedDescription) } }
         }
