@@ -261,6 +261,7 @@ final class SpatialMapView: NSView {
     /// Back to the state of a newly built map for `snapshot` (SpatialContentView.make re-uses its map view).
     func reuse(snapshot: SpatialSnapshot, width: CGFloat) {
         cancelDrag(); pending = nil
+        missingIcons = []  // retry apps whose icon could not be resolved last time, as a fresh map did
         onFocus = nil; onMove = nil; onDragState = nil; onPin = nil; onEscape = nil
         pins = [:]; pinPadding = 4; increaseContrastOverride = nil; pressedPin = nil; pressedOverflow = nil
         requestedWidth = width

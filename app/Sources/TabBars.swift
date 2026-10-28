@@ -544,7 +544,7 @@ final class TabBars: NSObject {
      icon.image=icons[entry.bundle] ?? NSImage(named:NSImage.applicationIconName);card.addSubview(icon)
      let tabLabel = displayTitle.isEmpty ? entry.app:displayTitle
      card.setAccessibilityLabel(tabLabel)
-     accessibilityItems.append(TabAccessibilityItem(card:card,label:tabLabel,help:help,selected:active,press:{ [weak card] in card?.onClick?() }))
+     accessibilityItems.append(TabAccessibilityItem(card:card,label:tabLabel,help:help,selected:active,press:{ [weak self] in self?.focus?(entry.id) }))
      if !side {
       let label=card.takeLabel(displayTitle.isEmpty ? entry.app:displayTitle)
       label.frame=CGRect(x:38,y:contentY-1,width:max(0,width-51),height:18)
@@ -558,6 +558,8 @@ final class TabBars: NSObject {
       card.addSubview(label)
      }
      view.addSubview(card,positioned:active ? .above:.below,relativeTo:nil)
+     // Re-applied after joining the strip: AppKit resets a pooled card's shadowOpacity on addSubview.
+     if !style.hasPrefix("folder") { card.layer?.shadowOpacity=Float(NSApp.effectiveAppearance.bestMatch(from:[.aqua,.darkAqua]) == .darkAqua ? 0.55:0.26) }
     }
     if overflow {
      let more = bar.more; more.frame = side ? CGRect(x:0,y:0,width:41,height:30):CGRect(x:available,y:0,width:30,height:frame.height)
