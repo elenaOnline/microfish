@@ -126,7 +126,9 @@ fn publish_status(world: &mut World, text: &str) {
     }
 }
 fn announce(world: &mut World, text: &str) {
-    publish_status(world, text);
+    // Confirmations only flash; the Window Map's Views menu shows the status
+    // line only when it reports a problem (see `warn_user`).
+    publish_status(world, "");
     world.commands().flash_message(text.to_owned(), 1.6);
 }
 /// A problem, shown in the failure HUD's layout: what failed, then why.
