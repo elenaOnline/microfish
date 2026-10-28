@@ -76,7 +76,8 @@ func failureCopy(action: String, diagnostic: String) -> (title: String, detail: 
  let title: String
  switch action {
  case "focus": title="Couldn’t switch to that window"
- case "view-pin","view-save": title="Couldn’t save the view"
+ case "view-pin": title="Couldn’t go to that view"
+ case "view-save": title="Couldn’t save the view"
  case "view-back": title="Couldn’t go back"
  case "undo-move": title="Couldn’t undo the move"
  case "move-column-row","reorder-column": title="Couldn’t move that column"
@@ -115,6 +116,7 @@ final class FailureHUDView:RoundedHUDView {
   let sourceAppearance=appearance ?? NSApp?.effectiveAppearance ?? NSAppearance.currentDrawing()
   self.appearance=NSAppearance(named:sourceAppearance.bestMatch(from:[.aqua,.darkAqua]) == .darkAqua ? .vibrantDark:.vibrantLight)
   let dark=hudDark(self)
+  title.lineBreakMode = .byTruncatingTail; detail.lineBreakMode = .byTruncatingTail
   title.font = .systemFont(ofSize:13,weight:.semibold); title.textColor = hudColor(dark ? 0xFF6961:0xC4000F)
   title.frame=CGRect(x:44,y:31,width:width-60,height:17)
   warning.image=NSImage(systemSymbolName:"exclamationmark.triangle",accessibilityDescription:"Warning");warning.contentTintColor=hudColor(dark ? 0xFF6961:0xD70015)

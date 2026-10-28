@@ -553,7 +553,7 @@ final class TabBars: NSObject {
      }
      let displayTitle=aliases[entry.bundle+"\t"+entry.title] ?? entry.title
      let name = tabDisplayName(app:entry.app,title:displayTitle)
-     card.toolTip = "\(name)\nDrag to reorder, or drop it in the Minimap to move it to another Column."
+     card.toolTip = "\(name)\nDrag to reorder, or drop it in the Minimap to move it to another column."
      card.wantsLayer = true
      let active = selection == entry.id
      if side && !active {card.setFrameSize(NSSize(width:40,height:card.frame.height))}

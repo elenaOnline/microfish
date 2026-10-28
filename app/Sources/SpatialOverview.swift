@@ -753,6 +753,8 @@ final class SpatialContentView: NSView {
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(settings), keyEquivalent: ","); settingsItem.keyEquivalentModifierMask = .command; settingsItem.target = self
         let quitItem = NSMenuItem(title: "Quit Microfish", action: #selector(quit), keyEquivalent: "q"); quitItem.keyEquivalentModifierMask = .command; quitItem.target = self
         menu.addItem(settingsItem); menu.addItem(.separator()); menu.addItem(quitItem)
+        // As in the status menu: macOS 27 adds an image to "Settings…" by its action, and not to Quit.
+        if #available(macOS 27.0, *) { for item in menu.items where !item.isSeparatorItem { item.preferredImageVisibility = .hidden } }
         return menu
     }
     @objc private func gearMenu() {
@@ -816,7 +818,7 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
         // The script's own messages are sentences; exception lines look like "Name: detail".
         let exceptionLine = last.range(of:#"^[A-Za-z_][\w.]*: "#,options:.regularExpression) != nil
         let plain = !last.isEmpty && last.count < 160 && !exceptionLine && !last.hasPrefix("File ") && !last.hasPrefix("Traceback")
-        return plain ? last : "Couldn’t refresh windows."
+        return plain ? last : "Couldn’t restart window tracking."
     }
     var onViewAction: ((String, Int?) -> Void)?
     private var item: NSStatusItem?
@@ -879,7 +881,7 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
         })
         if let data=try? Data(contentsOf:rootURL.appendingPathComponent("config/preferences.json")), let prefs=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any], let gap=prefs["windowGap"] as? Double { map.pinPadding=gap }
     }
-    func showMoveResult(_ success: Bool) { content?.message = success ? "Column moved" : "Couldn’t move the column. The layout may have changed." }
+    func showMoveResult(_ success: Bool) { content?.message = success ? "Column moved" : "Couldn’t move that column. The layout changed. Try again." }
     func popoverWillClose(_ notification: Notification) {
         content?.mapView.cancelDrag()
         if let window = item?.button?.window, NSEvent.pressedMouseButtons & 1 != 0, window.frame.contains(NSEvent.mouseLocation) { closedByStatusPressAt = ProcessInfo.processInfo.systemUptime }
@@ -930,7 +932,7 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
         if let data=try? Data(contentsOf:statusPath), let status=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any] {
             // Only what the user can act on: a locked View, or a problem. "Navigation ready" and "View released" are the engine's chatter.
             var lines:[String]=[]
-            if status["locked"] as? Bool == true { lines.append("Locked to a View. Navigate to unlock.") }
+            if status["locked"] as? Bool == true { lines.append("Locked to a view. Navigate to unlock.") }
             if let message=(status["message"] as? String)?.trimmingCharacters(in:.whitespacesAndNewlines), !message.isEmpty, !Self.routineViewStatus.contains(message) { lines.append(message) }
             for line in lines { let note=NSMenuItem(title:line,action:nil,keyEquivalent:""); note.isEnabled=false; menu.addItem(note) }
             if !lines.isEmpty { menu.addItem(.separator()) }
@@ -941,7 +943,7 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
             if let chord=chords[id], !chord.isEmpty, let (key,mask)=spatialKeyEquivalent(chord) { item.keyEquivalent=key; item.keyEquivalentModifierMask=mask }
             return item
         }
-        menu.addItem(item("Undo Last Layout Move","undo-move",chord:"undo_move"))
+        menu.addItem(item("Undo Last Move","undo-move",chord:"undo_move"))
         menu.addItem(item("Previous View","view-back",chord:"view_back")); menu.addItem(.separator())
         for slot in 0...9 {
             let count=(pins[String(slot)]?["columns"] as? [[Any]])?.reduce(0) { $0+$1.count }

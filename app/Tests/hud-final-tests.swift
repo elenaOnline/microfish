@@ -11,7 +11,8 @@ do {
  fcheck(failureCopy(action:"focus",diagnostic:"x")?.detail == "The layout changed. Try again.","detail")
  for a in ["move-column-row","reorder-column"] { fcheck(failureCopy(action:a,diagnostic:"")?.title == "Couldn’t move that column",a) }
  for a in ["move-tab","detach-tab","move"] { fcheck(failureCopy(action:a,diagnostic:"")?.title == "Couldn’t move that window",a) }
- for a in ["view-pin","view-save"] { fcheck(failureCopy(action:a,diagnostic:"")?.title == "Couldn’t save the view",a) }
+ fcheck(failureCopy(action:"view-save",diagnostic:"")?.title == "Couldn’t save the view","view-save")
+fcheck(failureCopy(action:"view-pin",diagnostic:"")?.title == "Couldn’t go to that view","view-pin")
  for a in ["focus","view-pin","move-tab"] {
   let c=failureCopy(action:a,diagnostic:"Navigator: no process is registered under that service name")
   fcheck(c?.title == "Microfish isn’t running" && c?.detail == "Open Microfish to turn it back on.","unreachable via \(a)")

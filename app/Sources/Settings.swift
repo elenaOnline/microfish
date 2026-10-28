@@ -379,7 +379,7 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
         DispatchQueue.global(qos: .userInitiated).async {
             let result: Result<([LiveWindowEntry], Int?), Error> = Result {
                 let (status, data) = try SettingsController.run(SettingsController.engineExecutable(root) ?? "", ["query", "state", "--json"])
-                guard status == 0, let state = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw NSError(domain: "Settings", code: 2, userInfo: [NSLocalizedDescriptionKey: "Microfish isn’t answering."]) }
+                guard status == 0, let state = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw NSError(domain: "Settings", code: 2, userInfo: [NSLocalizedDescriptionKey: "Microfish isn’t responding."]) }
                 let me = ProcessInfo.processInfo.processName
                 let list = (state["virtual_workspaces"] as? [[String: Any]] ?? []).flatMap { $0["windows"] as? [[String: Any]] ?? [] }.compactMap { w -> LiveWindowEntry? in
                     guard let id = (w["window_id"] as? NSNumber)?.intValue, (w["app_name"] as? String) != me else { return nil }
@@ -419,13 +419,14 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
         default: return nil
         }
     }
-    /// Plain wording for the messages apply-settings.py can produce; anything else gets the generic line.
+    /// apply-settings.py prints one plain sentence for every failure it knows (details go to its log), so
+    /// show that sentence; anything else (a crash, several lines) gets the generic line.
     nonisolated static func failureText(_ message: String) -> String {
         let generic = "Couldn’t apply these settings. Microfish kept the previous ones."
-        if message.contains("keep the manager running") { return "Couldn’t reduce rows. Microfish isn’t responding; open it and try again." }
-        if message.contains("retained row") { return "Couldn’t reduce rows. Switch to a row that will remain first." }
-        if message.contains("Move windows out of higher rows") { return "Couldn’t reduce rows. Move windows out of the higher rows first." }
-        return generic
+        let line = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty, !line.contains("\n"), line.count <= 200, line.hasSuffix("."),
+              !line.contains("Traceback"), !line.contains("Error:") else { return generic }
+        return line
     }
     private func announce() {
         if let text = outcomeText { Self.post(text) }
@@ -690,7 +691,8 @@ final class SettingsWindow: NSWindow {
             // Another visible window of ours (About) keeps the app in front.
             let others = NSApp.windows.contains { $0 !== self.window && $0.isVisible && $0.canBecomeKey }
             let target = others ? nil : Self.appToRestore(previous: self.previousApp, helperActive: NSApp.isActive, helperPID: ProcessInfo.processInfo.processIdentifier)
-            self.leaveAppMode()
+            // About still open: stay a regular app (menu bar, ⌘Tab) until it closes too.
+            if !others { self.leaveAppMode() }
             self.previousApp = nil
             if let target { NSApp.yieldActivation(to: target); target.activate() }
         }
@@ -772,7 +774,7 @@ final class SettingsWindow: NSWindow {
                         Thread.sleep(forTimeInterval: 0.25)
                         result = try Self.run(bridge, ["record-begin", token])
                     }
-                    guard result.0 == 0 else { throw NSError(domain: "ShortcutRecorder", code: Int(result.0), userInfo: [NSLocalizedDescriptionKey: "Couldn’t start recording. Make sure Microfish is running."]) }
+                    guard result.0 == 0 else { throw NSError(domain: "ShortcutRecorder", code: Int(result.0), userInfo: [NSLocalizedDescriptionKey: "Couldn’t start recording. Microfish isn’t responding."]) }
                     completion(.success({ queue.async { _ = try? Self.run(bridge, ["record-end", token]) } }))
                 } catch {
                     // A timed-out acknowledgement may still have installed the lease.

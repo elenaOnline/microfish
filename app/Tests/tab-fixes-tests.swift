@@ -70,7 +70,7 @@ do {
   run(els[1], "Move to New Column"); ok(drops.last == StripDrop(kind: .detach, source: 7001, target: 7000, before: false), "Move to New Column = detach-tab beside the rest of the group")
   ok(drops.last!.arguments == ["detach-tab", "7001", "after", "7000"], "detach arguments are the existing bridge command")
   ok(drops.count == 3, "each action sends exactly one command")
-  for c in tabCards(bars) { ok(c.toolTip == "App\(c.entryID - 7000) — Title \(c.entryID - 7000)\nDrag to reorder, or drop it in the Minimap to move it to another Column.", "tooltip copy: \(c.toolTip ?? "nil")") }
+  for c in tabCards(bars) { ok(c.toolTip == "App\(c.entryID - 7000) — Title \(c.entryID - 7000)\nDrag to reorder, or drop it in the Minimap to move it to another column.", "tooltip copy: \(c.toolTip ?? "nil")") }
   let labelled = NSApp.windows.compactMap { $0 as? NSPanel }.filter { $0.accessibilityLabel() == strip(bars).accessibilityLabel() }
   ok(!labelled.isEmpty && labelled.allSatisfy { !$0.canHide }, "tab bar panel cannot be hidden (\(labelled.count) found)")
  }
