@@ -141,7 +141,7 @@ pub(super) fn front_switched_trigger(
         debug!("front switching process: {}", process.name());
 
         if let Ok(focused_id) = app.focused_window_id().inspect_err(|err| {
-            warn!("can not get current focus: {err}");
+            warn!("can not get current focus of '{}': {err}", process.name());
         }) {
             if let Some(point) = window_manager.cursor_position()
                 && window_manager
@@ -277,17 +277,40 @@ pub(super) fn window_focused_trigger(
         // decided to show. Follow it to that window rather than dropping the
         // event: dropping it leaves the strip parked where it was, so Cmd-Tab
         // into a tabbed terminal looks like nothing happened.
+        //
+        // A tab group lives in one strip, so an answer from a different strip
+        // is no tab sibling. A window the engine has just added to the active
+        // row while the app still reports its old window, parked on a hidden
+        // row, is the case: following that answer would reveal the hidden row
+        // and park the new window along with the row it was inserted into. The
+        // app's own focus notification for the new window follows by itself.
+        let strip_of = |target: Entity| {
+            workspaces
+                .iter()
+                .find_map(|(strip_entity, strip, _)| strip.contains(target).then_some(strip_entity))
+        };
         let (window, entity, window_id) = match app.focused_window_id() {
             Ok(current) if current != window_id => {
                 match ctx.windows.find_parent(current) {
                     Some((current_window, current_entity, current_parent))
                         if current_parent == parent =>
                     {
-                        debug!(
-                            "app {} reports window {current} focused, not {window_id}; following it",
-                            app.name()
-                        );
-                        (current_window, current_entity, current)
+                        if let (Some(event_strip), Some(current_strip)) =
+                            (strip_of(entity), strip_of(current_entity))
+                            && event_strip != current_strip
+                        {
+                            debug!(
+                                "app {} reports window {current} focused on another row, not {window_id}; keeping {window_id}",
+                                app.name()
+                            );
+                            (window, entity, window_id)
+                        } else {
+                            debug!(
+                                "app {} reports window {current} focused, not {window_id}; following it",
+                                app.name()
+                            );
+                            (current_window, current_entity, current)
+                        }
                     }
                     // Nothing we track answers to that id, so the event really
                     // is stale.

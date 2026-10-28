@@ -8,6 +8,7 @@ mod session_restore;
 mod state;
 mod tabbed_display;
 mod tabs;
+mod terminal_presentation;
 mod tiling;
 
 pub(crate) use harness::*;
