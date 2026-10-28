@@ -62,6 +62,12 @@ expect('bridge rejection, short plain line is kept', code == 1 and 'bad rule' in
 # floating step fails after the save: still exit 0, Settings looks for "could not be applied"
 code, out = run(make(bridge_script="if [ \"$1\" = apply-float-rules ]; then echo 'Command failed at /Users/x' >&2; exit 1; fi; exit 0"), {})
 expect('float failure: exit 0 and contract phrase', code == 0 and 'could not be applied' in out and not BANNED.search(out), f'{code} {out!r}')
+# floating step hangs after the save: a note, not a failure (exit 0, same contract phrase)
+code, out = run(make(bridge_script="if [ \"$1\" = apply-float-rules ]; then exec sleep 30; fi; exit 0"), {})
+expect('float timeout: exit 0 and contract phrase', code == 0 and 'could not be applied' in out and not BANNED.search(out), f'{code} {out!r}')
+# the bridge hangs before anything is saved: the shared "isn't responding" wording
+code, out = run(make(bridge_script="if [ \"$1\" = validate-rules ]; then exec sleep 30; fi; exit 0"), {})
+plain('bridge hangs (timeout)', code, out, 1); expect('timeout says Microfish isn’t responding', out == 'Microfish isn’t responding. Try again.', out)
 
 # row reduction: engine not answering / crashing / odd output / rows occupied
 def reduce_root(engine):

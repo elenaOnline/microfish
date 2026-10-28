@@ -502,6 +502,8 @@ final class SettingsWindow: NSWindow {
         // Remember who had the keyboard, so closing Settings can hand it back (see windowWillClose).
         if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != ProcessInfo.processInfo.processIdentifier { previousApp = front }
         store.acknowledgeOutcome()
+        // Reopened while About outlived the last Settings window: this window's close takes over.
+        if let observer = otherWindowsObserver { NotificationCenter.default.removeObserver(observer); otherWindowsObserver = nil }
         enterAppMode()
         installMainMenu()
         if window == nil { build() }
@@ -688,13 +690,30 @@ final class SettingsWindow: NSWindow {
         // After the close animation, so the window doesn't vanish mid-close with the Dock tile.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            // Another visible window of ours (About) keeps the app in front.
-            let others = NSApp.windows.contains { $0 !== self.window && $0.isVisible && $0.canBecomeKey }
-            let target = others ? nil : Self.appToRestore(previous: self.previousApp, helperActive: NSApp.isActive, helperPID: ProcessInfo.processInfo.processIdentifier)
-            // About still open: stay a regular app (menu bar, ⌘Tab) until it closes too.
-            if !others { self.leaveAppMode() }
-            self.previousApp = nil
-            if let target { NSApp.yieldActivation(to: target); target.activate() }
+            // Another visible window of ours (About) keeps the app in front, and a regular app (menu bar,
+            // ⌘Tab), until it closes too; then the app leaves app mode and hands the keyboard back.
+            if self.otherWindowsVisible { self.finishWhenOtherWindowsClose() } else { self.finishClosing() }
+        }
+    }
+    private var otherWindowsVisible: Bool { NSApp.windows.contains { $0 !== window && $0.isVisible && $0.canBecomeKey } }
+    private var otherWindowsObserver: NSObjectProtocol?
+    private func finishClosing() {
+        if let observer = otherWindowsObserver { NotificationCenter.default.removeObserver(observer); otherWindowsObserver = nil }
+        let target = Self.appToRestore(previous: previousApp, helperActive: NSApp.isActive, helperPID: ProcessInfo.processInfo.processIdentifier)
+        leaveAppMode()
+        previousApp = nil
+        if let target { NSApp.yieldActivation(to: target); target.activate() }
+    }
+    private func finishWhenOtherWindowsClose() {
+        guard otherWindowsObserver == nil else { return }
+        otherWindowsObserver = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { [weak self] _ in
+            // After the close, so the closing window no longer counts as visible.
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self, self.otherWindowsObserver != nil, self.window?.isVisible != true, !self.otherWindowsVisible else { return }
+                    self.finishClosing()
+                }
+            }
         }
     }
     func windowDidBecomeKey(_ notification: Notification) { store.reloadFromDisk() }
