@@ -218,10 +218,10 @@ final class HelperWindow: NSWindow {
 final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     var window: NSWindow!
     var root = Bundle.main.bundleURL.deletingLastPathComponent()
-    let revealButton = NSButton(title: "Reveal in Finder", target: nil, action: nil)
+    let revealButton = NSButton(title: "Show in Finder", target: nil, action: nil)
     let copyButton = NSButton(title: "Copy Path", target: nil, action: nil)
     let chooseLink = NSButton(title: "Choose Build…", target: nil, action: nil)
-    let primary = NSButton(title: "Open Settings", target: nil, action: nil)
+    let primary = NSButton(title: "Open System Settings", target: nil, action: nil)
     var tile: BuildTile!
     var state: BuildState = .none
     private var copyResetTimer: Timer?
@@ -347,7 +347,7 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
 
         let file = submenu("File")
         add(file, "Choose Build…", #selector(choose), "o", target: self)
-        add(file, "Reveal in Finder", #selector(reveal), "r", target: self)
+        add(file, "Show in Finder", #selector(reveal), "r", target: self)
         file.addItem(.separator())
         add(file, "Close", #selector(NSWindow.performClose(_:)), "w")
 
@@ -385,7 +385,7 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
         state = newState
         tile?.show(newState, paneName: paneName)
         if case .ready = newState {
-            primary.title = "Open Settings"; primary.action = #selector(openSettings)
+            primary.title = "Open System Settings"; primary.action = #selector(openSettings)
             primary.setAccessibilityLabel("Open \(paneName) in System Settings")
             chooseLink.isHidden = false
         } else {

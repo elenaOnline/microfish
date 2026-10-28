@@ -165,6 +165,7 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
     var windowsNote: String?
     var selectedWindowID: Int?
     var lastFocusedWindowID: Int?
+    var currentPane: SettingsPane = .behavior
 
     @ObservationIgnored var beginRecording: ((String) -> Void)?
     @ObservationIgnored var cancelRecording: (() -> Void)?
@@ -192,6 +193,7 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
         }
         restoredDraft = next != saved
         invalid = [:]; draft = next; revision += 1
+        if phase == .idle { phase = Self.restingPhase(rootURL, prefsURL: prefsURL) }
         if !restoredDraft { try? FileManager.default.removeItem(at: pendingURL) }
     }
     /// Picks up preferences written elsewhere without discarding the user's edits: fields the user
@@ -286,6 +288,23 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
             }
         }
     }
+    /// What the engine last said about the saved settings: a reload logged after preferences.json
+    /// was written means it is running them.
+    nonisolated static func restingPhase(_ root: URL, prefsURL: URL) -> Phase {
+        guard let log = SettingsController.engineLogURL(root),
+              let size = (try? FileManager.default.attributesOfItem(atPath: log.path)[.size] as? NSNumber)?.uint64Value,
+              let written = try? FileManager.default.attributesOfItem(atPath: prefsURL.path)[.modificationDate] as? Date,
+              let handle = try? FileHandle(forReadingFrom: log) else { return .idle }
+        defer { try? handle.close() }
+        try? handle.seek(toOffset: size > 65536 ? size - 65536 : 0)
+        let text = String(decoding: (try? handle.readToEnd()) ?? Data(), as: UTF8.self).replacingOccurrences(of: "\u{1B}\\[[0-9;]*m", with: "", options: .regularExpression)
+        let iso = ISO8601DateFormatter()  // engine stamps carry microseconds; whole seconds are enough here
+        for line in text.split(separator: "\n").reversed() where line.contains("Reloading Lua script") || line.contains("Reloaded Lua script") {
+            guard let stamp = iso.date(from: String(line.prefix(19)) + "Z"), stamp >= written.addingTimeInterval(-1) else { return .idle }
+            return line.contains("ERROR") ? .rejected("check the engine log") : .confirmed
+        }
+        return .idle
+    }
     func refreshWindows() {
         let root = rootURL
         windowsNote = "Reading windows…"
@@ -335,6 +354,8 @@ final class SettingsWindow: NSWindow {
     let store: SettingsStore
     private(set) var window: NSWindow?
     private var hosts: [SettingsPane: NSView] = [:]
+    private var footer: NSView?
+    private var footerHeight: CGFloat = 0
     private(set) var pane: SettingsPane = .behavior
     private var switchGeneration = 0
     private let recorder = ShortcutRecorder()
@@ -359,6 +380,7 @@ final class SettingsWindow: NSWindow {
         store.reloadFromDisk(); store.refreshWindows()
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        warmPanes()
     }
 
     private func build() {
@@ -369,6 +391,7 @@ final class SettingsWindow: NSWindow {
         w.collectionBehavior = [.fullScreenNone]
         w.tabbingMode = .disallowed
         w.contentView = NSView(frame: NSRect(x: 0, y: 0, width: Self.width, height: 400))
+        installFooter(in: w.contentView!)
         let toolbar = NSToolbar(identifier: "MicrofishSettingsToolbar")
         toolbar.delegate = self; toolbar.displayMode = .iconAndLabel; toolbar.allowsUserCustomization = false
         w.toolbar = toolbar
@@ -393,49 +416,62 @@ final class SettingsWindow: NSWindow {
         return view
     }
     private func height(for pane: SettingsPane, _ view: NSView) -> CGFloat {
-        let limit = ((window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 900) - 120
-        if pane == .shortcuts { return min(640, limit) }
+        let limit = ((window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 900) - 120 - footerHeight
+        if pane == .shortcuts { return min(580, limit) }
         view.frame.size.width = Self.width
         return min(ceil(view.fittingSize.height), limit)
+    }
+    /// The status/Apply bar is one view shared by every pane, pinned to the window's bottom edge, so
+    /// it never moves or fades while panes change.
+    private func installFooter(in container: NSView) {
+        let bar = NSHostingView(rootView: FooterBar(store: store).frame(width: Self.width))
+        bar.sizingOptions = [.intrinsicContentSize]
+        footerHeight = ceil(bar.fittingSize.height)
+        bar.sizingOptions = []
+        bar.frame = NSRect(x: 0, y: 0, width: Self.width, height: footerHeight)
+        bar.autoresizingMask = [.width, .maxYMargin]
+        container.addSubview(bar)
+        footer = bar
     }
     func select(_ pane: SettingsPane, animate: Bool) {
         guard let window, let container = window.contentView else { return }
         if store.recordingID != nil { store.cancelRecording?() }
         let next = host(for: pane)
-        let size = NSSize(width: Self.width, height: height(for: pane, next))
-        var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: size))
+        let paneHeight = height(for: pane, next)
+        var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: NSSize(width: Self.width, height: paneHeight + footerHeight)))
         frame.origin = NSPoint(x: window.frame.minX, y: window.frame.maxY - frame.height)
-        self.pane = pane
+        self.pane = pane; store.currentPane = pane
         window.title = pane.title
         window.toolbar?.selectedItemIdentifier = NSToolbarItem.Identifier(pane.rawValue)
         UserDefaults.standard.set(pane.rawValue, forKey: Self.paneKey)
-        switchGeneration += 1; let generation = switchGeneration
-        let old = container.subviews.filter { $0 !== next }
-        next.frame = NSRect(x: 0, y: container.bounds.height - size.height, width: size.width, height: size.height)
+        // Swap content at once (no overlapping cross-fade), pinned under the toolbar; the window
+        // then grows or shrinks from its top edge, as first-party settings windows do.
+        hosts.values.filter { $0 !== next && $0.superview != nil }.forEach { $0.removeFromSuperview() }
+        next.frame = NSRect(x: 0, y: container.bounds.height - paneHeight, width: Self.width, height: paneHeight)
         next.autoresizingMask = [.width, .minYMargin]
-        if next.superview == nil { container.addSubview(next) }
-        let animated = animate && window.isVisible && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion && !old.isEmpty
-        if animated {
-            // Cross-fade while the window grows or shrinks from its top edge, like first-party settings.
-            next.alphaValue = 0
-            NSAnimationContext.runAnimationGroup({ context in
+        if next.superview == nil { container.addSubview(next, positioned: .below, relativeTo: footer) }
+        let animated = animate && window.isVisible && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        if animated && abs(frame.height - window.frame.height) > 1 {
+            NSAnimationContext.runAnimationGroup { context in
                 context.duration = window.animationResizeTime(frame)
                 context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
                 window.animator().setFrame(frame, display: true)
-                next.animator().alphaValue = 1
-                old.forEach { $0.animator().alphaValue = 0 }
-            }, completionHandler: { [weak self] in
-                MainActor.assumeIsolated {
-                    guard let self, self.switchGeneration == generation else { return }
-                    old.forEach { $0.removeFromSuperview(); $0.alphaValue = 1 }
-                    self.settleFocus()
-                }
-            })
+            }
         } else {
-            old.forEach { $0.removeFromSuperview(); $0.alphaValue = 1 }
-            next.alphaValue = 1
             window.setFrame(frame, display: window.isVisible)
-            settleFocus()
+        }
+        settleFocus()
+    }
+    /// Builds the other panes while idle so the first visit to one doesn't stall on SwiftUI setup.
+    private func warmPanes() {
+        let pending = SettingsPane.allCases.filter { hosts[$0] == nil }
+        guard let pane = pending.first else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, self.window?.isVisible == true else { return }
+            let view = self.host(for: pane)
+            view.frame.size = NSSize(width: Self.width, height: 600)
+            view.layoutSubtreeIfNeeded()
+            self.warmPanes()
         }
     }
     private func settleFocus() {
@@ -604,8 +640,6 @@ struct SettingsPaneView: View {
                 }
             }
             .formStyle(.grouped)
-            Divider()
-            FooterBar(store: store, showsResetAll: pane == .shortcuts, pane: pane)
         }
         .tint(usesBrandAccent ? brandTeal : nil)
     }
@@ -613,9 +647,17 @@ struct SettingsPaneView: View {
 
 struct FooterBar: View {
     @Bindable var store: SettingsStore
-    var showsResetAll = false
-    var pane: SettingsPane = .behavior
+    private var showsResetAll: Bool { store.currentPane == .shortcuts }
+    private var pane: SettingsPane { store.currentPane }
     var body: some View {
+        VStack(spacing: 0) {
+            Divider()
+            bar
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+        .tint(usesBrandAccent ? brandTeal : nil)
+    }
+    private var bar: some View {
         HStack(spacing: 8) {
             if showsResetAll {
                 Button("Reset All") { store.draft.shortcuts = store.defaults }
@@ -1194,7 +1236,7 @@ struct RulesPane: View {
                 }
                 LabeledContent("Tab title") {
                     HStack(spacing: 6) {
-                        TextField("Tab title", text: alias, prompt: Text("Use window title")).labelsHidden().textFieldStyle(.roundedBorder).frame(maxWidth: 260)
+                        TextField("Tab title", text: alias, prompt: Text("Use window title")).labelsHidden().textFieldStyle(.roundedBorder).multilineTextAlignment(.leading).frame(maxWidth: 260)
                         Button("Reset") { alias.wrappedValue = "" }.disabled(alias.wrappedValue.isEmpty)
                     }
                 }
