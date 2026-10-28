@@ -668,8 +668,8 @@ final class SettingsWindow: NSWindow {
     nonisolated static func appIcon(_ root: URL) -> NSImage? { NSImage(contentsOf: root.appendingPathComponent("assets/microfish-icon.png")) }
     /// While Settings is open the helper behaves like an app: menu bar, ⌘Tab, Dock tile. It returns to
     /// a menu-bar accessory when Settings closes. Off until the engine ignores its own helper even
-    /// when that helper is a regular app (BOARD 2026-10-28 00:35); a regular app is otherwise managed.
-    static let becomesRegularApp = false
+    /// when that helper is a regular app (BOARD 2026-10-28 00:35; engine exclusion live in 0a1ba64).
+    static let becomesRegularApp = true
     private func enterAppMode() {
         guard Self.becomesRegularApp, NSApp.activationPolicy() != .regular else { return }
         NSApp.setActivationPolicy(.regular)
