@@ -17,6 +17,7 @@ use std::ffi::c_void;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use stdext::function_name;
@@ -136,6 +137,9 @@ pub(super) struct InputHandler {
     /// scrolling windows underneath (including momentum scroll after finger lift).
     last_swipe_time: Option<Instant>,
     last_window_scroll: Option<(Instant, Direction)>,
+    /// Whether the previous pointer move still had the mouse-resize modifier
+    /// down. See [`mouse_moved_wanted`].
+    resize_modifier_was_down: bool,
     // Prevents from being Unpin automatically
     _pin: PhantomPinned,
 }
@@ -163,6 +167,7 @@ impl InputHandler {
             run_loop_source: None,
             last_swipe_time: None,
             last_window_scroll: None,
+            resize_modifier_was_down: false,
             _pin: PhantomPinned,
         }
     }
@@ -369,6 +374,14 @@ impl InputHandler {
                 events.send(Event::MouseDragged { point, modifiers })
             }
             CGEventType::MouseMoved => {
+                if !mouse_moved_wanted(
+                    &self.config,
+                    modifiers,
+                    &mut self.resize_modifier_was_down,
+                    LUA_WANTS_MOUSE_MOVED.load(Ordering::Relaxed),
+                ) {
+                    return false;
+                }
                 let point = CGEvent::location(Some(event));
                 events.send(Event::MouseMoved { point, modifiers })
             }
@@ -1007,6 +1020,43 @@ mod tests {
 
 /// Preserve small coherent movements even if one finger barely moves. The
 /// per-event baseline is updated below, so dropping these loses travel forever.
+/// Set by the Lua dispatcher while the loaded script has a `paneru.on("mouse_moved")`
+/// handler, so the tap knows a script reads pointer motion.
+pub(crate) static LUA_WANTS_MOUSE_MOVED: AtomicBool = AtomicBool::new(false);
+
+/// Whether anything downstream reads this pointer move.
+///
+/// Every move the tap forwards wakes the main loop and runs the whole schedule,
+/// at the pointer's report rate (~100+ Hz) for as long as the mouse is in
+/// motion; with hover focus off, no warp and no resize modifier that work
+/// produces nothing. This is the one list of who reads `Event::MouseMoved`,
+/// so a new consumer must be added here:
+/// - `mouse_moved_trigger` (focus follows mouse),
+/// - `mouse_resize_trigger` (the resize modifier held),
+/// - `horizontal_warp_mouse_trigger` (display-edge warp),
+/// - Lua `mouse_moved` handlers.
+///
+/// `resize_was_down` remembers the previous move's modifier state: the resize
+/// tracker drops its anchor on the first move after the modifier is released,
+/// so that one move must still be delivered or the next resize would start
+/// from a stale point.
+fn mouse_moved_wanted(
+    config: &Config,
+    modifiers: Modifiers,
+    resize_was_down: &mut bool,
+    lua_wants: bool,
+) -> bool {
+    let resize_down = config
+        .mouse_resize_modifier()
+        .is_some_and(|modifier| modifier.matches(modifiers));
+    let resize_released = std::mem::replace(resize_was_down, resize_down) && !resize_down;
+    config.focus_follows_mouse()
+        || config.horizontal_mouse_warp().is_some()
+        || lua_wants
+        || resize_down
+        || resize_released
+}
+
 fn horizontal_motion_is_meaningful(deltas: &[f64]) -> bool {
     !deltas.is_empty() && deltas.iter().sum::<f64>().abs() > 0.000_001
 }
@@ -1021,5 +1071,65 @@ mod slow_swipe_tests {
         assert!(!horizontal_motion_is_meaningful(&[0.0, 0.0, 0.0]));
         assert!(!horizontal_motion_is_meaningful(&[0.1, -0.1, 0.0]));
         assert!(!horizontal_motion_is_meaningful(&[]));
+    }
+}
+
+#[cfg(test)]
+mod mouse_interest_tests {
+    use super::*;
+
+    fn config(options: &str) -> Config {
+        Config::try_from(format!("[options]\n{options}\n[bindings]\n").as_str())
+            .expect("valid test config")
+    }
+
+    fn wanted(config: &Config, modifiers: Modifiers, was_down: &mut bool, lua: bool) -> bool {
+        mouse_moved_wanted(config, modifiers, was_down, lua)
+    }
+
+    #[test]
+    fn plain_pointer_motion_is_dropped_when_nothing_reads_it() {
+        let config = config("focus_follows_mouse = false");
+        let mut down = false;
+        for _ in 0..3 {
+            assert!(!wanted(&config, Modifiers::empty(), &mut down, false));
+        }
+    }
+
+    #[test]
+    fn each_consumer_keeps_the_events_flowing() {
+        let mut down = false;
+        assert!(wanted(
+            &config("focus_follows_mouse = true"),
+            Modifiers::empty(),
+            &mut down,
+            false
+        ));
+        // Hover focus defaults to on when the option is absent.
+        assert!(wanted(&config(""), Modifiers::empty(), &mut down, false));
+        assert!(wanted(
+            &config("focus_follows_mouse = false\nhorizontal_mouse_warp = 1"),
+            Modifiers::empty(),
+            &mut down,
+            false
+        ));
+        assert!(wanted(
+            &config("focus_follows_mouse = false"),
+            Modifiers::empty(),
+            &mut down,
+            true
+        ));
+    }
+
+    #[test]
+    fn resize_modifier_moves_and_the_release_move_are_delivered() {
+        let config = config("focus_follows_mouse = false\nmouse_resize_modifier = 'alt'");
+        let mut down = false;
+        assert!(!wanted(&config, Modifiers::empty(), &mut down, false));
+        assert!(wanted(&config, Modifiers::LALT, &mut down, false));
+        assert!(wanted(&config, Modifiers::LALT, &mut down, false));
+        // First move after release: the tracker needs it to forget its anchor.
+        assert!(wanted(&config, Modifiers::empty(), &mut down, false));
+        assert!(!wanted(&config, Modifiers::empty(), &mut down, false));
     }
 }

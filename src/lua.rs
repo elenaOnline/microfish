@@ -111,6 +111,12 @@ pub fn dispatch_lua_events(worker: Option<Res<LuaWorker>>, mut reader: MessageRe
     // No `paneru.on` handlers means nothing consumes these events; just
     // advance past them.
     let mask = worker.subscribed_event_mask();
+    // Tells the input tap whether pointer motion has any reader here; see
+    // `mouse_moved_wanted`.
+    crate::platform::input::LUA_WANTS_MOUSE_MOVED.store(
+        mask & convert::LuaEvent::bit_for_name("mouse_moved") != 0,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if mask == 0 {
         for _ in reader.read() {}
         return;
