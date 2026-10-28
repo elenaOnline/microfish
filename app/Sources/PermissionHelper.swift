@@ -106,7 +106,9 @@ final class BuildTile: NSView, NSDraggingSource {
         buttons.setContentHuggingPriority(.required, for: .horizontal)
         buttons.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        let row = NSStackView(views: [iconView, text, buttons])
+        // Buttons sit on the tile's trailing edge however short the file name is.
+        let row = NSStackView()
+        row.setViews([iconView, text], in: .leading); row.setViews([buttons], in: .trailing)
         row.orientation = .horizontal; row.alignment = .centerY; row.spacing = 12
         row.translatesAutoresizingMaskIntoConstraints = false
         addSubview(row)
