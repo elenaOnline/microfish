@@ -643,21 +643,42 @@ fn cleanup_active_workspace_marker(
 }
 
 /// Removes previuos `SelectedVirtualMarker`'s when a new one is inserted.
+///
+/// The selection is the row a Space change brings back, so on the Space that is
+/// on screen it must stay on the row that is on screen. A row spawned in the
+/// background - a window sent to a new row with Stay, or a restored session
+/// spawning its rows one after another - therefore does not take it: it
+/// would otherwise make the next Space notification (Mission Control closing
+/// sends one) switch to that row by itself.
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn cleanup_selected_space_marker(
     trigger: On<Add, SelectedVirtualMarker>,
-    workspaces: Query<(Entity, &LayoutStrip, Has<SelectedVirtualMarker>)>,
+    workspaces: Query<(
+        Entity,
+        &LayoutStrip,
+        Has<SelectedVirtualMarker>,
+        Has<ActiveWorkspaceMarker>,
+    )>,
     mut commands: Commands,
 ) {
-    let Ok(workspace_id) = workspaces
-        .get(trigger.entity)
-        .map(|(_, strip, _)| strip.id())
-    else {
+    let Ok((_, strip, _, active)) = workspaces.get(trigger.entity) else {
         return;
     };
+    let workspace_id = strip.id();
+
+    let on_screen_elsewhere = workspaces.iter().any(|(entity, other, _, on_screen)| {
+        on_screen && entity != trigger.entity && other.id() == workspace_id
+    });
+    if !active
+        && on_screen_elsewhere
+        && let Ok(mut entity_commands) = commands.get_entity(trigger.entity)
+    {
+        entity_commands.try_remove::<SelectedVirtualMarker>();
+        return;
+    }
 
     // Remove the marker from other strips on the same workspace.
-    workspaces.iter().for_each(|(entity, strip, marker)| {
+    workspaces.iter().for_each(|(entity, strip, marker, _)| {
         if marker
             && entity != trigger.entity
             && strip.id() == workspace_id
