@@ -121,9 +121,12 @@ fn an_app_that_always_fights_causes_a_bounded_number_of_moves() {
         assert_eq!(logical(&mut h, entity), target, "the layout stays put");
     }
     let total: usize = per_ten_seconds.iter().sum();
+    // The first moves are quick retries while the app looks mid-burst (it
+    // undoes each at once; see `UNDONE_RETRIES` in ecs/systems.rs), then the
+    // backoff takes over.
     assert!(
-        (3..=10).contains(&total),
-        "expected a few backed-off corrections in a minute, got {per_ten_seconds:?}"
+        (3..=18).contains(&total),
+        "expected a bounded number of corrections in a minute, got {per_ten_seconds:?}"
     );
     assert!(
         per_ten_seconds[3..].iter().all(|moves| *moves <= 2),

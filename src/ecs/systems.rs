@@ -1021,6 +1021,19 @@ const CORRECTION_BACKOFF: [Duration; 4] = [
 /// and the long ladder only fits the latter. It has to span two audits
 /// ([`PARKING_AUDIT_EVERY`]), the only callers that see a quiet window.
 const PARKED_SETTLE: Duration = Duration::from_secs(3);
+/// A displacement seen this soon after our correction means the app undid it at
+/// once: it is applying a burst of its own frame fixes (cmux re-clamps its
+/// window into the visible frame on every screen-parameter change, and macOS
+/// posts those 8 ms apart for about 2 s while display EDR headroom ramps).
+/// Climbing the backoff then only wastes the time after the burst ends.
+const UNDONE_WITHIN: Duration = Duration::from_millis(120);
+/// While an app keeps undoing corrections, retry at this pace instead of
+/// climbing the backoff, so the window is parked within this long of the burst
+/// ending...
+const UNDONE_RETRY: Duration = Duration::from_millis(300);
+/// ...but only this many times in a row, so an app that always undoes the move
+/// falls back to the backoff rather than a move every 300 ms forever.
+const UNDONE_RETRIES: usize = 8;
 /// How often the audit looks at the window server when nothing is in doubt.
 const PARKING_AUDIT_EVERY: Duration = Duration::from_secs(2);
 /// How soon the audit looks again when a window was seen displaced once, or a
@@ -1049,6 +1062,10 @@ struct ParkingEpisode {
     /// Seen displaced while the backoff held the correction back: the audit
     /// re-checks it as soon as `retry_at` passes, without a second sighting.
     pending: bool,
+    /// When the last corrective move was sent.
+    sent_at: Option<Duration>,
+    /// Corrections in a row the app undid at once (see [`UNDONE_WITHIN`]).
+    undone: usize,
 }
 
 /// A parking correction must not become a feedback loop with an app's own
@@ -1096,6 +1113,20 @@ impl ParkingCorrections {
             *episode = ParkingEpisode::new(target);
         }
         episode.parked_since = None;
+        let undone_at_once = episode
+            .sent_at
+            .is_some_and(|sent| now.saturating_sub(sent) <= UNDONE_WITHIN);
+        if undone_at_once && episode.undone < UNDONE_RETRIES {
+            // The app undid the move right away: it is mid-burst. That move
+            // doesn't count towards the backoff; try again shortly.
+            episode.sent_at = None;
+            episode.undone += 1;
+            episode.corrections = episode.corrections.saturating_sub(1);
+            episode.retry_at = now + UNDONE_RETRY;
+            episode.pending = true;
+            self.audit_due = self.audit_due.min(episode.retry_at);
+            return false;
+        }
         if now < episode.retry_at {
             episode.pending = true;
             self.audit_due = self.audit_due.min(episode.retry_at);
@@ -1105,6 +1136,7 @@ impl ParkingCorrections {
         episode.retry_at = now + wait;
         episode.corrections += 1;
         episode.pending = false;
+        episode.sent_at = Some(now);
         true
     }
 
@@ -1161,6 +1193,8 @@ impl ParkingEpisode {
             retry_at: Duration::ZERO,
             parked_since: None,
             pending: false,
+            sent_at: None,
+            undone: 0,
         }
     }
 }
@@ -2306,6 +2340,64 @@ mod parking_correction_tests {
         assert!(!episodes.displaced(entity, target, at(1.5)));
         episodes.parked(entity, target, at(1.75));
         assert!(!episodes.is_pending(entity));
+    }
+
+    /// cmux, measured live: during a ~2 s burst of screen-parameter changes it
+    /// undoes every correction 1–15 ms after it lands. The backoff used to
+    /// spend 0.25 + 1 + 4 s on undone moves, leaving the window on screen
+    /// ~5.7 s; now it is parked within `UNDONE_RETRY` of the burst ending.
+    #[test]
+    fn an_app_undoing_moves_mid_burst_does_not_climb_the_backoff() {
+        let mut episodes = ParkingCorrections::default();
+        let entity = Entity::from_bits(123);
+        let target = Origin::new(1500, 970);
+        let burst_ends = 2.0;
+        let mut moves = 0;
+        let mut parked_at = None;
+        // The app escapes at 0; the engine reacts to each event and audit.
+        let mut next_look = Some(0.0_f32);
+        while let Some(look) = next_look {
+            let mut now = look;
+            if episodes.displaced(entity, target, at(now)) {
+                moves += 1;
+                if now >= burst_ends {
+                    parked_at = Some(now);
+                    break;
+                }
+                // Undone 5 ms later: the move notification arrives.
+                now += 0.005;
+                assert!(!episodes.displaced(entity, target, at(now)));
+            }
+            episodes.audit_done(at(now));
+            next_look = Some(episodes.audit_due.as_secs_f32());
+            assert!(now < 30.0, "never parked");
+        }
+        let parked_at = parked_at.expect("parked");
+        assert!(
+            parked_at <= burst_ends + 0.35,
+            "parked {parked_at:.2}s, burst ended at {burst_ends}s"
+        );
+        assert!(moves <= 10, "{moves} moves");
+    }
+
+    #[test]
+    fn an_app_that_always_undoes_falls_back_to_the_backoff() {
+        let mut episodes = ParkingCorrections::default();
+        let entity = Entity::from_bits(123);
+        let target = Origin::new(1500, 970);
+        let mut now = 0.0_f32;
+        let mut moves = 0;
+        while now < 60.0 {
+            if episodes.displaced(entity, target, at(now)) {
+                moves += 1;
+                now += 0.005;
+                let _ = episodes.displaced(entity, target, at(now));
+            }
+            episodes.audit_done(at(now));
+            now = episodes.audit_due.as_secs_f32().max(now + 0.001);
+        }
+        // A few quick retries, then the ladder (≤ one move per 10 s at its cap).
+        assert!(moves <= UNDONE_RETRIES + 10, "{moves} moves in a minute");
     }
 
     #[test]
