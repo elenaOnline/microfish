@@ -19,7 +19,7 @@ use tracing::{Level, debug, error, info, instrument, warn};
 
 use super::{ActiveDisplayMarker, SpawnWindowTrigger};
 use crate::commands::{
-    Direction, MoveFocus, Operation, filter_window_operations, focus_with_verification,
+    Direction, MoveFocus, Operation, filter_window_operations, focus_row_with_verification,
     get_window_in_direction,
 };
 use crate::config::Config;
@@ -1473,7 +1473,7 @@ pub(crate) fn show_active_workspace(
             // The same ordered handoff keyboard navigation uses: the windows
             // are placed first, then the OS is asked to focus, naming the
             // window actually losing focus and retrying a refusal.
-            focus_with_verification(
+            focus_row_with_verification(
                 target,
                 current_focus.map(|(_, entity)| entity),
                 &mut commands,

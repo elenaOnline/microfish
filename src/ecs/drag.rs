@@ -393,6 +393,7 @@ fn apply_helper_drop(
             commands.trigger(super::focus::KeyboardFocusRequest {
                 target: source,
                 source: windows.focused().map(|(_, e)| e),
+                row_switch: false,
             });
             Ok(())
         })();

@@ -336,9 +336,28 @@ pub(crate) fn focus_with_verification(
     focused_entity: Option<Entity>,
     commands: &mut Commands,
 ) {
+    request_verified_focus(entity, focused_entity, false, commands);
+}
+
+/// [`focus_with_verification`] for the window a row switch reveals.
+pub(crate) fn focus_row_with_verification(
+    entity: Entity,
+    focused_entity: Option<Entity>,
+    commands: &mut Commands,
+) {
+    request_verified_focus(entity, focused_entity, true, commands);
+}
+
+fn request_verified_focus(
+    entity: Entity,
+    focused_entity: Option<Entity>,
+    row_switch: bool,
+    commands: &mut Commands,
+) {
     commands.trigger(crate::ecs::focus::KeyboardFocusRequest {
         target: entity,
         source: focused_entity,
+        row_switch,
     });
     // Select for layout first. Native focus follows the committed reveal.
     if let Ok(mut entity_commands) = commands.get_entity(entity) {

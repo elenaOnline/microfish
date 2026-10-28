@@ -395,3 +395,35 @@ fn cmd_tab_into_a_hidden_row_window_exposes_it_without_a_restore_guard() {
         }
     }
 }
+
+/// An app slow to hand focus to the row just switched to must not make the
+/// switch undo itself. The keyboard handoff for a column move treats a refusal
+/// as a window that cannot take focus and floats it out of the strip; for a
+/// row switch that tore a tiled window out of the layout, and giving up then
+/// reconciled to the window parked on the row just left, bouncing back to it.
+#[test]
+fn a_slow_app_does_not_float_its_window_or_bounce_the_row_switch() {
+    use crate::ecs::Unmanaged;
+    let mut h = rig(false);
+    let before = structure(&mut h);
+    for id in [3, 4] {
+        h.mock_state.refuse_focus(id, 10);
+    }
+    h.world()
+        .write_message::<Event>(cmd(Operation::Row(Direction::South)));
+    frames(&mut h, 60);
+    let after = structure(&mut h);
+    assert_eq!(after.2, 1, "the row switched to must stay shown: {after:?}");
+    assert_eq!(
+        after.1, before.1,
+        "no window may leave its row because its app was slow to focus"
+    );
+    let world = h.world();
+    let floating = world
+        .query::<(&Window, &Unmanaged)>()
+        .iter(world)
+        .filter(|(_, unmanaged)| matches!(unmanaged, Unmanaged::Floating))
+        .map(|(window, _)| window.id())
+        .collect::<Vec<_>>();
+    assert!(floating.is_empty(), "floated {floating:?}");
+}

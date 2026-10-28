@@ -151,6 +151,10 @@ pub(super) struct FocusWindow {
 pub(crate) struct KeyboardFocusRequest {
     pub target: Entity,
     pub source: Option<Entity>,
+    /// The request reveals a row. A slow app is no reason to float its window
+    /// or to fall back to the window parked on the row just left; see
+    /// [`KeyboardFocusAttempt::row_switch`].
+    pub row_switch: bool,
 }
 
 #[derive(Default, Resource)]
@@ -186,6 +190,10 @@ struct KeyboardFocusAttempt {
     /// itself, in which case it must not. The frame's other systems settle
     /// which; see [`confirm_keyboard_focus`].
     interrupted: bool,
+    /// Revealing a row, like switching Spaces, is not undone because the app
+    /// there is slow to take focus: no rejection float, and giving up leaves
+    /// the row shown instead of reconciling to a window on a hidden row.
+    row_switch: bool,
 }
 
 fn begin_keyboard_focus(
@@ -211,6 +219,7 @@ fn begin_keyboard_focus(
         confirmations: 0,
         prepared: false,
         interrupted: false,
+        row_switch: trigger.row_switch,
     });
 }
 
@@ -311,7 +320,9 @@ fn activate_prepared_keyboard_target(
     attempt.prepared = true;
     attempt.elapsed = Duration::ZERO;
     attempt.next_check = Duration::from_millis(150);
-    if let Ok(mut entity_commands) = commands.get_entity(attempt.target) {
+    if !attempt.row_switch
+        && let Ok(mut entity_commands) = commands.get_entity(attempt.target)
+    {
         entity_commands.try_insert((
             VerifyFocus,
             Timeout::for_component::<VerifyFocus>(VERIFY_FOCUS_TIMEOUT),
@@ -388,6 +399,17 @@ fn confirm_keyboard_focus(
         handoff.0 = None;
         return;
     }
+    // Giving up hands the layout to whatever the OS focused. For a row switch
+    // that is only right when it is on the row now shown: a window on the row
+    // just left would make the switch bounce back to it.
+    let reconcile_to = native.and_then(|(_, id)| id).filter(|id| {
+        !attempt.row_switch
+            || windows.find(*id).is_some_and(|(_, actual)| {
+                strips
+                    .iter()
+                    .any(|(_, strip)| strip.contains(actual) && strip.contains(attempt.target))
+            })
+    });
     if !attempt.prepared {
         if keyboard_reveal_pending(attempt.target, &windows, &strips, &strip_origins, &moving) {
             if attempt.elapsed >= Duration::from_millis(600) {
@@ -395,7 +417,7 @@ fn confirm_keyboard_focus(
                     window_id = target_window.id(),
                     "keyboard reveal did not settle before focus handoff"
                 );
-                if let Some((_, Some(window_id))) = native {
+                if let Some(window_id) = reconcile_to {
                     commands.trigger(SendMessageTrigger(Event::WindowFocused { window_id }));
                 }
                 handoff.0 = None;
@@ -454,7 +476,7 @@ fn confirm_keyboard_focus(
         retries = attempt.retries,
         "keyboard focus handoff did not receive native confirmation"
     );
-    if let Some((_, Some(window_id))) = native {
+    if let Some(window_id) = reconcile_to {
         commands.trigger(SendMessageTrigger(Event::WindowFocused { window_id }));
     }
     handoff.0 = None;
@@ -1153,6 +1175,7 @@ mod tests {
             confirmations: 0,
             prepared: true,
             interrupted: false,
+            row_switch: false,
         })));
         let mut time = bevy::time::Time::<()>::default();
         time.advance_by(Duration::from_millis(150));
@@ -1268,6 +1291,7 @@ mod tests {
         world.trigger(KeyboardFocusRequest {
             target,
             source: None,
+            row_switch: false,
         });
         world.run_system(cancel).unwrap();
         assert!(world.resource::<KeyboardFocusHandoff>().active());
@@ -1336,6 +1360,7 @@ mod tests {
         world.trigger(KeyboardFocusRequest {
             target: new_target,
             source: Some(old_target),
+            row_switch: false,
         });
         let pending = world.resource::<KeyboardFocusHandoff>().0.as_ref().unwrap();
         assert_eq!(pending.target, new_target);
