@@ -17,7 +17,7 @@ use bevy::prelude::Event as BevyEvent;
 use bevy::tasks::Task;
 use bevy::time::Timer;
 use bevy::time::common_conditions::on_timer;
-use bevy::time::{Time, Virtual};
+use bevy::time::{Fixed, Time, Virtual};
 use bevy::{
     app::Update,
     ecs::{component::Component, entity::Entity, schedule::IntoScheduleConfigs},
@@ -742,6 +742,57 @@ fn autorelease_runner(mut app: BevyApp) -> bevy::app::AppExit {
     }
 }
 
+/// Runs every schedule the main loop visits on the calling thread, and parks the
+/// fixed-timestep loop for good.
+///
+/// Systems run inline rather than fanning out across the task pool: the
+/// task-pool handoff measured ~45% of main-thread time against ~16% actually
+/// spent on accessibility calls, dropping to ~10% once inlined. The expensive
+/// systems here all take `&mut Window` and are already mutually exclusive, so
+/// the fan-out bought little; genuine parallelism (`par_iter_mut`) still goes
+/// through `ComputeTaskPool` directly. Empty schedules are included because an
+/// empty schedule on the default executor still costs a task-pool scope per
+/// frame.
+///
+/// The fixed loop (`RunFixedMainLoop` -> `FixedMain` -> `Fixed*`) is the part
+/// that used to be missed. Nothing here registers a fixed-timestep system, but
+/// bevy still ran those five empty schedules on the multi-threaded executor
+/// 64 times per second of wall time (a long idle frame runs them back to back
+/// to catch up), each run waking pool threads: ~220 context switches/s and
+/// ~0.16% of a core with the window manager doing nothing. A timestep longer
+/// than any session keeps the catch-up loop from ever firing, and the inline
+/// executors cover the one run it would still get.
+pub fn run_schedules_inline(app: &mut BevyApp) {
+    use bevy::app::{
+        FixedFirst, FixedLast, FixedPostUpdate, FixedPreUpdate, FixedUpdate, RunFixedMainLoop,
+        SpawnScene,
+    };
+    for label in [
+        First.intern(),
+        PreUpdate.intern(),
+        RunFixedMainLoop.intern(),
+        FixedFirst.intern(),
+        FixedPreUpdate.intern(),
+        FixedUpdate.intern(),
+        FixedPostUpdate.intern(),
+        FixedLast.intern(),
+        Update.intern(),
+        SpawnScene.intern(),
+        PostUpdate.intern(),
+        Last.intern(),
+    ] {
+        app.edit_schedule(label, |schedule| {
+            schedule.set_executor(SingleThreadedExecutor::new());
+        });
+    }
+    if let Some(mut fixed) = app.world_mut().get_resource_mut::<Time<Fixed>>() {
+        fixed.set_timestep(FIXED_TIMESTEP_NEVER);
+    }
+}
+
+/// See [`run_schedules_inline`]: long enough that the accumulator never reaches it.
+const FIXED_TIMESTEP_NEVER: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+
 pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<BevyApp> {
     crate::manager::app::bound_ax_messaging_timeout()?;
 
@@ -806,25 +857,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .add_plugins(display::DisplayEventsPlugin)
         .add_plugins((register_triggers, register_systems, register_commands));
 
-    // Run every schedule inline rather than fanning systems out across the task
-    // pool: the task-pool handoff measured ~45% of main-thread time against
-    // ~16% actually spent on accessibility calls, dropping to ~10% once
-    // inlined. The expensive systems here all take `&mut Window` and are
-    // already mutually exclusive, so the fan-out bought little; genuine
-    // parallelism (`par_iter_mut`) still goes through `ComputeTaskPool`
-    // directly. `First`/`Last` are included even though unused because an
-    // empty schedule still costs a task-pool scope per frame.
-    for label in [
-        First.intern(),
-        PreUpdate.intern(),
-        Update.intern(),
-        PostUpdate.intern(),
-        Last.intern(),
-    ] {
-        app.edit_schedule(label, |schedule| {
-            schedule.set_executor(SingleThreadedExecutor::new());
-        });
-    }
+    run_schedules_inline(&mut app);
 
     app.set_runner(autorelease_runner);
 
@@ -967,5 +1000,41 @@ impl WindowProperties {
             .iter()
             .find_map(|props| props.horizontal_padding)
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+    use bevy::app::FixedUpdate;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Frames longer than the default 1/64 s fixed step used to run `FixedMain`
+    /// once per step elapsed; the engine has no fixed-timestep systems, so none
+    /// of that is wanted. Regular schedules keep running every frame.
+    #[test]
+    fn the_fixed_loop_never_catches_up() {
+        let fixed_runs = Arc::new(AtomicUsize::new(0));
+        let update_runs = Arc::new(AtomicUsize::new(0));
+        let mut app = BevyApp::new();
+        app.add_plugins(MinimalPlugins);
+        run_schedules_inline(&mut app);
+        let counter = Arc::clone(&fixed_runs);
+        app.add_systems(FixedUpdate, move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        let counter = Arc::clone(&update_runs);
+        app.add_systems(Update, move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        app.finish();
+        app.cleanup();
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(40));
+            app.update();
+        }
+        assert_eq!(update_runs.load(Ordering::Relaxed), 6);
+        assert_eq!(fixed_runs.load(Ordering::Relaxed), 0);
     }
 }
