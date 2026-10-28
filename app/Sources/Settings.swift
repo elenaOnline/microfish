@@ -153,6 +153,9 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
     var draft = SettingsPrefs() { didSet { if draft != oldValue { draftChanged(from: oldValue) } } }
     private(set) var catalog: [ShortcutAction] = []
     var invalid: [String: String] = [:]
+    /// Invalid fields the user has left (or pressed Return in): only these are announced as errors.
+    /// A value mid-typing ("0" on the way to "0.6") blocks Apply but stays quiet.
+    var flagged: Set<String> = []
     var phase: Phase = .idle { didSet { if phase != oldValue { announce() } } }
     var recordingID: String? { didSet { if recordingID == nil { recordingStarted = false } } }
     /// True once the engine has paused its shortcuts and keys are actually being captured.
@@ -238,10 +241,14 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
     }
     var canApply: Bool { isDirty && invalid.isEmpty && conflictCount == 0 && phase != .applying && recordingID == nil && !catalog.isEmpty }
     var canRevert: Bool { (isDirty || !invalid.isEmpty) && phase != .applying && recordingID == nil }
+    /// The last Apply ended badly (failed, or the engine refused the reload) and the user hasn't dismissed it.
+    var hasBadOutcome: Bool { if case .failed = phase { return true }; if case .rejected = phase { return true }; return false }
+    func dismissOutcome() { if hasBadOutcome { phase = .idle } }
 
     private func draftChanged(from old: SettingsPrefs) {
-        // Edits never clear the outcome of the last Apply (failed, waiting, rejected): it stays
-        // visible until the next Apply or Revert.
+        // Edits keep the outcome of the last Apply visible (waiting, rejected) until the next Apply,
+        // Revert or Dismiss; a failed Apply whose edits have all been undone has nothing left to say.
+        if case .failed = phase, !isDirty { phase = .idle }
         if recordingID == nil { recordingNote = nil }
         persist()
         onDraftChanged?()
@@ -271,8 +278,8 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
     }
     func revert() {
         guard canRevert else { return }
-        invalid = [:]; draft = saved; revision += 1; restoredDraft = false; recordingNote = nil
-        if case .failed = phase { phase = .idle }
+        invalid = [:]; flagged = []; draft = saved; revision += 1; restoredDraft = false; recordingNote = nil
+        dismissOutcome()
     }
     func apply() {
         guard canApply else { return }
@@ -685,7 +692,13 @@ final class SettingsWindow: NSWindow {
             let token = UUID().uuidString.lowercased()
             queue.async {
                 do {
-                    let result = try Self.run(bridge, ["record-begin", token])
+                    var result = try Self.run(bridge, ["record-begin", token])
+                    // A quick switch to another slot can arrive while the previous capture's lease is
+                    // still being released; give that release a moment, once.
+                    if result.0 != 0, String(decoding: result.1, as: UTF8.self).contains("lease") {
+                        Thread.sleep(forTimeInterval: 0.25)
+                        result = try Self.run(bridge, ["record-begin", token])
+                    }
                     guard result.0 == 0 else { throw NSError(domain: "ShortcutRecorder", code: Int(result.0), userInfo: [NSLocalizedDescriptionKey: "Couldn’t start recording. Make sure Microfish is running."]) }
                     completion(.success({ queue.async { _ = try? Self.run(bridge, ["record-end", token]) } }))
                 } catch {
@@ -734,7 +747,9 @@ final class SettingsWindow: NSWindow {
         for line in plain.split(separator: "\n") {
             // Real shape: "ERROR paneru::lua::worker: src/lua/worker.rs:342: Reloading Lua script '…': err"
             if line.contains("Reloading Lua script") && line.contains("ERROR") {
-                let detail = line.components(separatedBy: "Reloading Lua script").last?.trimmingCharacters(in: .whitespaces) ?? ""
+                // "…Reloading Lua script '/path/init.lua': <error>": keep the error, drop the path.
+                let tail = line.components(separatedBy: "Reloading Lua script").last ?? ""
+                let detail = (tail.range(of: "': ").map { String(tail[$0.upperBound...]) } ?? tail).trimmingCharacters(in: .whitespaces)
                 return .failure(NSError(domain: "Settings", code: 3, userInfo: [NSLocalizedDescriptionKey: String(detail.prefix(160))]))
             }
             if line.contains("Reloaded Lua script") { return .success(()) }
@@ -842,11 +857,13 @@ struct FooterBar: View {
             if let note = store.recordingNote { return (note, .orange, false) }
             return store.recordingStarted ? ("Recording a shortcut · Esc cancels · Delete clears", settingsAccent, false) : ("Pausing Microfish shortcuts…", .secondary, true)
         }
-        if case .rejected(let message) = store.phase { return ("Engine rejected the change and kept its previous settings · " + message, .red, false) }
-        if case .failed(let message) = store.phase { return ("Couldn’t apply · " + message, .red, false) }
-        if let note = store.recordingNote { return (note, .orange, false) }
+        // What blocks Apply comes first, then what the last Apply said, then the draft.
         if store.conflictCount > 0 { return ("\(store.conflictCount) shortcut conflict\(store.conflictCount == 1 ? "" : "s") to resolve before applying", .red, false) }
-        if let message = SettingsPrefs.fields.compactMap({ store.invalid[$0.key] }).first ?? store.invalid.values.sorted().first { return (message, .red, false) }
+        let shown = store.invalid.filter { store.flagged.contains($0.key) }
+        if let message = SettingsPrefs.fields.compactMap({ shown[$0.key] }).first ?? shown.values.sorted().first { return (message, .red, false) }
+        if let note = store.recordingNote { return (note, .orange, false) }
+        if case .rejected(let message) = store.phase { return ("Engine rejected the change · " + message, .red, false) }
+        if case .failed(let message) = store.phase { return ("Couldn’t apply · " + message, .red, false) }
         if store.isDirty { return (store.restoredDraft ? "Unapplied changes from earlier" : "Unapplied changes", settingsAccent, false) }
         switch store.phase {
         case .waiting: return ("Applied · waiting for engine", .orange, false)
@@ -867,6 +884,12 @@ struct FooterBar: View {
                 Button("Show") { if pane != .shortcuts { store.openPane?(.shortcuts) }; store.revealConflict += 1 }
                     .buttonStyle(.link).foregroundStyle(settingsAccent).font(.callout)
                     .accessibilityLabel("Show conflicting shortcut")
+            }
+            if store.hasBadOutcome && store.conflictCount == 0 && store.flagged.isDisjoint(with: store.invalid.keys) && store.recordingNote == nil && store.recordingID == nil {
+                if case .rejected = store.phase, let log = SettingsController.engineLogURL(store.rootURL) {
+                    Button("Open Log") { NSWorkspace.shared.open(log) }.buttonStyle(.link).foregroundStyle(settingsAccent).font(.callout)
+                }
+                Button("Dismiss") { store.dismissOutcome() }.buttonStyle(.link).foregroundStyle(settingsAccent).font(.callout)
             }
         }
         .accessibilityElement(children: .contain)
@@ -911,17 +934,21 @@ struct NumberField: View {
                     .accessibilityValue(store.invalid[key].map { text + ", invalid. " + $0 } ?? text)
                     .focused($focused)
                     .overlay(RoundedRectangle(cornerRadius: 5).stroke(showError && store.invalid[key] != nil ? Color.red : .clear, lineWidth: 1.5).allowsHitTesting(false))
-                    .onSubmit { showError = store.invalid[key] != nil }
+                    .onSubmit { flag() }
                     .onChange(of: text) { _, new in commit(new) }
                 Text(unit).foregroundStyle(.secondary).frame(minWidth: 14, alignment: .leading).accessibilityHidden(true)
             }
         } label: { HintLabel(title, hint) }
         .onAppear { text = Self.format(value.wrappedValue) }
         .onChange(of: store.revision) { _, _ in text = Self.format(value.wrappedValue) }
-        .onChange(of: focused) { _, now in if !now { showError = store.invalid[key] != nil } }
+        .onChange(of: focused) { _, now in if !now { flag() } }
         // Leaving the pane with a half-typed value returns the field to its last good value, so no
         // error is left behind where it can't be seen.
-        .onDisappear { if store.invalid[key] != nil { store.invalid[key] = nil; text = Self.format(value.wrappedValue); showError = false } }
+        .onDisappear { if store.invalid[key] != nil { store.invalid[key] = nil; store.flagged.remove(key); text = Self.format(value.wrappedValue); showError = false } }
+    }
+    private func flag() {
+        showError = store.invalid[key] != nil
+        if showError { store.flagged.insert(key) }
     }
     private func commit(_ new: String) {
         let trimmed = new.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")
@@ -929,7 +956,7 @@ struct NumberField: View {
         guard let n = Double(trimmed), n.isFinite else { store.invalid[key] = "\(title) needs a number from \(lo) to \(hi)"; return }
         guard range.contains(n) else { store.invalid[key] = "\(title) must be \(lo)–\(hi)\(unit.isEmpty ? "" : " " + unit)"; return }
         guard !whole || n.rounded() == n else { store.invalid[key] = "\(title) must be a whole number"; return }
-        store.invalid[key] = nil; showError = false
+        store.invalid[key] = nil; store.flagged.remove(key); showError = false
         if value.wrappedValue != n { value.wrappedValue = n }
     }
 }
@@ -1006,7 +1033,7 @@ struct Keycap: View {
 struct RowsPane: View {
     @Bindable var store: SettingsStore
     /// Builds a legend entry from the live bindings, so a rebound key never shows a stale cap.
-    private func legend(_ title: String, _ ids: [String], hint: String? = nil, _ suffix: String? = nil) -> some View {
+    private func legend(_ title: String, _ ids: [String], hint: String? = nil, rowsOnly: Bool = true, _ suffix: String? = nil) -> some View {
         let parsed = ids.compactMap { store.draft.shortcuts[$0].flatMap(Chord.parse) }
         let mods = parsed.first?.mods ?? []
         let shared = parsed.allSatisfy { $0.mods == mods }
@@ -1025,7 +1052,7 @@ struct RowsPane: View {
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(spoken.isEmpty ? "Not set" : spoken + (suffix.map { ", " + $0 } ?? ""))
         } label: { HintLabel(title, hint) }
-        .disabled(!store.draft.rowsEnabled)
+        .disabled(rowsOnly && !store.draft.rowsEnabled)
     }
     var body: some View {
         Form {
@@ -1034,8 +1061,8 @@ struct RowsPane: View {
             }
             Section {
                 legend("Change row", ["row_north", "row_south"])
-                legend("Change row (Vim keys)", ["focus_k", "focus_j"])
-                legend("Move along the strip", ["focus_leftarrow", "focus_rightarrow"])
+                legend(store.draft.rowsEnabled ? "Change row (Vim keys)" : "Move within a stack (Vim keys)", ["focus_k", "focus_j"], rowsOnly: false)
+                legend("Move along the strip", ["focus_leftarrow", "focus_rightarrow"], rowsOnly: false)
                 legend("Move window to another row", ["move_row_north", "move_row_south"])
                 legend("Move whole column to another row", ["move_column_north", "move_column_south"])
                 legend("New row", ["row_north", "row_south"], hint: "Change row past the top or bottom row")
@@ -1307,7 +1334,7 @@ struct AppearancePane: View {
                     HStack(spacing: 8) {
                         TextField("Hex color", text: $hexText).labelsHidden().textFieldStyle(.roundedBorder).frame(width: 84).font(.body.monospacedDigit())
                             .focused($hexFocused)
-                            .overlay(RoundedRectangle(cornerRadius: 5).stroke(store.invalid["borderColor"] != nil ? Color.red : .clear, lineWidth: 1.5).allowsHitTesting(false))
+                            .overlay(RoundedRectangle(cornerRadius: 5).stroke(store.invalid["borderColor"] != nil && !hexFocused ? Color.red : .clear, lineWidth: 1.5).allowsHitTesting(false))
                             .accessibilityLabel("Outline color, hex")
                             .onSubmit(commitHex)
                             .onChange(of: hexText) { _, _ in checkHex() }
@@ -1351,11 +1378,11 @@ struct AppearancePane: View {
     /// Live while typing: a complete value applies, a partial one is marked rather than half-applied.
     private func checkHex() {
         let t = hexText.trimmingCharacters(in: .whitespaces)
-        if Self.validHex(t) { commitHex() } else { store.invalid["borderColor"] = "Outline color needs six hex digits, like #009193" }
+        if Self.validHex(t) { commitHex() } else { store.invalid["borderColor"] = "Outline color needs six hex digits, like #009193" }  // quiet until left
     }
     private func commitHex() {
         let t = hexText.trimmingCharacters(in: .whitespaces)
-        store.invalid["borderColor"] = nil
+        store.invalid["borderColor"] = nil; store.flagged.remove("borderColor")
         guard Self.validHex(t) else { hexText = store.draft.borderColor.uppercased(); return }
         let hex = "#" + t.replacingOccurrences(of: "#", with: "").uppercased()
         if hex.caseInsensitiveCompare(store.draft.borderColor) != .orderedSame { store.draft.borderColor = hex }
