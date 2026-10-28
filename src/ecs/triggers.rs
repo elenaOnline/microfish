@@ -482,27 +482,36 @@ pub(super) fn mission_control_trigger(
                 mission_control_active.as_mut().0 = false;
 
                 // Check if some windows disappeared from the current workspace
-                // - e.g. they were moved away during mission control.
-                if let Some(mut active_strip) = workspaces
-                    .iter_mut()
-                    .find_map(|(_, strip, active, _)| active.then_some(strip))
-                    && let Ok(present_windows) =
-                        window_manager.windows_in_workspace(active_strip.id())
+                // - e.g. they were moved away during mission control. Every row
+                // of the Space is checked: the windows of a parked row are still
+                // on the Space, so the list names them, and one dragged to
+                // another Space leaves its row whether or not the row is on
+                // screen.
+                if let Some(workspace_id) = workspaces
+                    .iter()
+                    .find_map(|(_, strip, active, _)| active.then_some(strip.id()))
+                    && let Ok(present_windows) = window_manager.windows_in_workspace(workspace_id)
                 {
-                    let moved_windows = active_strip
-                        .all_windows()
-                        .into_iter()
-                        .filter_map(|entity| windows.get(entity).zip(Some(entity)))
-                        .filter(|(window, _)| !present_windows.contains(&window.id()));
-                    for (window, entity) in moved_windows {
-                        debug!(
-                            "window {} {entity} moved, removing from workspace {}",
-                            window.id(),
-                            active_strip.id(),
-                        );
-                        // Simply removing them from the current strip is enough,
-                        // they will be re-detected during the workspace change.
-                        active_strip.remove(entity);
+                    for (_, mut strip, _, _) in &mut workspaces {
+                        if strip.id() != workspace_id {
+                            continue;
+                        }
+                        let moved_windows = strip
+                            .all_windows()
+                            .into_iter()
+                            .filter_map(|entity| windows.get(entity).zip(Some(entity)))
+                            .filter(|(window, _)| !present_windows.contains(&window.id()))
+                            .map(|(window, entity)| (window.id(), entity))
+                            .collect::<Vec<_>>();
+                        for (window_id, entity) in moved_windows {
+                            debug!(
+                                "window {window_id} {entity} moved, removing from workspace {workspace_id} row {}",
+                                strip.virtual_index + 1,
+                            );
+                            // Simply removing them from the strip is enough,
+                            // they will be re-detected during the workspace change.
+                            strip.remove(entity);
+                        }
                     }
                 }
             }

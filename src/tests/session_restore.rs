@@ -669,6 +669,54 @@ fn test_startup_restore_keeps_one_selected_row_and_hides_inactive_rows() {
     );
 }
 
+/// Restore spawns the rows in order, and a row spawned after the one on screen
+/// used to take the selection from it. The selection is the row a Space
+/// notification (Mission Control closing sends one) brings back, so the engine
+/// would switch to the last row by itself.
+#[test]
+fn test_startup_restore_keeps_the_selection_on_the_row_on_screen() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.world().insert_resource(PaneruState {
+        version: 2,
+        timestamp: 123_456_789,
+        active_display_id: Some(TEST_DISPLAY_ID),
+        displays: vec![saved_display(TEST_DISPLAY_ID, true)],
+        workspaces: vec![SavedWorkspace {
+            workspace_id: TEST_WORKSPACE_ID,
+            display_id: Some(TEST_DISPLAY_ID),
+            active_virtual_index: Some(1),
+            strips: (0..3_i32)
+                .map(|window| SavedStrip {
+                    side_tabs: false,
+                    virtual_index: window.cast_unsigned(),
+                    columns: vec![SavedColumn::Single(saved_window(window))],
+                })
+                .collect(),
+        }],
+    });
+
+    for _ in 0..5 {
+        harness.app.update();
+    }
+
+    let world = harness.world();
+    let mut query = world.query::<(
+        &LayoutStrip,
+        Has<crate::ecs::ActiveWorkspaceMarker>,
+        Has<crate::ecs::SelectedVirtualMarker>,
+    )>();
+    let mut rows = query
+        .iter(world)
+        .filter(|(strip, _, _)| strip.id() == TEST_WORKSPACE_ID)
+        .map(|(strip, active, selected)| (strip.virtual_index, active, selected))
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        vec![(0, false, false), (1, true, true), (2, false, false)]
+    );
+}
+
 /// Restore consumes row 0's windows onto the saved rows, which empties row 0.
 /// Despawning it there left the restored space numbered from "2", so the
 /// emptied baseline row is kept.

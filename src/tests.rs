@@ -3,6 +3,7 @@ mod drag_reorder;
 mod focus_or_virtual;
 mod harness;
 mod interaction;
+mod mission_control;
 mod mocks;
 mod parking;
 mod review_a;
