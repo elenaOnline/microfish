@@ -58,6 +58,9 @@ pub(crate) struct MockWindowData {
     /// Whether `AXSize` can be set: false models Calculator or Surfshark's
     /// main window, which accept no resize at all.
     pub(crate) resizable: bool,
+    /// Review: the app does not answer `AXPosition` reads (hung), while the
+    /// window server still reports the frame.
+    pub(crate) frame_read_fails: bool,
     pub(crate) resize_behavior: Option<MockResizeBehavior>,
     /// `AppKit` keeps a title bar on screen: a requested origin below this y
     /// lands here instead, without any notification.
@@ -87,6 +90,7 @@ impl Default for MockWindowData {
             requested_padding: (None, None),
             child_role: false,
             resizable: true,
+            frame_read_fails: false,
             resize_behavior: None,
             lowest_origin_y: None,
             fights_back_to: None,
@@ -134,6 +138,10 @@ struct MockStateInner {
     self_activations: Vec<Option<Pid>>,
     /// The engine is the front process: no app is.
     engine_front: bool,
+    /// Review: calls to the window server's on-screen bounds query.
+    bounds_queries: usize,
+    /// Review: the engine's front switch is accepted but changes nothing.
+    hold_ineffective: bool,
 }
 
 /// The serial number the mock gives the engine itself.
@@ -177,6 +185,8 @@ impl MockState {
                 window_list_scans: 0,
                 self_activations: Vec::new(),
                 engine_front: false,
+                bounds_queries: 0,
+                hold_ineffective: false,
             })),
         }
     }
@@ -280,6 +290,23 @@ impl MockState {
         self.inner.force_read().self_activations.clone()
     }
 
+    pub(crate) fn app_psn(&self, pid: Pid) -> ProcessSerialNumber {
+        self.inner
+            .force_read()
+            .apps
+            .get(&pid)
+            .map(|a| a.psn)
+            .unwrap()
+    }
+
+    pub(crate) fn bounds_queries(&self) -> usize {
+        self.inner.force_read().bounds_queries
+    }
+
+    pub(crate) fn set_hold_ineffective(&self) {
+        self.inner.force_write().hold_ineffective = true;
+    }
+
     /// Whether the engine, not an app, is the front process.
     pub(crate) fn engine_is_front(&self) -> bool {
         self.inner.force_read().engine_front
@@ -290,6 +317,9 @@ impl MockState {
     fn activate_engine(&self, previous: Option<Pid>) {
         let mut inner = self.inner.force_write();
         inner.self_activations.push(previous);
+        if inner.hold_ineffective {
+            return;
+        }
         inner.engine_front = true;
         for app in inner.apps.values_mut() {
             app.is_frontmost = false;
@@ -637,6 +667,9 @@ impl MockState {
     fn read_window_frame(&self, id: WinID) -> crate::errors::Result<IRect> {
         let mut inner = self.inner.force_write();
         let window = inner.windows.get_mut(&id).ok_or(Error::InvalidWindow)?;
+        if window.frame_read_fails {
+            return Err(Error::InvalidWindow);
+        }
         if let Some(behavior) = &mut window.resize_behavior {
             behavior.delayed_reads = behavior.delayed_reads.saturating_sub(1);
             if behavior.delayed_reads == 0
@@ -1114,6 +1147,7 @@ impl MockState {
 
         let s = self.clone();
         wm.expect_on_screen_window_bounds().returning(move || {
+            s.inner.force_write().bounds_queries += 1;
             let windows = s
                 .inner
                 .force_read()
