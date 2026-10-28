@@ -1,7 +1,8 @@
 import AppKit
 
-// Microfish Access: grants macOS "Device Control and Data Access" (the Privacy_Accessibility pane) to a newly
-// signed engine build. Shows the build as a draggable file tile; it never grants access or starts Microfish.
+// Microfish Access: helps you give Microfish the macOS "Device Control and Data Access" permission (the
+// Privacy_Accessibility pane). Shows the Microfish program as a draggable file tile; it never grants access
+// or starts Microfish itself.
 
 /// Name System Settings shows for the pane the deep link below opens (macOS 27: SecurityPrivacyExtension,
 /// Localizable key ACCESSIBILITY = "Device Control and Data Access").
@@ -19,12 +20,15 @@ enum Teal {
             appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
         }
     }
+    // The Microfish teal set (same values as the tab bars, Minimap and Settings).
     /// Borders, fills and badge circles.
-    static let accent = dynamic(light: rgb(0x009193), dark: rgb(0x3CC8CA))
-    /// Teal used as text on the tinted badge / link (>= 4.5:1 on the window background).
-    static let text = dynamic(light: rgb(0x00696B), dark: rgb(0x6FDCDE))
-    /// Fill of the primary button; white label on it is 5.2:1.
-    static let button = rgb(0x00797B)
+    static let accent = dynamic(light: rgb(0x007F81), dark: rgb(0x3CC6C4))
+    /// Teal used as text on the tinted badge / link (4.86:1 on white; 6.9:1 on the dark window background).
+    static let text = dynamic(light: rgb(0x00777A), dark: rgb(0x3CC6C4))
+    /// Fill of the primary button. Light: white label on it is 4.8:1. Dark: a deeper teal that keeps the white label at 4.5:1 or better.
+    static let button = dynamic(light: rgb(0x007F81), dark: rgb(0x00777A))
+    /// Warnings are red, as everywhere else in Microfish.
+    static let warning = NSColor.systemRed
     static var increaseContrast: Bool { NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast }
 }
 
@@ -53,7 +57,7 @@ final class StepBadge: NSView {
     override func viewDidChangeEffectiveAppearance() { needsDisplay = true }
 }
 
-// MARK: - Build tile (drop-zone look, drag source)
+// MARK: - Program tile (drop-zone look, drag source)
 
 enum BuildState {
     case ready(URL)
@@ -134,31 +138,31 @@ final class BuildTile: NSView, NSDraggingSource {
             buttons.isHidden = false
             setAccessibilityElement(true)
             setAccessibilityRole(.group)
-            setAccessibilityLabel("Microfish build, draggable. Drag into the \(paneName) list.")
+            setAccessibilityLabel("Microfish, draggable. Drag it into the \(paneName) list.")
             setAccessibilityValue(url.path)
         case .missing(let path):
             buildURL = nil; isWarning = true
             warningIcon()
-            nameLabel.stringValue = "Build missing or not executable"
+            nameLabel.stringValue = "Microfish isn’t at this location"
             pathLabel.stringValue = path
             pathLabel.font = BuildTile.pathFont
             toolTip = path
             buttons.isHidden = true
             setAccessibilityElement(true)
             setAccessibilityRole(.group)
-            setAccessibilityLabel("Build missing or not executable. Choose the intended build.")
+            setAccessibilityLabel("Microfish isn’t at this location. Choose the Microfish program.")
             setAccessibilityValue(path)
         case .none:
             buildURL = nil; isWarning = true
             warningIcon()
-            nameLabel.stringValue = "No build selected"
-            pathLabel.stringValue = "Choose the build to give access."
+            nameLabel.stringValue = "Microfish not found"
+            pathLabel.stringValue = "Choose the Microfish program."
             pathLabel.font = BuildTile.sentenceFont
             toolTip = nil
             buttons.isHidden = true
             setAccessibilityElement(true)
             setAccessibilityRole(.group)
-            setAccessibilityLabel("No build selected. Choose the intended build.")
+            setAccessibilityLabel("Microfish not found. Choose the Microfish program.")
             setAccessibilityValue(nil)
         }
         needsDisplay = true
@@ -167,7 +171,7 @@ final class BuildTile: NSView, NSDraggingSource {
     private func warningIcon() {
         let config = NSImage.SymbolConfiguration(pointSize: 30, weight: .regular)
         iconView.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil)?.withSymbolConfiguration(config)
-        iconView.contentTintColor = .systemOrange
+        iconView.contentTintColor = Teal.warning
     }
 
     // The whole tile is the drag source; only the buttons keep their own clicks.
@@ -191,7 +195,7 @@ final class BuildTile: NSView, NSDraggingSource {
     override func viewDidChangeEffectiveAppearance() { needsDisplay = true }
 
     override func draw(_ dirtyRect: NSRect) {
-        let base: NSColor = isWarning ? .systemOrange : Teal.accent
+        let base: NSColor = isWarning ? Teal.warning : Teal.accent
         let strong = Teal.increaseContrast
         let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
         let path = NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10)
@@ -243,12 +247,12 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
     var root = Bundle.main.bundleURL.deletingLastPathComponent()
     let revealButton = NSButton(title: "Show in Finder", target: nil, action: nil)
     let copyButton = NSButton(title: "Copy Path", target: nil, action: nil)
-    let chooseLink = LinkButton(title: "Choose Build…", target: nil, action: nil)
+    let chooseLink = LinkButton(title: "Choose Another File…", target: nil, action: nil)
     let primary = NSButton(title: "Open System Settings", target: nil, action: nil)
     var tile: BuildTile!
     let hint = NSTextField(wrappingLabelWithString: "")
-    static let dragHint = "If dragging doesn’t work, use + in System Settings, press ⇧⌘G and paste the copied path. This helper doesn’t grant access or start Microfish."
-    static let chooseHint = "Choose the build that needs access. This helper doesn’t grant access or start Microfish."
+    static let dragHint = "If dragging doesn’t work, click + in System Settings, press ⇧⌘G and paste the copied path. This window only helps you find the file; it doesn’t grant access."
+    static let chooseHint = "Choose the Microfish program that needs access. This window only helps you find the file; it doesn’t grant access."
     var state: BuildState = .none
     private var copyResetTimer: Timer?
 
@@ -278,11 +282,11 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
         let content = NSView()
         win.contentView = content
 
-        let heading = label("Give the new build access", size: 22, weight: .bold)
+        let heading = label("Give Microfish access", size: 22, weight: .bold)
         heading.setAccessibilityRole(.staticText)
         let sub = label("Microfish needs \(paneName) to move windows.", color: .secondaryLabelColor)
 
-        let stepTexts = ["Open \(paneName) in System Settings.", "Drag the build below into its list.", "Turn on its switch."]
+        let stepTexts = ["Open \(paneName) in System Settings.", "Drag Microfish into the list.", "Turn on Microfish."]
         let steps = NSStackView(views: stepTexts.enumerated().map { index, text in
             let row = NSStackView(views: [StepBadge(index + 1), label(text)])
             row.orientation = .horizontal; row.alignment = .centerY; row.spacing = 10
@@ -296,8 +300,8 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
             button.target = self
         }
         revealButton.action = #selector(reveal); copyButton.action = #selector(copyPath)
-        revealButton.setAccessibilityLabel("Reveal build in Finder")
-        copyButton.setAccessibilityLabel("Copy build path")
+        revealButton.setAccessibilityLabel("Show in Finder")
+        copyButton.setAccessibilityLabel("Copy Path")
         copyButton.widthAnchor.constraint(equalToConstant: copyButton.fittingSize.width).isActive = true
         tile = BuildTile(reveal: revealButton, copy: copyButton)
 
@@ -308,9 +312,9 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
 
         chooseLink.isBordered = false
         chooseLink.font = .systemFont(ofSize: 11)
-        chooseLink.attributedTitle = NSAttributedString(string: "Choose Build…", attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: Teal.text])
+        chooseLink.attributedTitle = NSAttributedString(string: "Choose Another File…", attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: Teal.text])
         chooseLink.target = self; chooseLink.action = #selector(choose)
-        chooseLink.setAccessibilityLabel("Choose a different build")
+        chooseLink.setAccessibilityLabel("Choose another file")
         let left = NSStackView(views: [hint, chooseLink])
         left.orientation = .vertical; left.alignment = .leading; left.spacing = 6
 
@@ -373,7 +377,7 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
         add(app, "Quit \(appName)", #selector(NSApplication.terminate(_:)), "q")
 
         let file = submenu("File")
-        add(file, "Choose Build…", #selector(choose), "o", target: self)
+        add(file, "Choose Another File…", #selector(choose), "o", target: self)
         add(file, "Show in Finder", #selector(reveal), "r", target: self)
         file.addItem(.separator())
         add(file, "Close", #selector(NSWindow.performClose(_:)), "w")
@@ -417,8 +421,8 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
             chooseLink.isHidden = false
             hint.stringValue = PermissionHelper.dragHint
         } else {
-            primary.title = "Choose Build…"; primary.action = #selector(choose)
-            primary.setAccessibilityLabel("Choose the build")
+            primary.title = "Choose File…"; primary.action = #selector(choose)
+            primary.setAccessibilityLabel("Choose the Microfish program")
             chooseLink.isHidden = true
             hint.stringValue = PermissionHelper.chooseHint
         }
@@ -449,7 +453,7 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
         let panel = NSOpenPanel()
         panel.directoryURL = root.appendingPathComponent("bin")
         panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
-        panel.message = "Choose the Microfish build to give access."
+        panel.message = "Choose the Microfish program that needs access."
         panel.prompt = "Choose"
         panel.beginSheetModal(for: window) { [weak self] response in
             guard let self, response == .OK, let url = panel.url else { return }
@@ -458,7 +462,7 @@ final class PermissionHelper: NSObject, NSApplicationDelegate, NSMenuItemValidat
                 self.select(url)
             } catch {
                 let alert = NSAlert()
-                alert.messageText = "Could not save the build selection"
+                alert.messageText = "Couldn’t save your choice"
                 alert.informativeText = error.localizedDescription
                 alert.beginSheetModal(for: self.window)
             }
