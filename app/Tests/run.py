@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Performance-team headless runner: builds src/ + tests into a scratch dir and runs them. No windows.
-Usage: tests/run.py [--scratch DIR] [suite ...]   suites: hud drag spatial team live press queue leak pixel (default: all)
+Usage: tests/run.py [--scratch DIR] [suite ...]   suites: hud drag spatial team live press tabfix queue leak pixel (default: all)
 The hud/drag/spatial suites are the Minimap team's existing ones (read from the main tree's work/)."""
 from pathlib import Path
 import argparse, shutil, subprocess, sys
@@ -33,12 +33,13 @@ def suite_team():
     body = '\n'.join(f'do {{ // {f.name}\n{f.read_text().replace("is NSButton || m.visibleRect", "is NSControl || m.visibleRect").replace("$0 as? NSButton }.first { $0.accessibilityLabel()", "$0 as? NSControl }.first { $0.accessibilityLabel()")}\n}}' for f in files)
     return build('team', (src/'main.swift').read_text()+'\n'+prelude+body+'\nprint("Minimap team checks passed:", teamChecks)\n')
 def suite_press(): return build('press', (src/'main.swift').read_text()+'\n'+(here/'press-tests.swift').read_text())
+def suite_tabfix(): return build('tabfix', (src/'main.swift').read_text()+'\n'+(here/'tab-fixes-tests.swift').read_text())
 def suite_queue(): return build('queue', (src/'main.swift').read_text()+'\n'+(here/'queue-tests.swift').read_text())
 def suite_leak():
     # Flat NSKeyValueDependency count over view-rebuild churn (tests/leak-churn.py); a stand-in "binary" for the loop below.
     return here/'leak-churn.py'
 def suite_pixel(): return here/'pixel-diff.py'
-SUITES = {'hud': suite_hud, 'drag': suite_drag, 'spatial': suite_spatial, 'team': suite_team, 'live': suite_live, 'press': suite_press, 'queue': suite_queue, 'leak': suite_leak, 'pixel': suite_pixel}
+SUITES = {'hud': suite_hud, 'drag': suite_drag, 'spatial': suite_spatial, 'team': suite_team, 'live': suite_live, 'press': suite_press, 'tabfix': suite_tabfix, 'queue': suite_queue, 'leak': suite_leak, 'pixel': suite_pixel}
 for n in (a.suites or list(SUITES)):
     exe = SUITES[n]()
     cmd = [sys.executable, str(exe), '--src', str(src)] if n in ('leak', 'pixel') else [str(exe)]
