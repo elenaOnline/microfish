@@ -192,14 +192,13 @@ final class TabColorSampler {
  private var attempted:[Int:TimeInterval]=[:]
  private var busy=false
  private var lastFailure=""
- private var preflightAt:TimeInterval=0
- private var preflightAllowed=false
- func sample(id:Int) -> TabWindowSample? {
+ private var gate=SampleGate()
+ var onSample: (() -> Void)?
+ // Event-driven: see SampleGate. `key` identifies the group's members and selection.
+ func sample(id:Int,size:CGSize = .zero,key:Int = 0,titles:Int = 0) -> TabWindowSample? {
   let now=Date.timeIntervalSinceReferenceDate
-  // Re-asking TCC on every display-link tick is wasted work; once a second is plenty.
-  if now-preflightAt>1 { preflightAllowed=CGPreflightScreenCaptureAccess(); preflightAt=now }
-  guard preflightAllowed else {report("Screen Recording permission unavailable");return nil}
-  if !busy && now-(attempted[id] ?? 0)>3 {
+  guard screenCaptureAllowed() else {report("Screen Recording permission unavailable");return nil}
+  if !busy && gate.claim(id:id,size:size,appearance:NSApp.effectiveAppearance.name.rawValue,key:key,titles:titles,have:samples[id] != nil,now:now) {
    busy=true;attempted[id]=now
    SCShareableContent.getExcludingDesktopWindows(true,onScreenWindowsOnly:true) { [weak self] content,error in
     guard let window=content?.windows.first(where: { $0.windowID == CGWindowID(id) }) else {
@@ -212,7 +211,7 @@ final class TabColorSampler {
      let sample=image.flatMap(Self.extract)
      DispatchQueue.main.async {
       guard let self else {return};self.busy=false
-      if let sample {self.samples[id]=sample;self.lastFailure=""}
+      if let sample {self.samples[id]=sample;self.lastFailure="";self.onSample?()}
       else {self.report("Window capture failed: \(error?.localizedDescription ?? "empty sample")")}
       if self.attempted.count>100 {self.samples=self.samples.filter {$0.key==id};self.attempted=self.attempted.filter {$0.key==id}}
      }
@@ -370,6 +369,7 @@ final class TabBars: NSObject {
  var height:CGFloat=34
  var matchAppColor=false
  private let sampler=TabColorSampler()
+ var onSampled: (() -> Void)? { didSet { sampler.onSample = onSampled } }
  var focus: ((Int) -> Void)?
  var reorder: ((StripDrop) -> Void)?
  var dragOutside: ((Int,CGPoint,Bool) -> Bool)?
@@ -450,7 +450,7 @@ final class TabBars: NSObject {
    let contentWidth=frame.width
    let panelFrame=frame
    let seamFrame=side ? CGRect(x:live.frame.minX,y:live.frame.minY,width:32,height:live.frame.height) : CGRect(x:live.frame.minX,y:live.frame.maxY-32,width:live.frame.width,height:32)
-   let sample=matchAppColor ? sampler.sample(id:live.id):nil
+   let sample=matchAppColor ? sampler.sample(id:live.id,size:live.frame.size,key:ids.sorted().hashValue &+ (selection ?? 0),titles:members.map(\.title).hashValue):nil
    let matched=side ? sample?.sideColor:sample?.titleColor
    let signature = tabContentSignature(members, selected: selection, width: contentWidth, height: frame.height) + ":\(style):\(sample != nil):\(NSApp.effectiveAppearance.name.rawValue):\(matched?.description ?? "default")" + members.map { aliases[$0.bundle+"\t"+$0.title] ?? "" }.joined(separator:"|") + ":\(NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast):\(NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency)"
    if signature != bar.signature && !bar.pressed {

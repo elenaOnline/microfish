@@ -680,7 +680,6 @@ final class Navigator: NSObject, NSApplicationDelegate {
  var escapeWasDown = false
  var fastMode = false
  var fastTimer: Timer?
- var workWatch: DispatchSourceFileSystemObject?
  var statusItem: NSStatusItem?
  // Quit: idle -> stopping (engine going down, off the main thread) -> finishing (helper may die)
  // or back to idle when the engine would not stop. A second request while not idle does nothing.
@@ -724,7 +723,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
  var tabDragRevealed = false
  var liveWindows: [LiveWindow] = []
  var snapshot = NavigatorSnapshot("")
- var lastSnapshotPoll = Date.distantPast
+ let signals = LiveSignals()
  let tabBars = TabBars()
  var displayLink: CADisplayLink?
  var displayLinkScreen: UInt32?
@@ -842,15 +841,21 @@ final class Navigator: NSObject, NSApplicationDelegate {
   }
   // Low-rate lifecycle polling stays alive when all bars are hidden. Visible
   // geometry is paced by the owning display in common run-loop modes.
-  let lifecycle = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+  // Files announce the engine's changes (per-file watchers, coalesced to one tick per event burst).
+  signals.onWake = { [weak self] in self?.tick(forcePoll: true) }
+  signals.watch([rootURL.path+"/config/preferences.json",path,path.replacingOccurrences(of:".tsv",with:".intent")])
+  tabBars.onSampled = { [weak self] in self?.signals.sampleReady() }
+  // Bars visible: the 30 Hz clock keeps the bare-Hyper keystroke baselines fresh between lifecycle ticks.
+  signals.onFastFire = { [weak self] in
+   guard let self else { return }
+   let c={ CGEventSource.counterForEventType(.combinedSessionState,eventType:$0) }
+   _ = self.keyWatch.interrupted(exact:isHyperClick(NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)),key:c(.keyDown),leftDown:c(.leftMouseDown),rightDown:c(.rightMouseDown),otherDown:c(.otherMouseDown),buttonsDown:false)
+  }
+  signals.startClock(barsVisible: { [weak self] in self?.tabBars.hasVisibleBars ?? false }) { [weak self] in
    guard let self else { return }
    let screenPresent = NSScreen.screens.contains { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == self.displayLinkScreen }
    if self.displayLink == nil || !screenPresent { self.tick() }
   }
-  lifecycle.tolerance = 0.01
-  RunLoop.main.add(lifecycle, forMode: .common)
-  timer = lifecycle
-  watchWorkDirectory()
   observeEnvironment()
  }
  // Spaces, displays, appearance and accessibility options change under a visible HUD.
@@ -866,23 +871,8 @@ final class Navigator: NSObject, NSApplicationDelegate {
   if panel.isVisible { requestRender() }
  }
  func requestRender() { renderRequested=true }
- // The engine publishes by tmp+rename, which modifies the directory: wake at once instead of
- // waiting for the next poll. Polling stays as the fallback.
- func watchWorkDirectory() {
-  let fd=open(URL(fileURLWithPath:path).deletingLastPathComponent().path,O_EVTONLY)
-  guard fd >= 0 else { return }
-  let source=DispatchSource.makeFileSystemObjectSource(fileDescriptor:fd,eventMask:.write,queue:.main)
-  // Coalesce bursts (several renames per publish, title storms) to one tick per frame.
-  source.setEventHandler { [weak self] in
-   guard let self, !self.watchTickQueued else { return }
-   self.watchTickQueued=true
-   DispatchQueue.main.asyncAfter(deadline:.now()+1.0/120) { [weak self] in self?.watchTickQueued=false; self?.tick(forcePoll:true) }
-  }
-  source.setCancelHandler { close(fd) }
-  source.resume(); workWatch=source
- }
  deinit {
-  workWatch?.cancel(); fastTimer?.invalidate()
+  fastTimer?.invalidate()
   observers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0); NotificationCenter.default.removeObserver($0) }
  }
  @objc func openSettings() {
@@ -911,7 +901,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
  }
  func updateDisplayLink() {
   let fast=fastNeeded(); fastMode=fast
-  let needed = tabBars.hasVisibleBars || (scrollNavigation && panel.isVisible) || fast
+  let needed = (tabBars.hasVisibleBars && (signals.motionActive || panel.isVisible)) || (scrollNavigation && panel.isVisible) || fast
   let screen = NSScreen.screens.first { screenID($0) == snapshot.display } ?? (fast ? NSScreen.main : nil)
   let id = screen.flatMap { screenID($0) }
   if !needed || screen == nil {
@@ -943,12 +933,11 @@ final class Navigator: NSObject, NSApplicationDelegate {
  func tick(forcePoll: Bool = false) {
   if quitPhase != .idle { return }  // nothing may bring the HUD back while the product is going down
   let date=Date(), now=date.timeIntervalSinceReferenceDate
-  let pollSnapshot = forcePoll || date.timeIntervalSince(lastSnapshotPoll) >= 0.1
+  let pollSnapshot = signals.takeFileChange() || forcePoll
   if pollSnapshot {
-   lastSnapshotPoll = date
    let prefsPath=rootURL.appendingPathComponent("config/preferences.json").path
    let prefsStamp=(try? FileManager.default.attributesOfItem(atPath:prefsPath)[.modificationDate] as? Date) ?? .distantPast
-   if prefsStamp != preferencesModified { reloadPreferences() }
+   if prefsStamp != preferencesModified { reloadPreferences(); signals.requestRead() }
   }
   presence.mode=effectiveHideMode(preferences.hide,voiceOver:NSWorkspace.shared.isVoiceOverEnabled); presence.delay=preferences.delay; presence.fade=preferences.fade
   if pollSnapshot, let attrs=try? FileManager.default.attributesOfItem(atPath:path), let stamp=attrs[.modificationDate] as? Date, stamp != modified {
@@ -956,24 +945,29 @@ final class Navigator: NSObject, NSApplicationDelegate {
    if let content=try? String(contentsOfFile:path,encoding:.utf8) {
     previous=content
     snapshot = NavigatorSnapshot(content)
+    signals.snapshotChanged(snapshotLayoutSignature(snapshot))
     #if !NAVIGATOR_TESTS
     spatialOverview.update(text:content)
     #endif
     if panel.isVisible { requestRender() }
    }
   }
-  if (!snapshot.tabGroups.isEmpty && snapshot.tabsVisible) || (scrollNavigation && panel.isVisible) { liveWindows = readLiveWindows() }
-  else { liveWindows = [] }
+  let scrollLive = scrollNavigation && panel.isVisible   // viewportColumn and strip motion need fresh geometry every tick
+  let wantsLive = (!snapshot.tabGroups.isEmpty && snapshot.tabsVisible) || scrollLive
+  let readNow = wantsLive && (scrollLive || signals.shouldRead())
+  if readNow { liveWindows = readLiveWindows(); signals.observe(liveWindows) }
+  else if !wantsLive { liveWindows = [] }
   if scrollNavigation && panel.isVisible && (presence.timer || presence.touching) {
    if motion.moved(stripMotionSignature(liveWindows,ids:Set(snapshot.entries.map(\.id)))) { presence.motion(now:now) }
   } else { motion.reset() }
-  tabBars.update(snapshot, windows: liveWindows)
+  if readNow || !wantsLive { tabBars.update(snapshot, windows: liveWindows) }
   let flags=NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
   let mods=HUDChord(flags), pointer=NSEvent.mouseLocation
   let intentPath=path.replacingOccurrences(of:".tsv",with:".intent")
-  if pollSnapshot || fastMode, let attrs=try? FileManager.default.attributesOfItem(atPath:intentPath), let stamp=attrs[.modificationDate] as? Date, stamp != intentModified {
+  if pollSnapshot, let attrs=try? FileManager.default.attributesOfItem(atPath:intentPath), let stamp=attrs[.modificationDate] as? Date, stamp != intentModified {
    intentModified=stamp
    let action=(try? String(contentsOfFile:intentPath,encoding:.utf8)) ?? "hide"
+   signals.intentSeen(action)
    let mtime=stamp.timeIntervalSinceReferenceDate
    if let kind=["show":HUDPresence.Kind.show,"row":.row,"scroll":.scroll][action] {
     if let k=presence.navigate(kind,chord:mods,mtime:mtime,now:now,pointer:pointer) { navigateHUD(k,mtime:mtime) }
@@ -1001,7 +995,10 @@ final class Navigator: NSObject, NSApplicationDelegate {
   if keys != typedCounter, presence.typed(mods:mods,dragging:pressingCard || tabDragRevealed) { hide() }
   typedCounter=keys
   let otherKey=keyWatch.interrupted(exact:exactHyper,key:keys,leftDown:counter(.leftMouseDown),rightDown:counter(.rightMouseDown),otherDown:counter(.otherMouseDown),buttonsDown:NSEvent.pressedMouseButtons != 0)
+  let holdStarting = hyperHold.began == nil
   let reveal=hyperHold.update(exactHyper:exactHyper && preferences.showOnHyper,otherKey:otherKey,now:now,delay:preferences.hyperDelay)
+  // With bars visible and no display link running, the chord can be noticed up to a clock period after it went down: count the dwell from the press.
+  if holdStarting, hyperHold.began != nil { hyperHold.began! -= min(0.05,max(0,CGEventSource.secondsSinceLastEventType(.combinedSessionState,eventType:.flagsChanged))) }
   // Physical Escape (edge) dismisses at once, unless a card press or drag owns it.
   let escapeDown=CGEventSource.keyState(.combinedSessionState,key:53)
   if escapeDown && !escapeWasDown && presence.escape(mods:mods,dragging:pressingCard || tabDragRevealed) { hide() }

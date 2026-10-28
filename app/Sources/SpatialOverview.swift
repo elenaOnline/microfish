@@ -164,12 +164,14 @@ func spatialScrollOffset(viewport: CGRect, document: CGSize, point: CGPoint) -> 
     result.y = max(0,min(max(0,document.height-viewport.height),result.y))
     return result
 }
-private final class SpatialHitButton: NSButton {
+// NSControl, not NSButton: on macOS 27 every NSButton that joins a window leaks two
+// NSKeyValueDependency objects when released, and this view is rebuilt on every snapshot.
+private final class SpatialHitButton: NSControl {
     weak var owner: SpatialMapView?
     let tile: SpatialTile
     init(tile: SpatialTile, owner: SpatialMapView) {
         self.tile = tile; self.owner = owner; super.init(frame: tile.rect)
-        isBordered = false; title = ""; target = self; action = #selector(pressed)
+        target = self; action = #selector(pressed)
         toolTip = "\(tile.window.app) — \(tile.window.title). Drag to move the whole column."
         setAccessibilityRole(.button)
         setAccessibilityLabel("\(tile.window.app), \(tile.window.title)")
@@ -179,10 +181,12 @@ private final class SpatialHitButton: NSButton {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func draw(_ dirtyRect: NSRect) {}
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }  // as NSButton did
     override func mouseDown(with event: NSEvent) { owner?.begin(tile: tile, event: event) }
     override func mouseDragged(with event: NSEvent) { owner?.track(event: event) }
     override func mouseUp(with event: NSEvent) { owner?.finish(event: event) }
     @objc private func pressed() { owner?.focus(tile.window) }
+    override func accessibilityPerformPress() -> Bool { owner?.focus(tile.window); return true }
 }
 /// Drawn-only targets (pin badges, overflow pills) exposed to VoiceOver.
 private final class SpatialAXElement: NSAccessibilityElement {
