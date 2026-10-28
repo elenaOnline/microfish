@@ -325,9 +325,11 @@ struct HUDPresence {
    return nil
   case .begin, .move:
    touching=true; contactDismissed=false; contactSeen=now; deferred=nil
-   if visible { present(now:now,pointer:pointer,timer:false,chord:observed.isEmpty ? chord:observed); return .scroll }
+   // The fingers are the holder: a modifier that happens to be down (⌘ from the last shortcut)
+   // must not keep the HUD after lift. A running chord session keeps its own chord.
+   if visible { present(now:now,pointer:pointer,timer:false,chord:chord); return .scroll }
    let due=pending.map { min($0.due,min(mtime,now)+Self.revealDelay) } ?? min(mtime,now)+Self.revealDelay
-   pending=(due,.scroll,pending?.chord ?? observed,true)
+   pending=(due,.scroll,pending?.chord ?? [],true)
    return nil
   }
  }
@@ -346,7 +348,7 @@ struct HUDPresence {
  // A plain keystroke (no ⌃⌥⌘) means the user moved on: like ⌘Tab, the HUD gets out of the way.
  // Also catches Karabiner's Caps-tap Escape, too brief for a key-state poll.
  mutating func typed(mods: HUDChord, dragging: Bool) -> Bool {
-  guard visible, !dragging, mods.isEmpty else { return false }
+  guard visible || pending != nil, !dragging, mods.isEmpty else { return false }
   hide(); return true
  }
  mutating func escape(mods: HUDChord, dragging: Bool) -> Bool {
