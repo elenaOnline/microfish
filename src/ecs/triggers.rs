@@ -566,6 +566,10 @@ pub(super) fn dispatch_application_messages(
         match event {
             Event::WindowMinimized { window_id } => {
                 if let Some((_, entity)) = find_window(*window_id)
+                    // A floating window is already outside the layout, and the
+                    // marker is all that remembers it: replacing it with
+                    // `Minimized` would tile the window when it comes back.
+                    && !matches!(unmanaged_query.get(entity), Ok(Unmanaged::Floating))
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
                 {
                     entity_commands.try_insert(Unmanaged::Minimized);
@@ -1010,6 +1014,12 @@ pub(super) fn invalidate_window_title(mut messages: MessageReader<Event>, window
 }
 
 /// Moves the focus away to a neighbour window.
+///
+/// Only a window that actually holds focus has focus to give away. A background
+/// window going away (a helper window closing, an app on a hidden row being
+/// hidden or minimized) leaves the key window alone, as it does in macOS;
+/// without this the neighbour search raised whichever column sat nearest the
+/// middle, taking the keyboard from whatever the user was typing in.
 fn give_away_focus(
     entity: Entity,
     windows: &Windows,
@@ -1018,6 +1028,13 @@ fn give_away_focus(
     config: &mut GlobalState,
     commands: &mut Commands,
 ) {
+    if windows
+        .focused()
+        .is_some_and(|(_, focused)| focused != entity)
+    {
+        return;
+    }
+
     if active_strip.is_tabbed_display(entity)
         && let Some(sibling) = active_strip.tab_display_sibling(entity)
     {

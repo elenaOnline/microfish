@@ -11,6 +11,7 @@ mod tabbed_display;
 mod tabs;
 mod terminal_presentation;
 mod tiling;
+mod wide;
 
 pub(crate) use harness::*;
 pub(crate) use mocks::*;
