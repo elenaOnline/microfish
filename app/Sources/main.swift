@@ -245,16 +245,25 @@ struct HUDStep {
  var fast = false
 }
 // Every show/hide decision for the HUD, time-injected so it runs without windows.
-// release: keyboard sessions appear revealDelay after the navigation and leave when the chord is
-// released (command-tab model). timer: appear at once and linger delay+fade. Scroll gestures are
-// always timer-style. Alpha is a pure function of time; the Navigator applies it each fast tick.
+// release: a session appears revealDelay after it starts and leaves when its holder lets go
+// (command-tab model). The holder is the chord for keyboard navigation and modifier-scroll, the
+// fingers for a trackpad swipe. Hover never holds. timer: appear at once and linger delay+fade.
+// Alpha is a pure function of time; the Navigator applies it each fast tick.
 struct HUDPresence {
  enum Kind { case show, row, scroll }
+ // Trackpad contact, from the engine's swipe intents: first movement, later movement, fingers up.
+ enum Contact { case begin, move, lift }
  static let revealDelay=0.15, releaseFade=0.12, engageTravel=24.0
+ // A contact with no swipe intent and no strip motion for this long is treated as lifted (a lost
+ // touchpad_up must not pin the HUD). Only a backstop: the lift intent is the signal.
+ static let contactStale=6.0
  var mode="release", delay=1.3, fade=0.22
  var visible=false, timer=false, forced=false, moved=false
  var chord=HUDChord(), escapedChord: HUDChord?
- var pending: (due: TimeInterval, kind: Kind, chord: HUDChord)?
+ // touching: fingers are on the trackpad in a swipe that holds the HUD. contactDismissed: the HUD
+ // was dismissed (Escape, typing, click elsewhere) during this contact; its later movement doesn't reopen it.
+ var touching=false, contactDismissed=false, contactSeen: TimeInterval=0
+ var pending: (due: TimeInterval, kind: Kind, chord: HUDChord, contact: Bool)?
  // The engine writes show/row intents before it runs the command: render once a newer snapshot
  // lands, or deferWait after the intent, whichever is first. The earliest intent keeps the deadline.
  static let deferWait=0.15
@@ -269,7 +278,10 @@ struct HUDPresence {
   if !visible { lastPointer=pointer; travel=0; moved=false; wasInside=true }
   visible=true; self.timer=timer; self.chord=chord; anchor=now; releaseAt=nil; forced=false; pending=nil
  }
- mutating func hide() { visible=false; pending=nil; forced=false; releaseAt=nil; moved=false; timer=false; deferred=nil }
+ mutating func hide() {
+  if touching { contactDismissed=true; touching=false }
+  visible=false; pending=nil; forced=false; releaseAt=nil; moved=false; timer=false; deferred=nil
+ }
  mutating func holdRender(_ kind: Kind, mtime: TimeInterval, now: TimeInterval = .infinity) { deferred=(kind,deferred?.mtime ?? min(mtime,now)) }
  mutating func releaseRender(snapshot: TimeInterval, now: TimeInterval) -> Kind? {
   guard let d=deferred, snapshot > d.mtime || now >= d.mtime+Self.deferWait else { return nil }
@@ -277,17 +289,47 @@ struct HUDPresence {
   if timer { anchor=now }
   return d.kind
  }
- // Ongoing strip motion counts as activity for a scroll (timer) session, like a hold.
- mutating func motion(now: TimeInterval) { if visible && timer { anchor=now; releaseAt=nil } }
+ // Ongoing strip motion counts as activity for a scroll (timer) session, like a hold, and as
+ // evidence that a swipe's fingers are still down.
+ mutating func motion(now: TimeInterval) {
+  if touching { contactSeen=now }
+  if visible && timer { anchor=now; releaseAt=nil }
+ }
  // Returns the kind to render now, or nil (nothing yet, or a reveal is pending).
+ // Modifier-scroll with the chord held is a chord session; without one (no ⌃⌥⌘, or an engine that
+ // sends swipes as "scroll") it falls back to the timer.
  mutating func navigate(_ kind: Kind, chord observed: HUDChord, mtime: TimeInterval, now: TimeInterval, pointer: CGPoint) -> Kind? {
-  let t=kind == .scroll || mode == "timer"
+  let t=mode == "timer" || (kind == .scroll && observed.isEmpty && !touching)
   if kind == .scroll { deferred=nil }
   if t || visible { present(now:now,pointer:pointer,timer:t,chord:observed.isEmpty && visible ? chord:observed); return kind }
   guard !observed.isEmpty else { return nil }
   let due=pending.flatMap { $0.chord.isSubset(of:observed) ? $0.due:nil } ?? min(mtime,now)+Self.revealDelay
-  pending=(due,kind,observed)
+  pending=(due,kind,observed,pending?.contact ?? false)
   return nil
+ }
+ // Swipe contact. release: the fingers hold the HUD like the chord does: it appears revealDelay
+ // into the swipe (a flick shows nothing), stays through pauses, and leaves on lift, even while
+ // the strip still settles. timer: every contact intent is a scroll, as before.
+ mutating func contact(_ c: Contact, chord observed: HUDChord, mtime: TimeInterval, now: TimeInterval, pointer: CGPoint) -> Kind? {
+  guard mode == "release" else {
+   touching=false; contactDismissed=false
+   return navigate(.scroll,chord:observed,mtime:mtime,now:now,pointer:pointer)
+  }
+  switch c {
+  case .lift:
+   touching=false; contactDismissed=false   // step() drops a reveal the fingers no longer hold
+   return nil
+  case .move where touching:
+   contactSeen=now; return nil
+  case .move where contactDismissed:
+   return nil
+  case .begin, .move:
+   touching=true; contactDismissed=false; contactSeen=now; deferred=nil
+   if visible { present(now:now,pointer:pointer,timer:false,chord:observed.isEmpty ? chord:observed); return .scroll }
+   let due=pending.map { min($0.due,min(mtime,now)+Self.revealDelay) } ?? min(mtime,now)+Self.revealDelay
+   pending=(due,.scroll,pending?.chord ?? observed,true)
+   return nil
+  }
  }
  mutating func bareHoldReveal(now: TimeInterval, mods: HUDChord, pointer: CGPoint) -> Bool {
   if visible { anchor=now; return false }
@@ -316,8 +358,9 @@ struct HUDPresence {
  }
  mutating func step(now: TimeInterval, mods: HUDChord, pointer: CGPoint, frame: CGRect, pressing: Bool, tabDrag: Bool) -> HUDStep {
   if let e=escapedChord, !e.isSubset(of:mods) { escapedChord=nil }
+  if touching && now-contactSeen > Self.contactStale { touching=false }
   if let p=pending {
-   if !p.chord.isSubset(of:mods) { pending=nil }
+   if !((p.contact && touching) || (!p.chord.isEmpty && p.chord.isSubset(of:mods))) { pending=nil }
    else if now >= p.due { present(now:now,pointer:pointer,timer:false,chord:p.chord); deferred=nil; return HUDStep(present:p.kind,alpha:1,fast:true) }
   }
   guard visible else { return HUDStep(alpha:0,fast:pending != nil) }
@@ -328,7 +371,8 @@ struct HUDPresence {
   }
   wasInside=inside; lastPointer=pointer
   let busy=pressing || tabDrag
-  let hold = busy || (!forced && ((moved && inside) || (timer ? mods.isSuperset(of:[.control,.option]) : held(mods))))
+  // release: only the holder (chord or fingers) or a press/drag keeps the HUD; hovering doesn't.
+  let hold = busy || (!forced && (timer ? (moved && inside) || mods.isSuperset(of:[.control,.option]) : held(mods) || touching))
   if hold { anchor=now; releaseAt=nil; return HUDStep(fast:true) }
   var out=HUDStep(fast:true)
   if timer {
@@ -804,7 +848,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   }
   if (!snapshot.tabGroups.isEmpty && snapshot.tabsVisible) || (scrollNavigation && panel.isVisible) { liveWindows = readLiveWindows() }
   else { liveWindows = [] }
-  if scrollNavigation && panel.isVisible && presence.timer {
+  if scrollNavigation && panel.isVisible && (presence.timer || presence.touching) {
    if motion.moved(stripMotionSignature(liveWindows,ids:Set(snapshot.entries.map(\.id)))) { presence.motion(now:now) }
   } else { motion.reset() }
   tabBars.update(snapshot, windows: liveWindows)
@@ -814,9 +858,12 @@ final class Navigator: NSObject, NSApplicationDelegate {
   if pollSnapshot || fastMode, let attrs=try? FileManager.default.attributesOfItem(atPath:intentPath), let stamp=attrs[.modificationDate] as? Date, stamp != intentModified {
    intentModified=stamp
    let action=(try? String(contentsOfFile:intentPath,encoding:.utf8)) ?? "hide"
+   let mtime=stamp.timeIntervalSinceReferenceDate
    if let kind=["show":HUDPresence.Kind.show,"row":.row,"scroll":.scroll][action] {
-    let mtime=stamp.timeIntervalSinceReferenceDate
     if let k=presence.navigate(kind,chord:mods,mtime:mtime,now:now,pointer:pointer) { navigateHUD(k,mtime:mtime) }
+   }
+   else if let c=["swipe":HUDPresence.Contact.begin,"swiping":.move,"lift":.lift][action] {
+    if let k=presence.contact(c,chord:mods,mtime:mtime,now:now,pointer:pointer) { navigateHUD(k,mtime:mtime) }
    }
    else {
     let inside=panel.frame.contains(pointer)
