@@ -833,7 +833,10 @@ mod tests {
         )
         .unwrap();
         worker.send_reload(script.clone());
-        assert_eq!(next_flash(&worker, "the reload notice"), "Settings reloaded");
+        assert_eq!(
+            next_flash(&worker, "the reload notice"),
+            "Settings reloaded"
+        );
         assert!(
             worker.has_event_handlers(),
             "the reloaded script's handler should be visible to the fast path"

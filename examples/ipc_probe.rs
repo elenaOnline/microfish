@@ -20,9 +20,15 @@ fn stats(label: &str, mut xs: Vec<f64>) {
 }
 
 fn main() {
-    let count: usize = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(30);
+    let count: usize = std::env::args()
+        .nth(1)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(30);
     let gap = Duration::from_millis(
-        std::env::args().nth(2).and_then(|a| a.parse().ok()).unwrap_or(100),
+        std::env::args()
+            .nth(2)
+            .and_then(|a| a.parse().ok())
+            .unwrap_or(100),
     );
     let mut connect = Vec::new();
     let mut active = Vec::new();

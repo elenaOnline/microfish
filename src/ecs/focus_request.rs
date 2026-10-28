@@ -178,10 +178,7 @@ fn focus_acknowledged(trigger: On<Add, FocusedMarker>, mut pending: ResMut<Pendi
 
 /// Answers the requests that will not be acknowledged: the window went away, or
 /// never took the focus.
-fn expire_focus_requests(
-    mut pending: ResMut<PendingFocusRequests>,
-    windows: Windows,
-) {
+fn expire_focus_requests(mut pending: ResMut<PendingFocusRequests>, windows: Windows) {
     if pending.0.is_empty() {
         return;
     }
@@ -204,12 +201,12 @@ fn expire_focus_requests(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assert_focused;
     use crate::ecs::Unmanaged;
     use crate::tests::{
         TEST_DISPLAY_HEIGHT, TEST_DISPLAY_ID, TEST_DISPLAY_WIDTH, TEST_WORKSPACE_ID, TestHarness,
         find_window_entity,
     };
-    use crate::assert_focused;
     use bevy::math::IRect;
 
     fn request(window: WinID) -> (Event, async_channel::Receiver<Response>) {
@@ -317,7 +314,13 @@ mod tests {
             answer.try_recv(),
             Ok(Response::Error("window did not accept focus".to_string()))
         );
-        assert!(harness.world().resource::<PendingFocusRequests>().0.is_empty());
+        assert!(
+            harness
+                .world()
+                .resource::<PendingFocusRequests>()
+                .0
+                .is_empty()
+        );
     }
 
     #[test]
@@ -339,7 +342,9 @@ mod tests {
         harness.advance(Duration::from_millis(60));
         assert_eq!(
             answer.try_recv(),
-            Ok(Response::Error("target disappeared while focusing".to_string()))
+            Ok(Response::Error(
+                "target disappeared while focusing".to_string()
+            ))
         );
     }
 }

@@ -187,7 +187,10 @@ impl MenuBarManager {
         let status = self.add_item("Microfish Needs Permission", None);
         status.setEnabled(false);
 
-        let hint = self.add_item("Turn on Microfish in System Settings; it starts automatically", None);
+        let hint = self.add_item(
+            "Turn on Microfish in System Settings; it starts automatically",
+            None,
+        );
         hint.setEnabled(false);
 
         self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));

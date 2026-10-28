@@ -214,10 +214,7 @@ pub enum Event {
 
     /// The navigator asked for a tiled window to be focused, and wants to be
     /// told when the engine has it focused.
-    FocusRequest {
-        window: WinID,
-        respond_to: Reply,
-    },
+    FocusRequest { window: WinID, respond_to: Reply },
 
     RowDrop {
         drop: crate::types::wire::RowDrop,
