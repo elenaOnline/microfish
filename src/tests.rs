@@ -5,6 +5,7 @@ mod harness;
 mod interaction;
 mod mocks;
 mod parking;
+mod review_a;
 mod rows;
 mod session_restore;
 mod state;

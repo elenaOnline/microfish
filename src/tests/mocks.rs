@@ -121,6 +121,8 @@ struct MockStateInner {
     /// Native focus requests each window will still ignore, modelling an app
     /// that takes the focus back from the window it was just handed to.
     refused_focus: HashMap<WinID, u8>,
+    /// How many times the engine asked an app for its full window list.
+    window_list_scans: usize,
 }
 
 /// One native focus request recorded by the mock.
@@ -154,6 +156,7 @@ impl MockState {
                 background_tabs: HashSet::new(),
                 focus_calls: Vec::new(),
                 refused_focus: HashMap::new(),
+                window_list_scans: 0,
             })),
         }
     }
@@ -239,6 +242,11 @@ impl MockState {
         if let Some(app) = inner.apps.get_mut(&pid) {
             app.focused_window_id = Some(id);
         }
+    }
+
+    /// Full window-list queries made to any app so far.
+    pub(crate) fn window_list_scans(&self) -> usize {
+        self.inner.force_read().window_list_scans
     }
 
     /// Native focus requests made so far, oldest first.
@@ -888,8 +896,10 @@ impl MockState {
         };
 
         let (s, ids) = (self.clone(), window_ids.clone());
-        ma.expect_window_list()
-            .returning(move |_| ids().into_iter().map(|id| s.create_window(id)).collect());
+        ma.expect_window_list().returning(move |_| {
+            s.inner.force_write().window_list_scans += 1;
+            ids().into_iter().map(|id| s.create_window(id)).collect()
+        });
 
         let (s, ids) = (self.clone(), window_ids.clone());
         ma.expect_ax_window_ids().returning(move || {

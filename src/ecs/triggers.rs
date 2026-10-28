@@ -283,15 +283,19 @@ pub(super) fn window_focused_trigger(
         // into a tabbed terminal looks like nothing happened.
         //
         // A tab group lives in one strip, so an answer from a different strip
-        // is no tab sibling. A window the engine has just added to the active
-        // row while the app still reports its old window, parked on a hidden
-        // row, is the case: following that answer would reveal the hidden row
-        // and park the new window along with the row it was inserted into. The
-        // app's own focus notification for the new window follows by itself.
+        // is no tab sibling. Two things can disagree across rows. A window the
+        // engine has just added to the active row while the app still reports
+        // its old window, parked on a hidden row: following that answer would
+        // reveal the hidden row and park the new window along with the row it
+        // was inserted into, so the event wins; the app's own focus
+        // notification for the new window follows by itself. And an event that
+        // arrives late, naming a window on a row the user has since left while
+        // the app already reports the one on screen: the app wins, or the late
+        // event would pull the user back. The row on screen decides.
         let strip_of = |target: Entity| {
-            workspaces
-                .iter()
-                .find_map(|(strip_entity, strip, _)| strip.contains(target).then_some(strip_entity))
+            workspaces.iter().find_map(|(strip_entity, strip, active)| {
+                strip.contains(target).then_some((strip_entity, active))
+            })
         };
         let (window, entity, window_id) = match app.focused_window_id() {
             Ok(current) if current != window_id => {
@@ -299,7 +303,7 @@ pub(super) fn window_focused_trigger(
                     Some((current_window, current_entity, current_parent))
                         if current_parent == parent =>
                     {
-                        if let (Some(event_strip), Some(current_strip)) =
+                        if let (Some((event_strip, true)), Some((current_strip, _))) =
                             (strip_of(entity), strip_of(current_entity))
                             && event_strip != current_strip
                         {

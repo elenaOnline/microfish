@@ -3470,7 +3470,14 @@ fn hidden_row_rejects_app_driven_move_back_onscreen() {
         .find(|(_, strip)| strip.all_windows().contains(&entity))
         .unwrap()
         .0;
-    world.entity_mut(strip).remove::<ActiveWorkspaceMarker>();
+    // A parked row: no longer active, and holding the origin it returns to.
+    world
+        .entity_mut(strip)
+        .remove::<ActiveWorkspaceMarker>()
+        .insert(crate::ecs::workspace::PreviousStripPosition {
+            origin: Origin::new(0, 0),
+            focus: None,
+        });
     world.entity_mut(entity).remove::<RepositionMarker>();
     let parked = Origin::new(1500, 970);
     world.get_mut::<Position>(entity).unwrap().0 = parked;

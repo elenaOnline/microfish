@@ -973,6 +973,21 @@ pub(super) fn window_resized_update_frame(
     }
 }
 
+/// The rows currently parked at a display's corner. A row is hidden when it
+/// carries the position it will be restored from, not merely when it is not
+/// the active one: `ActiveWorkspaceMarker` is global, so the row each other
+/// display (or native Space) is showing is inactive too, and its windows sit
+/// where they are meant to be seen.
+type HiddenRows<'w, 's> = Query<
+    'w,
+    's,
+    &'static LayoutStrip,
+    (
+        With<crate::ecs::workspace::PreviousStripPosition>,
+        Without<ActiveWorkspaceMarker>,
+    ),
+>;
+
 /// How much of a parked window may show before it counts as displaced. The
 /// engine itself leaves a `PARKED_STRIP_SLIVER` of 10 pt, and `AppKit` adds up to
 /// ~40 pt of title bar or toolbar on top of that, so the clamp's echo of our own
@@ -1032,12 +1047,8 @@ pub(crate) struct ParkingCorrections {
 
 impl ParkingCorrections {
     /// Drops episodes of windows whose row is no longer hidden.
-    fn retain_hidden(&mut self, strips: &Query<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>) {
-        let hidden = |entity: &Entity| {
-            strips
-                .iter()
-                .any(|(strip, active)| !active && strip.contains(*entity))
-        };
+    fn retain_hidden(&mut self, strips: &HiddenRows) {
+        let hidden = |entity: &Entity| strips.iter().any(|strip| strip.contains(*entity));
         self.episodes.retain(|entity, _| hidden(entity));
         self.suspects.retain(|entity| hidden(entity));
     }
@@ -1102,7 +1113,7 @@ fn display_frames(displays: &Query<&Display>) -> Vec<IRect> {
 pub(crate) fn window_moved_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: MovableWindows,
-    strips: Query<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    strips: HiddenRows,
     displays: Query<&Display>,
     time: Res<Time>,
     mut corrections: ResMut<ParkingCorrections>,
@@ -1143,7 +1154,7 @@ pub(crate) fn window_moved_update_frame(
         // never make a hidden row visible. Keep visible-row mouse moves intact.
         let hidden_row = strips
             .iter()
-            .any(|(strip, active)| !active && strip.all_windows().contains(&entity));
+            .any(|strip| strip.all_windows().contains(&entity));
         if hidden_row {
             // Judge by what shows, not by distance from the corner: AppKit
             // keeps a title bar on screen, so a parked window never sits
@@ -1177,7 +1188,7 @@ pub(crate) fn window_moved_update_frame(
 #[instrument(level = Level::TRACE, skip_all)]
 pub(crate) fn audit_parked_windows(
     mut windows: MovableWindows,
-    strips: Query<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    strips: HiddenRows,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     time: Res<Time>,
@@ -1186,8 +1197,7 @@ pub(crate) fn audit_parked_windows(
     corrections.retain_hidden(&strips);
     let hidden = strips
         .iter()
-        .filter(|(_, active)| !active)
-        .flat_map(|(strip, _)| strip.all_windows())
+        .flat_map(LayoutStrip::all_windows)
         .collect::<Vec<_>>();
     if hidden.is_empty() {
         return;
@@ -2008,14 +2018,21 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
     apps: Query<&Application>,
     config: Res<Config>,
     time: Res<Time>,
-    mut cache: Local<HashMap<WinID, Duration>>,
+    mut cache: Local<HashMap<WinID, (Duration, usize)>>,
     mut commands: Commands,
 ) {
     const CACHE_CLEANUP_SIZE: usize = 1000;
     // A window the app cannot hand over yet (its role and subrole fill in a beat
     // after creation, as a terminal's do) is not unmanageable for good, so a failed
-    // discovery is only remembered for this long before the window may be tried again.
-    const RETRY_AFTER: Duration = Duration::from_secs(1);
+    // discovery is only remembered for a while before the window may be tried again.
+    // Each try scans every app's windows, so a window that keeps failing (a panel
+    // that takes focus on every use) waits longer each time: the last wait repeats.
+    const RETRY_BACKOFF: [Duration; 4] = [
+        Duration::from_secs(1),
+        Duration::from_secs(4),
+        Duration::from_secs(16),
+        Duration::from_secs(64),
+    ];
     if cache.len() > CACHE_CLEANUP_SIZE {
         cache.clear();
     }
@@ -2027,9 +2044,10 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
         };
 
         if windows.iter().any(|w| w.id() == window_id)
-            || cache
-                .get(&window_id)
-                .is_some_and(|failed_at| now.saturating_sub(*failed_at) < RETRY_AFTER)
+            || cache.get(&window_id).is_some_and(|(failed_at, failures)| {
+                let wait = RETRY_BACKOFF[(*failures - 1).min(RETRY_BACKOFF.len() - 1)];
+                now.saturating_sub(*failed_at) < wait
+            })
         {
             continue;
         }
@@ -2063,7 +2081,8 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
             trace!(
                 "Failed to discover manageable window for focused ID {window_id}; caching as unmanageable."
             );
-            cache.insert(window_id, now);
+            let failures = cache.get(&window_id).map_or(0, |(_, failures)| *failures);
+            cache.insert(window_id, (now, failures + 1));
         }
     }
 }
