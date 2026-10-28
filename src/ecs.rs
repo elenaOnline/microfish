@@ -44,6 +44,7 @@ use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 pub mod display;
 pub(super) mod drag;
 pub mod focus;
+pub(crate) mod focus_request;
 pub mod layout;
 #[cfg(feature = "lua")]
 pub mod layout_ops;
@@ -254,6 +255,7 @@ pub fn register_triggers(app: &mut bevy::app::App) {
         .add_observer(triggers::window_minimized_trigger)
         .add_observer(triggers::spawn_window_trigger)
         .add_observer(triggers::send_message_trigger)
+        .add_observer(crate::focus_trace::focused_marker_added)
         .add_observer(triggers::window_removal_trigger)
         .add_observer(triggers::cleanup_timeout_trigger)
         .add_observer(restore::restore_window_state);

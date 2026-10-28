@@ -552,6 +552,8 @@ pub(crate) fn observe(mut events: MessageReader<Event>, mut commands: Commands) 
                         navigate(world);
                     }
                 }
+                // A navigator tab click is a focus op like any other.
+                Event::FocusRequest { .. } => navigate(world),
                 Event::RowDrop { .. } | Event::LayoutDrop { .. } => begin_move(world),
                 Event::MouseDown { .. } => {
                     let candidate = layout(world);

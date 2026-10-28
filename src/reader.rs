@@ -79,6 +79,13 @@ impl CommandReader {
                     Event::RowDrop { drop, respond_to }
                 });
             }
+            Request::FocusWindow(window) => {
+                crate::focus_trace::begin_click(window);
+                answer(events, reply, "focus request", move |respond_to| {
+                    Event::FocusRequest { window, respond_to }
+                });
+                crate::focus_trace::mark("queued");
+            }
             Request::LayoutDrop(drop) => {
                 answer(events, reply, "layout drop", move |respond_to| {
                     Event::LayoutDrop { drop, respond_to }
@@ -98,12 +105,25 @@ impl CommandReader {
                 send(&events, Event::Command { command });
             }
             Request::WindowSetApply(ops) => {
+                // A tab click arrives as one focus op. Time it from here: the
+                // Mach message is already decoded, so this is the engine's
+                // first sight of it.
+                let focus = ops.iter().find_map(|op| match op {
+                    crate::types::windowset::LayoutOp::Focus(id) => Some(*id),
+                    _ => None,
+                });
+                if let Some(window) = focus {
+                    crate::focus_trace::begin_click(window);
+                }
                 send(
                     &events,
                     Event::Command {
                         command: crate::commands::Command::Layout(ops),
                     },
                 );
+                if focus.is_some() {
+                    crate::focus_trace::mark("queued");
+                }
             }
 
             Request::Query(kind) => {
@@ -112,6 +132,7 @@ impl CommandReader {
                 });
             }
             Request::WindowSet => {
+                crate::focus_trace::snapshot_seen();
                 answer(events, reply, "window set query", |respond_to| {
                     Event::WindowSetQuery { respond_to }
                 });

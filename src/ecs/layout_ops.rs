@@ -13,11 +13,9 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, Without};
 use bevy::ecs::system::{Commands, Query};
 use bevy::platform::collections::HashSet;
-use bevy::prelude::World;
 use tracing::debug;
 
 use crate::commands::{Command, MoveFocus, Operation};
-use crate::ecs::focus::FocusWindow;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::Windows;
 use crate::ecs::workspace::VirtualMoveMarker;
@@ -79,35 +77,10 @@ fn apply(
     };
 
     match op {
-        LayoutOp::Focus(_) => {
+        LayoutOp::Focus(window) => {
             let entity = entity.expect("Focus names a window");
-            commands.queue(move |world: &mut World| {
-                let target = world
-                    .query::<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>()
-                    .iter(world)
-                    .find(|(_, strip, _)| strip.contains(entity))
-                    .map(|(row, _, active)| (row, active));
-                if let Some((row, false)) = target {
-                    if let Some(mut previous) =
-                        world.get_mut::<crate::ecs::workspace::PreviousStripPosition>(row)
-                    {
-                        previous.focus = Some(entity);
-                    }
-                    world.entity_mut(row).insert(ActiveWorkspaceMarker);
-                    // Retry the addressed focus after workspace restoration; never focus
-                    // a parked window before its row has been revealed.
-                    world.trigger(SendMessageTrigger(Event::Command {
-                        command: Command::Layout(vec![op]),
-                    }));
-                } else {
-                    world.trigger(FocusWindow {
-                        entity,
-                        raise: true,
-                        source: None,
-                    });
-                    world.commands().reshuffle_around(entity);
-                }
-            });
+            crate::focus_trace::mark("op_apply");
+            crate::ecs::focus_request::queue_focus(commands, entity, window);
         }
 
         LayoutOp::Swap(_, other) => {

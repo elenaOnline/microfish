@@ -736,6 +736,7 @@ impl WindowApi for WindowOS {
     ) {
         let window_id = self.id();
         debug!("{window_id}");
+        crate::focus_trace::focus_started(window_id, "nofocus_begin");
         if focused_psn == psn {
             let mut event_bytes = [0u8; 0xf8];
             event_bytes[0x04] = 0xf8;
@@ -746,35 +747,44 @@ impl WindowApi for WindowOS {
             unsafe {
                 SLPSPostEventRecordTo(&focused_psn, event_bytes.as_ptr().cast());
             }
+            crate::focus_trace::mark("defocus_posted");
 
             // Artificially delay the activation. This is necessary because some
             // applications appear to be confused if both of the events appear instantaneously.
             thread::sleep(Duration::from_millis(20));
+            crate::focus_trace::mark("same_app_sleep");
 
             event_bytes[0x8a] = 0x01;
             event_bytes[0x3c..0x40].copy_from_slice(&window_id.to_ne_bytes());
             unsafe {
                 SLPSPostEventRecordTo(&psn, event_bytes.as_ptr().cast());
             }
+            crate::focus_trace::mark("focus_posted");
         }
 
         unsafe {
             _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED);
         }
+        crate::focus_trace::mark("slps_front");
         self.make_key_window(&psn);
+        crate::focus_trace::mark("key_window");
     }
 
     /// Focuses the window and raises it to the front.
     #[instrument(level = Level::DEBUG)]
     fn focus_with_raise(&self, psn: ProcessSerialNumber) {
         let window_id = self.id();
+        crate::focus_trace::focus_started(window_id, "raise_begin");
         unsafe {
             _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED);
         }
+        crate::focus_trace::mark("slps_front");
         self.make_key_window(&psn);
+        crate::focus_trace::mark("key_window");
         let element_ref = self.ax_element.as_ptr();
         let action = CFString::from_static_str(kAXRaiseAction);
         unsafe { AXUIElementPerformAction(element_ref, &action) };
+        crate::focus_trace::mark("ax_raise");
     }
 
     #[instrument(level = Level::DEBUG)]

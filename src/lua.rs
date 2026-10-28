@@ -264,6 +264,7 @@ pub fn drain_lua_outbox(
     for effect in worker.drain_outbox() {
         match effect {
             FromLua::Command(command) => {
+                crate::focus_trace::mark_once("lua_out");
                 commands.trigger(SendMessageTrigger(Event::Command { command }));
             }
             FromLua::Flash { message, duration } => commands.flash_message(message, duration),

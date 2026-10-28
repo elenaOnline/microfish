@@ -146,6 +146,11 @@ pub enum Request {
     ScriptState(ScriptStateRequest),
     /// Ask for state events to be pushed as they happen.
     Subscribe,
+    /// Give a tiled window on the current desktop the focus, and answer once the
+    /// engine has it as its focused window. The navigator's tab click: validated
+    /// and applied in one step inside the daemon, so the client needs no
+    /// snapshot round trip before it and no polling after it.
+    FocusWindow(i32),
 }
 
 /// What a client wants of the script-state store.
@@ -167,6 +172,8 @@ pub enum Response {
     Query(QueryPayload),
     WindowSet(Box<WindowSet>),
     ScriptState(ScriptStateResponse),
+    /// The window asked for by [`Request::FocusWindow`] is the focused window.
+    Focused,
     /// The request could not be answered. Carries the message a client should
     /// show.
     Error(String),
@@ -232,6 +239,7 @@ mod tests {
         round_trip(&Request::WindowSet);
         round_trip(&Request::WindowSetApply(vec![LayoutOp::Focus(7)]));
         round_trip(&Request::Subscribe);
+        round_trip(&Request::FocusWindow(165_371));
         round_trip(&Request::ScriptState(ScriptStateRequest::Get {
             key: "pads.term".to_string(),
         }));
@@ -253,6 +261,7 @@ mod tests {
         round_trip(&Response::ScriptState(ScriptStateResponse::Write(
             WriteOutcome::Applied { changed: true },
         )));
+        round_trip(&Response::Focused);
         round_trip(&Response::Error("no such window".to_string()));
     }
 
