@@ -3,6 +3,64 @@ import AppKit
 private func mapColor(_ hex:UInt32)->NSColor { NSColor(srgbRed:CGFloat((hex>>16)&255)/255,green:CGFloat((hex>>8)&255)/255,blue:CGFloat(hex&255)/255,alpha:1) }
 private func mapDark(_ view:NSView)->Bool { view.effectiveAppearance.bestMatch(from:[.aqua,.darkAqua]) == .darkAqua }
 private func mapTeal(_ view:NSView)->NSColor { mapColor(mapDark(view) ? 0x3CC6C4:0x00898B) }
+/// Microfish teal for small text: #00777A is 4.8:1 on the light map, #3CC6C4 on the dark one. The brand teal above stays for strokes and fills.
+func spatialTealText(dark:Bool)->NSColor { mapColor(dark ? 0x3CC6C4:0x00777A) }
+private func mapTealText(_ view:NSView)->NSColor { spatialTealText(dark:mapDark(view)) }
+
+func spatialLuminance(_ color:NSColor)->Double {
+    let c=color.usingColorSpace(.sRGB) ?? color
+    func lin(_ v:CGFloat)->Double { let x=Double(v); return x<=0.03928 ? x/12.92:pow((x+0.055)/1.055,2.4) }
+    return 0.2126*lin(c.redComponent)+0.7152*lin(c.greenComponent)+0.0722*lin(c.blueComponent)
+}
+func spatialContrast(_ a:NSColor,_ b:NSColor)->Double {
+    let x=spatialLuminance(a),y=spatialLuminance(b); return (max(x,y)+0.05)/(min(x,y)+0.05)
+}
+/// Digit colour for a View chip: white where it reads at 4.5:1, otherwise dark, whichever is stronger. `fill` must already be resolved for the appearance.
+func spatialChipTextColor(on fill:NSColor)->NSColor {
+    let white=NSColor.white,dark=NSColor.black
+    return spatialContrast(white,fill) >= 4.5 || spatialContrast(white,fill) >= spatialContrast(dark,fill) ? white:dark
+}
+/// `spatialPinColor` is dynamic; resolve it the way a view in `appearance` would draw it.
+func spatialResolved(_ color:NSColor,dark:Bool)->NSColor {
+    var out=color
+    NSAppearance(named:dark ? .darkAqua:.aqua)!.performAsCurrentDrawingAppearance { out=color.usingColorSpace(.sRGB) ?? color }
+    return out
+}
+private func mapChipText(_ slot:Int,_ view:NSView)->NSColor { spatialChipTextColor(on:spatialResolved(spatialPinColor(slot),dark:mapDark(view))) }
+
+// MARK: Shortcut display
+/// Key equivalent for an engine chord such as "ctrl + alt + cmd - tab", so AppKit draws it in the menu like any other shortcut.
+func spatialKeyEquivalent(_ chord:String)->(key:String,mask:NSEvent.ModifierFlags)? {
+    let parts=chord.lowercased().components(separatedBy:" - ")
+    guard parts.count==2 else { return nil }
+    var mask=NSEvent.ModifierFlags()
+    for m in parts[0].split(separator:"+").map({ $0.trimmingCharacters(in:.whitespaces) }) {
+        switch m { case "ctrl":mask.insert(.control); case "alt":mask.insert(.option); case "shift":mask.insert(.shift); case "cmd":mask.insert(.command); default:return nil }
+    }
+    let name=parts[1].trimmingCharacters(in:.whitespaces)
+    func fn(_ code:Int)->String { String(UnicodeScalar(UInt16(code))!) }
+    let named:[String:String]=["tab":"\t","space":" ","return":"\r","escape":"\u{1b}","delete":"\u{8}","forwarddelete":fn(0xF728),
+        "leftarrow":fn(0xF702),"rightarrow":fn(0xF703),"uparrow":fn(0xF700),"downarrow":fn(0xF701),"home":fn(0xF729),"end":fn(0xF72B),"pageup":fn(0xF72C),"pagedown":fn(0xF72D),
+        "leftbracket":"[","rightbracket":"]","backslash":"\\","equal":"=","minus":"-","semicolon":";","quote":"'","comma":",","period":".","slash":"/","grave":"`"]
+    if let key=named[name] { return (key,mask) }
+    if name.count==1 { return (name,mask) }
+    if name.hasPrefix("f"),let n=Int(name.dropFirst()),(1...20).contains(n) { return (fn(0xF703+n),mask) }
+    return nil
+}
+/// Live bindings: config/shortcut-defaults.json, overridden by the `shortcuts` map in config/preferences.json (an empty chord means unset).
+func spatialShortcutChords(root:URL)->[String:String] {
+    var out:[String:String]=[:]
+    if let data=try? Data(contentsOf:root.appendingPathComponent("config/shortcut-defaults.json")),let list=(try? JSONSerialization.jsonObject(with:data)) as? [[String:String]] {
+        for entry in list { if let id=entry["id"] { out[id]=entry["default"] ?? "" } }
+    }
+    if let data=try? Data(contentsOf:root.appendingPathComponent("config/preferences.json")),let prefs=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any],let custom=prefs["shortcuts"] as? [String:String] {
+        for (id,chord) in custom { out[id]=chord }
+    }
+    return out
+}
+func spatialPlural(_ n:Int,_ noun:String)->String { "\(n) \(noun)\(n==1 ? "":"s")" }
+/// What to call a window: its title, or the app when the title is empty (or just repeats the app).
+func spatialWindowTitle(_ w:SpatialWindow)->String { let t=w.title.trimmingCharacters(in:.whitespacesAndNewlines); return t.isEmpty ? w.app:t }
 
 
 struct SpatialWindow: Equatable {
@@ -172,15 +230,28 @@ private final class SpatialHitButton: NSControl {
     init(tile: SpatialTile, owner: SpatialMapView) {
         self.tile = tile; self.owner = owner; super.init(frame: tile.rect)
         target = self; action = #selector(pressed)
-        toolTip = "\(tile.window.app) — \(tile.window.title). Drag to move the whole column."
+        let name = SpatialHitButton.name(tile.window)
+        toolTip = "\(name). Drag to move the whole column."
         setAccessibilityRole(.button)
-        setAccessibilityLabel("\(tile.window.app), \(tile.window.title)")
-        setAccessibilityHelp("Row \(tile.window.row), column \(tile.window.column + 1). Press to focus this window. Drag to move the whole column.")
+        setAccessibilityLabel(SpatialHitButton.spoken(tile.window))
+        // The snapshot's columns are already 1-based, like its rows.
+        setAccessibilityHelp("Row \(tile.window.row), column \(tile.window.column). Press to focus this window. Drag to move the whole column.")
         if owner.snapshot.focused == tile.window.id { setAccessibilityValueDescription("Current window") }
         setAccessibilityCustomActions(owner.moveActions(for: tile))
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    /// "Safari — Inbox", or just "Safari" when the title is empty or repeats the app.
+    static func name(_ w: SpatialWindow) -> String { let t = spatialWindowTitle(w); return t == w.app ? w.app : "\(w.app) — \(t)" }
+    static func spoken(_ w: SpatialWindow) -> String { let t = spatialWindowTitle(w); return t == w.app ? w.app : "\(w.app), \(t)" }
     override func draw(_ dirtyRect: NSRect) {}
+    // Keyboard: Tab reaches a tile when Full Keyboard Access is on; Space or Return presses it, as on a button.
+    override var acceptsFirstResponder: Bool { true }
+    override var canBecomeKeyView: Bool { NSApp.isFullKeyboardAccessEnabled && super.canBecomeKeyView }
+    override func drawFocusRingMask() { NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 5, yRadius: 5).fill() }
+    override var focusRingMaskBounds: NSRect { bounds }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 49 || event.keyCode == 36 || event.keyCode == 76 { pressed() } else { super.keyDown(with: event) }
+    }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }  // as NSButton did
     override func mouseDown(with event: NSEvent) { owner?.begin(tile: tile, event: event) }
     override func mouseDragged(with event: NSEvent) { owner?.track(event: event) }
@@ -226,10 +297,23 @@ final class SpatialMapView: NSView {
     var increaseContrastOverride: Bool?
     private var increaseContrast: Bool { increaseContrastOverride ?? NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast }
     private var requestedWidth: CGFloat
+    static let noWindowsText = "No windows yet", notRunningText = "Microfish isn’t running"
+    /// Painted when the snapshot has no rows; also what VoiceOver reads for the empty map.
+    var emptyText = SpatialMapView.noWindowsText { didSet { if emptyText != oldValue { updateAccessibilityLabel(); needsDisplay = true } } }
+    private func updateAccessibilityLabel() { setAccessibilityLabel(snapshot.rows.isEmpty ? emptyText : "Windows by row") }
+    /// Cursor pushed for the drag in flight: closed hand over a drop that would move the column, not-allowed over one that would not.
+    private(set) var dragCursor: NSCursor?
+    private func showDragCursor(_ valid: Bool) {
+        let wanted: NSCursor = valid ? .closedHand : .operationNotAllowed
+        if dragCursor === wanted { return }
+        if dragCursor != nil { NSCursor.pop() }
+        wanted.push(); dragCursor = wanted
+    }
+    private func hideDragCursor() { if dragCursor != nil { NSCursor.pop(); dragCursor = nil } }
     init(snapshot: SpatialSnapshot, width: CGFloat, onFocus: ((Int) -> Void)?) {
         self.snapshot = snapshot; self.map = SpatialMapLayout(snapshot: snapshot, width: width); self.onFocus = onFocus; requestedWidth = width
         super.init(frame: CGRect(x: 0, y: 0, width: map.width, height: map.height))
-        setAccessibilityElement(true); setAccessibilityRole(.group); setAccessibilityLabel("Windows by row"); rebuild()
+        setAccessibilityElement(true); setAccessibilityRole(.group); rebuild()
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(displayEnvironmentChanged), name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(displayEnvironmentChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
     }
@@ -238,7 +322,7 @@ final class SpatialMapView: NSView {
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     deinit {
-        dragTimer?.invalidate(); if let monitor { NSEvent.removeMonitor(monitor) }
+        dragTimer?.invalidate(); if let monitor { NSEvent.removeMonitor(monitor) }; hideDragCursor()
         NSWorkspace.shared.notificationCenter.removeObserver(self); NotificationCenter.default.removeObserver(self)
     }
     /// True when a newer snapshot no longer has the dragged window in its row, so the drop could only target stale data.
@@ -263,12 +347,13 @@ final class SpatialMapView: NSView {
         cancelDrag(); pending = nil
         missingIcons = []  // retry apps whose icon could not be resolved last time, as a fresh map did
         onFocus = nil; onMove = nil; onDragState = nil; onPin = nil; onEscape = nil
-        pins = [:]; pinPadding = 4; increaseContrastOverride = nil; pressedPin = nil; pressedOverflow = nil
+        pins = [:]; pinPadding = 4; increaseContrastOverride = nil; pressedPin = nil; pressedOverflow = nil; emptyText = Self.noWindowsText
         requestedWidth = width
         update(snapshot, force: true)
     }
     func resizeViewport(width: CGFloat) { if abs(width-requestedWidth) > 0.5 { cancelDrag(); requestedWidth = max(1,width); update(snapshot, force: true) } }
     private func rebuild() {
+        updateAccessibilityLabel()
         subviews.forEach { $0.removeFromSuperview() }
         for tile in map.tiles { addSubview(SpatialHitButton(tile: tile, owner: self)) }
     }
@@ -292,6 +377,7 @@ final class SpatialMapView: NSView {
                 dragTimer = timer; RunLoop.main.add(timer, forMode: .common)
             }
             drop = spatialDrop(snapshot: snapshot, map: map, drag: state, point: point); needsDisplay = true
+            showDragCursor(drop != nil)
         }
     }
     func scrollDrag() {
@@ -300,6 +386,7 @@ final class SpatialMapView: NSView {
         let offset = spatialScrollOffset(viewport: visibleRect, document: bounds.size, point: point)
         scroll.contentView.scroll(to: offset); scroll.reflectScrolledClipView(scroll.contentView)
         drop = spatialDrop(snapshot: snapshot, map: map, drag: state, point: convert(position, from: nil)); needsDisplay = true
+        showDragCursor(drop != nil)
     }
     func finish(event: NSEvent) { finish(point: convert(event.locationInWindow, from: nil)) }
     func finish(point: CGPoint) {
@@ -323,7 +410,7 @@ final class SpatialMapView: NSView {
     override func keyDown(with event: NSEvent) { if event.keyCode == 53 { cancelOperation(self) } else { super.keyDown(with: event) } }
     func cancelDrag() {
         dragTimer?.invalidate(); dragTimer = nil; lastWindowPoint = nil
-        drag = nil; drop = nil
+        drag = nil; drop = nil; hideDragCursor()
         if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
         onDragState?(false)
         if let pending { self.pending = nil; update(pending) }; needsDisplay = true
@@ -365,7 +452,7 @@ final class SpatialMapView: NSView {
         return [(index-1,"above"),(index+1,"below")].compactMap { target, side in
             guard rows.indices.contains(target) else { return nil }
             let row = rows[target]
-            return NSAccessibilityCustomAction(name: "Move column to row \(row), \(side)") { [weak self] in
+            return NSAccessibilityCustomAction(name: "Move column to the row \(side) (row \(row))") { [weak self] in
                 guard let self, let drop = self.accessibilityDrop(sourceID: tile.window.id, toRow: row) else { return false }
                 self.onMove?(drop.sourceID, drop.sourceRow, drop.row, drop.anchor, drop.after); return true
             }
@@ -382,7 +469,7 @@ final class SpatialMapView: NSView {
         for entry in pinGeometry() {
             let element = SpatialAXElement(); element.owner = self; element.rect = entry.badge
             element.setAccessibilityParent(self); element.setAccessibilityRole(.button)
-            element.setAccessibilityLabel("Pinned view \(entry.slot)"); element.setAccessibilityHelp("Press to jump to this pinned view.")
+            element.setAccessibilityLabel("View \(entry.slot)"); element.setAccessibilityHelp("Press to go to this view.")
             let slot = entry.slot; element.press = { [weak self] in self?.onPin?(slot) }
             extra.append(element)
         }
@@ -424,7 +511,7 @@ final class SpatialMapView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let dark=mapDark(self),teal=mapTeal(self),background=mapColor(dark ? 0x2B2E2F:0xFAFAFA)
         background.setFill();bounds.fill()
-        if snapshot.rows.isEmpty {text("No windows yet",in:bounds.insetBy(dx:20,dy:30),color:.secondaryLabelColor);return}
+        if snapshot.rows.isEmpty {text(emptyText,in:bounds.insetBy(dx:20,dy:30),color:.secondaryLabelColor);return}
         for row in snapshot.rows {
             guard let frame=map.rowFrames[row] else {continue}
             let active=row==snapshot.activeRow
@@ -435,7 +522,7 @@ final class SpatialMapView: NSView {
                 let slot=CGRect(x:left,y:frame.minY+1,width:max(1,right-left),height:frame.height-2)
                 let path=NSBezierPath(roundedRect:slot,xRadius:7,yRadius:7);path.setLineDash([1,2],count:2,phase:0);path.lineWidth=1
                 (active ? teal:NSColor.labelColor.withAlphaComponent(increaseContrast ? 0.55:0.22)).setStroke();path.stroke()
-                text(active ? "Empty row · you’re here":"Empty row",in:CGRect(x:slot.minX+8,y:slot.midY-7,width:slot.width-16,height:16),color:active ? teal:.secondaryLabelColor,size:10,centered:true)
+                text(active ? "Empty row (current)":"Empty row",in:CGRect(x:slot.minX+8,y:slot.midY-7,width:slot.width-16,height:16),color:active ? mapTealText(self):.secondaryLabelColor,size:10,centered:true)
             }
         }
         NSGraphicsContext.saveGraphicsState()
@@ -476,7 +563,7 @@ final class SpatialMapView: NSView {
             let color=spatialPinColor(slot);color.setStroke()
             let p=NSBezierPath(roundedRect:rect,xRadius:6,yRadius:6);p.lineWidth=1;p.stroke()
             color.setFill();NSBezierPath(roundedRect:badge,xRadius:4,yRadius:4).fill()
-            text(String(slot),in:badge.insetBy(dx:0,dy:1),color:.white,size:10,centered:true)
+            text(String(slot),in:badge.insetBy(dx:0,dy:1),color:mapChipText(slot,self),size:10,centered:true)
         }
         if let drop,let lane=map.rowFrames[drop.row] {
             teal.setStroke();let line=NSBezierPath();line.move(to:CGPoint(x:drop.markerX,y:lane.minY+3));line.line(to:CGPoint(x:drop.markerX,y:lane.maxY-3));line.lineWidth=2;line.stroke()
@@ -499,7 +586,7 @@ final class SpatialMapView: NSView {
             background.setFill();ruler.insetBy(dx:-2,dy:0).fill()
             (active ? teal.withAlphaComponent(0.09):NSColor.labelColor.withAlphaComponent(0.04)).setFill();NSBezierPath(roundedRect:ruler.insetBy(dx:2,dy:0),xRadius:6,yRadius:6).fill()
             let style=NSMutableParagraphStyle();style.alignment = .center
-            (String(row) as NSString).draw(in:CGRect(x:ruler.minX,y:lane.midY-7,width:ruler.width,height:16),withAttributes:[.font:NSFont.monospacedSystemFont(ofSize:11,weight:active ? .semibold:.regular),.foregroundColor:active ? teal:NSColor.secondaryLabelColor,.paragraphStyle:style])
+            (String(row) as NSString).draw(in:CGRect(x:ruler.minX,y:lane.midY-7,width:ruler.width,height:16),withAttributes:[.font:NSFont.monospacedSystemFont(ofSize:11,weight:active ? .semibold:.regular),.foregroundColor:active ? mapTealText(self):NSColor.secondaryLabelColor,.paragraphStyle:style])
         }
     }
     private func icon(_ bundle: String) -> NSImage? {
@@ -533,7 +620,7 @@ struct SpatialPanelGeometry {
 }
 private final class SpatialGearButton: NSButton {
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
-    override func draw(_ dirtyRect: NSRect) { NSImage(systemSymbolName:"gearshape",accessibilityDescription:"Settings")?.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors:[mapColor(mapDark(self) ? 0xA1A1A6:0x6E6E73)]))?.draw(in:bounds.insetBy(dx:5,dy:5)) }
+    override func draw(_ dirtyRect: NSRect) { NSImage(systemSymbolName:"gearshape",accessibilityDescription:"Microfish Menu")?.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors:[mapColor(mapDark(self) ? 0xA1A1A6:0x6E6E73)]))?.draw(in:bounds.insetBy(dx:5,dy:5)) }
 }
 private final class SpatialClipView:NSClipView {
     var onScroll:(()->Void)?
@@ -567,8 +654,12 @@ final class SpatialContentView: NSView {
     var onSettings: (() -> Void)?
     var onRefresh: (() -> Void)?
     var onViews: (() -> Void)?
-    private let viewsButton = NSButton(title: "Views…", target: nil, action: nil)
-    let refreshButton = NSButton(title: "Refresh", target: nil, action: nil)
+    /// Quit is the app's own action: sent down the responder chain (nil target) like any menu's Quit, after the popover is closed.
+    var onQuit: (() -> Void)?
+    static let refreshLabel = "Restart Window Tracking"
+    static let refreshHelp = "Restarts Microfish and finds every window again. Windows may move briefly."
+    private let viewsButton = NSButton(title: "Views", target: nil, action: nil)
+    let refreshButton = NSButton(title: "Restart Window Tracking", target: nil, action: nil)
     private let gear = SpatialGearButton()
     init(snapshot: SpatialSnapshot, available: NSSize) {
         geometry = SpatialPanelGeometry(available: available, rowCount: snapshot.rows.count)
@@ -583,11 +674,11 @@ final class SpatialContentView: NSView {
         NotificationCenter.default.addObserver(self,selector:#selector(mapViewportChanged),name:NSView.boundsDidChangeNotification,object:scrollView.contentView)
         scrollView.frame = geometry.scroll; scrollView.hasVerticalScroller = true; scrollView.hasHorizontalScroller = true
         scrollView.autohidesScrollers = true; scrollView.drawsBackground = false; scrollView.documentView = mapView; addSubview(scrollView)
-        gear.title = ""; gear.isBordered = false; gear.target = self; gear.action = #selector(settings); gear.toolTip = "Settings"; gear.setAccessibilityLabel("Settings")
+        gear.title = ""; gear.isBordered = false; gear.target = self; gear.action = #selector(gearMenu); gear.toolTip = "Settings and Quit"; gear.setAccessibilityLabel("Microfish Menu"); gear.setAccessibilityRole(.menuButton)
         gear.frame = CGRect(x: max(0,bounds.width-44), y: min(12,geometry.header.height/4), width: min(30,bounds.width), height: min(30,geometry.header.height)); addSubview(gear)
         refreshButton.target = self; refreshButton.action = #selector(refresh)
-        refreshButton.bezelStyle = .rounded; refreshButton.setAccessibilityLabel("Refresh windows")
-        refreshButton.toolTip = "Rediscover windows and restore the saved layout. Windows may briefly move."
+        refreshButton.bezelStyle = .rounded; refreshButton.setAccessibilityLabel(Self.refreshLabel)
+        refreshButton.toolTip = Self.refreshHelp
         refreshButton.frame = CGRect(x: max(0,bounds.width-132), y: 12, width: 82, height: 28)
         addSubview(refreshButton)
         viewsButton.target=self; viewsButton.action = #selector(views); viewsButton.bezelStyle = .rounded
@@ -620,13 +711,13 @@ final class SpatialContentView: NSView {
     /// Takes a closed popover's content back for the next open.
     static func recycle(_ content: SpatialContentView) {
         content.mapView.cancelDrag()
-        content.onEscape = nil; content.onSettings = nil; content.onRefresh = nil; content.onViews = nil
+        content.onEscape = nil; content.onSettings = nil; content.onRefresh = nil; content.onViews = nil; content.onQuit = nil
         if !spare.contains(where: { $0 === content }) { spare.append(content) }
     }
     private func refill(snapshot: SpatialSnapshot, available: NSSize) {
         geometry = SpatialPanelGeometry(available: available, rowCount: snapshot.rows.count)
         mapView.reuse(snapshot: snapshot, width: max(1, geometry.scroll.width-14))
-        message = Self.defaultMessage
+        message = Self.defaultMessage; engineNotRunning = false
         refreshButton.isEnabled = true
         setFrameSize(geometry.size)
         scrollView.frame = geometry.scroll
@@ -644,15 +735,32 @@ final class SpatialContentView: NSView {
     private func layoutHeader() {
         let narrow=bounds.width<380,y:CGFloat=7
         gear.frame=CGRect(x:bounds.width-34,y:y,width:24,height:24)
-        refreshButton.title="";refreshButton.image=NSImage(systemSymbolName:"arrow.clockwise",accessibilityDescription:"Refresh windows");refreshButton.isBordered=false
+        refreshButton.title="";refreshButton.image=NSImage(systemSymbolName:"arrow.clockwise",accessibilityDescription:Self.refreshLabel);refreshButton.isBordered=false
         refreshButton.frame=CGRect(x:bounds.width-64,y:y,width:24,height:24)
-        viewsButton.title=narrow ? "":"Views ⌄";viewsButton.image=narrow ? NSImage(systemSymbolName:"bookmark",accessibilityDescription:"Views and pins"):nil
-        viewsButton.isBordered = !narrow;viewsButton.isHidden=bounds.width<200;viewsButton.toolTip="Views and pins";viewsButton.setAccessibilityLabel("Views and pins")
+        viewsButton.title=narrow ? "":"Views ⌄";viewsButton.image=narrow ? NSImage(systemSymbolName:"bookmark",accessibilityDescription:"Views"):nil
+        viewsButton.isBordered = !narrow;viewsButton.isHidden=bounds.width<200;viewsButton.toolTip="Views";viewsButton.setAccessibilityLabel("Views");viewsButton.setAccessibilityRole(.menuButton)
         viewsButton.frame=CGRect(x:bounds.width-(narrow ? 94:134),y:y,width:narrow ? 24:64,height:24)
     }
     @objc private func views() { onViews?() }
     @objc private func refresh() { onRefresh?() }
     @objc private func settings() { onSettings?() }
+    @objc private func quit() { onQuit?(); NSApp.sendAction(Selector(("quitMicrofish:")), to: nil, from: self) }
+    /// Where the Views menu hangs: just under its button (under the gear when the button is hidden).
+    var viewsAnchor: CGPoint { let f = viewsButton.isHidden ? gear.frame : viewsButton.frame; return CGPoint(x: f.minX, y: f.maxY + 2) }
+    /// The gear's pull-down: Settings… and Quit Microfish, with the shortcuts every Mac app uses for them.
+    func makeGearMenu() -> NSMenu {
+        let menu = NSMenu()
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(settings), keyEquivalent: ","); settingsItem.keyEquivalentModifierMask = .command; settingsItem.target = self
+        let quitItem = NSMenuItem(title: "Quit Microfish", action: #selector(quit), keyEquivalent: "q"); quitItem.keyEquivalentModifierMask = .command; quitItem.target = self
+        menu.addItem(settingsItem); menu.addItem(.separator()); menu.addItem(quitItem)
+        return menu
+    }
+    @objc private func gearMenu() {
+        let menu = makeGearMenu()
+        menu.popUp(positioning: nil, at: CGPoint(x: gear.frame.minX, y: gear.frame.maxY + 2), in: self)
+    }
+    /// The engine is not answering: the empty map says so instead of "No windows yet".
+    var engineNotRunning = false { didSet { if engineNotRunning != oldValue { mapView.emptyText = engineNotRunning ? SpatialMapView.notRunningText : SpatialMapView.noWindowsText; needsDisplay = true } } }
     func centerActiveRow() {
         guard let row = mapView.map.rowFrames[mapView.snapshot.activeRow] else { return }
         let viewport = scrollView.contentView.bounds
@@ -666,17 +774,25 @@ final class SpatialContentView: NSView {
         NSColor.separatorColor.withAlphaComponent(0.6).setStroke()
         let path = NSBezierPath(); path.move(to: CGPoint(x: 16,y: geometry.header.maxY-1)); path.line(to: CGPoint(x: bounds.width-16,y: geometry.header.maxY-1)); path.move(to: CGPoint(x: 16,y: geometry.footer.minY)); path.line(to: CGPoint(x: bounds.width-16,y: geometry.footer.minY)); path.lineWidth = 0.5; path.stroke()
         let normal=message==Self.defaultMessage
-        let showLegend=normal && bounds.width>=500
+        // No rows: nothing to drag and nothing for the legend to explain. Only a status ("Restarting…") is worth the footer.
+        let hasRows = !mapView.snapshot.rows.isEmpty
+        let showLegend=normal && hasRows && bounds.width>=500
+        if !hasRows && normal { return }
         (message as NSString).draw(in:CGRect(x:12,y:geometry.footer.minY+9,width:showLegend ? bounds.width-250:bounds.width-24,height:14),withAttributes:[.font:NSFont.systemFont(ofSize:9),.foregroundColor:NSColor.secondaryLabelColor,.paragraphStyle:paragraph])
         if showLegend {
             let x=bounds.width-218,y=geometry.footer.minY+10
             mapTeal(self).setStroke();let port=NSBezierPath(roundedRect:CGRect(x:x,y:y,width:7,height:7),xRadius:1,yRadius:1);port.lineWidth=1;port.stroke()
             ("On screen" as NSString).draw(at:CGPoint(x:x+12,y:y-2),withAttributes:[.font:NSFont.systemFont(ofSize:9),.foregroundColor:NSColor.secondaryLabelColor])
             spatialPinColor(2).setFill();NSBezierPath(roundedRect:CGRect(x:x+68,y:y-1,width:11,height:11),xRadius:3,yRadius:3).fill()
-            ("2" as NSString).draw(at:CGPoint(x:x+71,y:y-1),withAttributes:[.font:NSFont.monospacedDigitSystemFont(ofSize:8,weight:.bold),.foregroundColor:NSColor.white])
-            ("Pinned view · click to jump" as NSString).draw(at:CGPoint(x:x+84,y:y-2),withAttributes:[.font:NSFont.systemFont(ofSize:9),.foregroundColor:NSColor.secondaryLabelColor])
+            ("2" as NSString).draw(at:CGPoint(x:x+71,y:y-1),withAttributes:[.font:NSFont.monospacedDigitSystemFont(ofSize:8,weight:.bold),.foregroundColor:mapChipText(2,self)])
+            ("Saved view · click to go" as NSString).draw(at:CGPoint(x:x+84,y:y-2),withAttributes:[.font:NSFont.systemFont(ofSize:9),.foregroundColor:NSColor.secondaryLabelColor])
         }
     }
+}
+/// An empty map says "Microfish isn’t running" when the engine does not answer; with no answer to go on, when no snapshot ever arrived.
+func spatialMapNotRunning(empty: Bool, receivedSnapshot: Bool, engineAnswers: Bool?) -> Bool {
+    guard empty else { return false }
+    return engineAnswers.map { !$0 } ?? !receivedSnapshot
 }
 /// A transient popover closes on the mouse-down that lands on its own status item, so the
 /// mouse-up action would immediately reopen it. True when this click is the tail of such a close.
@@ -709,6 +825,38 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
     private var snapshot = SpatialSnapshot("")
     private var content: SpatialContentView?
     private var closedByStatusPressAt: TimeInterval?
+    private var receivedSnapshot = false
+    /// Does the engine answer? nil = cannot tell. The default asks the Microfish binary next to the helper (`query active`) off the main
+    /// thread, as the quit sequence does; tests replace it. It is only asked while the map has no rows, to name the empty state.
+    var engineProbe: (@escaping (Bool?) -> Void) -> Void = SpatialOverviewController.askEngine
+    static func askEngine(_ done: @escaping (Bool?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let engine = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.deletingLastPathComponent().appendingPathComponent("Microfish")
+            var answer: Bool?
+            if FileManager.default.isExecutableFile(atPath: engine.path) {
+                let child = Process(); child.executableURL = engine; child.arguments = ["query", "active"]
+                child.standardOutput = FileHandle.nullDevice; child.standardError = FileHandle.nullDevice
+                if (try? child.run()) != nil {
+                    let deadline = Date().addingTimeInterval(1.5)
+                    while child.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
+                    if child.isRunning { child.terminate(); child.waitUntilExit(); answer = true }  // slow is not absent
+                    else { answer = child.terminationStatus == 0 }
+                }
+            }
+            DispatchQueue.main.async { done(answer) }
+        }
+    }
+    /// Names an empty map: "Microfish isn’t running" when it is not answering (or never wrote a snapshot), else "No windows yet".
+    func checkEngine() {
+        guard let shown = content else { return }
+        let empty = shown.mapView.snapshot.rows.isEmpty
+        shown.engineNotRunning = spatialMapNotRunning(empty: empty, receivedSnapshot: receivedSnapshot, engineAnswers: nil)
+        guard empty else { return }
+        engineProbe { [weak self, weak shown] up in
+            guard let self, let shown, shown === self.content else { return }
+            shown.engineNotRunning = spatialMapNotRunning(empty: true, receivedSnapshot: self.receivedSnapshot, engineAnswers: up)
+        }
+    }
     func attach(to item: NSStatusItem) {
         self.item = item; menu = item.menu; item.menu = nil
         // Switching apps (Cmd-Tab) must dismiss the map like a menu; the transient behavior only watches clicks.
@@ -719,7 +867,7 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
     @objc private func appResigned(_ note: Notification) { if popover.isShown { popover.performClose(nil) } }
     func update(text: String) {
         let next = SpatialSnapshot(text); let changed = next != snapshot
-        snapshot = next; if changed { updateGlyph() }
+        snapshot = next; receivedSnapshot = true; if changed { updateGlyph() }
         content?.mapView.update(next); loadPins()
     }
     private func loadPins() {
@@ -729,10 +877,9 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
         map.pins=Dictionary(uniqueKeysWithValues:decoded.compactMap { key,value in
             guard let slot=Int(key), (0...9).contains(slot) else { return nil }; return (slot,value)
         })
-        let root=URL(fileURLWithPath:pinsPath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        if let data=try? Data(contentsOf:root.appendingPathComponent("config/preferences.json")), let prefs=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any], let gap=prefs["windowGap"] as? Double { map.pinPadding=gap }
+        if let data=try? Data(contentsOf:rootURL.appendingPathComponent("config/preferences.json")), let prefs=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any], let gap=prefs["windowGap"] as? Double { map.pinPadding=gap }
     }
-    func showMoveResult(_ success: Bool) { content?.message = success ? "Column moved" : "Move not confirmed · layout may have changed" }
+    func showMoveResult(_ success: Bool) { content?.message = success ? "Column moved" : "Couldn’t move the column. The layout may have changed." }
     func popoverWillClose(_ notification: Notification) {
         content?.mapView.cancelDrag()
         if let window = item?.button?.window, NSEvent.pressedMouseButtons & 1 != 0, window.frame.contains(NSEvent.mouseLocation) { closedByStatusPressAt = ProcessInfo.processInfo.systemUptime }
@@ -771,34 +918,45 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
         guard let value=sender.representedObject as? [String:String], let action=value["action"] else { return }
         popover.performClose(nil); onViewAction?(action,value["slot"].flatMap(Int.init))
     }
-    private func showViews(in root: NSView) {
+    /// The install root (view-pins.json is work/state/paneru/view-pins.json).
+    private var rootURL: URL { URL(fileURLWithPath:pinsPath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent() }
+    /// The Views menu: one row per View with its live shortcut drawn by AppKit, then Previous View and Undo.
+    func makeViewsMenu() -> NSMenu {
         let data=(try? Data(contentsOf:URL(fileURLWithPath:pinsPath))) ?? Data()
         let pins=(try? JSONSerialization.jsonObject(with:data)) as? [String:[String:Any]] ?? [:]
-        let menu=NSMenu()
+        let chords=spatialShortcutChords(root:rootURL)
+        let menu=NSMenu(title:"Views"); menu.autoenablesItems=false
         let statusPath=URL(fileURLWithPath:pinsPath).deletingLastPathComponent().appendingPathComponent("view-status.json")
         if let data=try? Data(contentsOf:statusPath), let status=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any] {
-            let label=NSMenuItem(title:(status["locked"] as? Bool == true) ? "View pinned · navigate to release" : "View follows navigation",action:nil,keyEquivalent:"")
-            label.isEnabled=false; menu.addItem(label)
-            if let message=status["message"] as? String, !message.isEmpty {
-                let note=NSMenuItem(title:message,action:nil,keyEquivalent:""); note.isEnabled=false; menu.addItem(note)
-            }
-            menu.addItem(.separator())
+            // Only what the user can act on: a locked View, or a problem. "Navigation ready" and "View released" are the engine's chatter.
+            var lines:[String]=[]
+            if status["locked"] as? Bool == true { lines.append("Locked to a View. Navigate to unlock.") }
+            if let message=(status["message"] as? String)?.trimmingCharacters(in:.whitespacesAndNewlines), !message.isEmpty, !Self.routineViewStatus.contains(message) { lines.append(message) }
+            for line in lines { let note=NSMenuItem(title:line,action:nil,keyEquivalent:""); note.isEnabled=false; menu.addItem(note) }
+            if !lines.isEmpty { menu.addItem(.separator()) }
         }
-        func item(_ title: String,_ action: String,_ slot: Int? = nil) -> NSMenuItem {
+        func item(_ title: String,_ action: String,_ slot: Int? = nil,chord id: String) -> NSMenuItem {
             let item=NSMenuItem(title:title,action:#selector(viewAction(_:)),keyEquivalent:"")
             item.target=self; var value=["action":action]; if let slot { value["slot"]=String(slot) }; item.representedObject=value
+            if let chord=chords[id], !chord.isEmpty, let (key,mask)=spatialKeyEquivalent(chord) { item.keyEquivalent=key; item.keyEquivalentModifierMask=mask }
             return item
         }
-        menu.addItem(item("Undo last layout move  ·  Hyper Z","undo-move"))
-        menu.addItem(item("Previous view  ·  Hyper Tab","view-back")); menu.addItem(.separator())
+        menu.addItem(item("Undo Last Layout Move","undo-move",chord:"undo_move"))
+        menu.addItem(item("Previous View","view-back",chord:"view_back")); menu.addItem(.separator())
         for slot in 0...9 {
             let count=(pins[String(slot)]?["columns"] as? [[Any]])?.reduce(0) { $0+$1.count }
-            menu.addItem(item(count.map { "Pin \(slot) · \($0) windows" } ?? "Pin \(slot) · Save current view","view-pin",slot))
+            menu.addItem(item(count.map { "View \(slot) (\(spatialPlural($0,"window")))" } ?? "Save Current View as View \(slot)","view-pin",slot,chord:"view_pin_\(slot)"))
         }
-        let replace=NSMenuItem(title:"Save / replace pin",action:nil,keyEquivalent:""); let slots=NSMenu()
-        for slot in 0...9 { slots.addItem(item("Pin \(slot)  ·  Hyper Shift \(slot)","view-save",slot)) }
+        menu.addItem(.separator())
+        let replace=NSMenuItem(title:"Replace View",action:nil,keyEquivalent:""); let slots=NSMenu(title:"Replace View"); slots.autoenablesItems=false
+        for slot in 0...9 { slots.addItem(item("View \(slot)","view-save",slot,chord:"view_save_\(slot)")) }
         replace.submenu=slots; menu.addItem(replace)
-        menu.popUp(positioning:nil,at:CGPoint(x:max(0,root.bounds.width-216),y:42),in:root)
+        return menu
+    }
+    /// The engine's routine view-status messages: not shown, the HUD already says them.
+    static let routineViewStatus: Set<String> = ["Navigation ready", "View released"]
+    private func showViews(in root: SpatialContentView) {
+        makeViewsMenu().popUp(positioning:nil,at:root.viewsAnchor,in:root)
     }
     @objc private func clicked() {
         guard let button = item?.button else { return }
@@ -812,19 +970,21 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
         if pressClosed { return }
         let screen = button.window?.screen ?? NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
         let available = screen?.visibleFrame.size ?? NSSize(width: 800,height: 600)
-        let root = SpatialContentView.make(snapshot: snapshot, available: available); content = root; loadPins()
+        let root = SpatialContentView.make(snapshot: snapshot, available: available); content = root; loadPins(); checkEngine()
         root.onViews = { [weak self, weak root] in if let root { self?.showViews(in:root) } }
         root.refreshButton.isEnabled = !refreshing
         root.onRefresh = { [weak self, weak root] in
             guard let self, !self.refreshing else { return }
             self.refreshing = true; root?.refreshButton.isEnabled = false
-            root?.message = "Refreshing windows…"
+            root?.message = "Restarting window tracking…"
             self.onRefresh? { [weak self] success in
                 guard let self else { return }
                 self.refreshing = false; self.content?.refreshButton.isEnabled = true
-                self.content?.message = success ? "Windows refreshed" : self.refreshFailure()
+                self.content?.message = success ? "Window tracking restarted" : self.refreshFailure()
+                self.checkEngine()
             }
         }
+        root.onQuit = { [weak self] in self?.popover.performClose(nil) }
         root.onEscape = { [weak self] in self?.popover.performClose(nil) }
         root.onSettings = { [weak self] in self?.popover.performClose(nil); self?.onSettings?() }
         root.mapView.onPin = { [weak self] slot in self?.popover.performClose(nil); self?.onViewAction?("view-pin",slot) }
