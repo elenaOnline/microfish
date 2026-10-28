@@ -459,14 +459,20 @@ final class SettingsWindow: NSWindow {
         toolbar.allowsDisplayModeCustomization = false
         w.toolbar = toolbar
         window = w
-        let saved = UserDefaults.standard.string(forKey: Self.paneKey).flatMap(SettingsPane.init(rawValue:)) ?? .behavior
+        let saved = Self.remembered(Self.paneKey).flatMap(SettingsPane.init(rawValue:)) ?? .behavior
         select(saved, animate: false)
-        if let text = UserDefaults.standard.string(forKey: Self.originKey) {
+        if let text = Self.remembered(Self.originKey) {
             let p = NSPointFromString(text)
             var frame = w.frame; frame.origin = NSPoint(x: p.x, y: p.y - frame.height)
             if NSScreen.screens.contains(where: { $0.visibleFrame.insetBy(dx: -1, dy: -1).contains(NSPoint(x: frame.midX, y: frame.maxY - 10)) }) { w.setFrame(w.constrainFrameRect(frame, to: nil), display: false) } else { w.center() }
         } else { w.center() }
         w.contentView?.layoutSubtreeIfNeeded()
+    }
+
+    /// The helper's defaults domain is its executable name until the build embeds an Info.plist, then
+    /// its bundle identifier; read the old domain once so the window keeps its place across that change.
+    private static func remembered(_ key: String) -> String? {
+        UserDefaults.standard.string(forKey: key) ?? UserDefaults(suiteName: "MicrofishNavigator")?.string(forKey: key)
     }
 
     // MARK: Panes
