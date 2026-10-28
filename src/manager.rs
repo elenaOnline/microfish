@@ -46,7 +46,12 @@ use skylight::{
     SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows,
     SLSWindowQueryWindows,
 };
-pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_ax_window_id};
+#[allow(unused_imports)]
+pub use windows::{Admission, WindowKind};
+pub use windows::{
+    Window, WindowApi, WindowOS, WindowPadding, ax_window_id, log_admission, report_rejection,
+    try_ax_window_id,
+};
 
 #[cfg(test)]
 pub use process::MockProcessApi;

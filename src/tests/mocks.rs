@@ -55,6 +55,9 @@ pub(crate) struct MockWindowData {
     pub(crate) vertical_padding: i32,
     pub(crate) requested_padding: (Option<i32>, Option<i32>),
     pub(crate) child_role: bool,
+    /// Whether `AXSize` can be set: false models Calculator or Surfshark's
+    /// main window, which accept no resize at all.
+    pub(crate) resizable: bool,
     pub(crate) resize_behavior: Option<MockResizeBehavior>,
     /// `AppKit` keeps a title bar on screen: a requested origin below this y
     /// lands here instead, without any notification.
@@ -83,6 +86,7 @@ impl Default for MockWindowData {
             vertical_padding: 0,
             requested_padding: (None, None),
             child_role: false,
+            resizable: true,
             resize_behavior: None,
             lowest_origin_y: None,
             fights_back_to: None,
@@ -107,6 +111,8 @@ struct MockStateInner {
     cursor_position: Origin,
     event_queue: VecDeque<Event>,
     geometry_writes: Vec<WinID>,
+    /// Every size the engine asked for, whether or not the window took it.
+    resize_requests: Vec<(WinID, Size)>,
     /// Windows that are gone but which the app's AX window list still reports,
     /// modelling the lag real apps show right after a window closes.
     stale_window_ids: HashMap<WinID, Pid>,
@@ -151,6 +157,7 @@ impl MockState {
                 cursor_position: Origin::ZERO,
                 event_queue: VecDeque::new(),
                 geometry_writes: Vec::new(),
+                resize_requests: Vec::new(),
                 stale_window_ids: HashMap::new(),
                 unordered_windows: HashSet::new(),
                 background_tabs: HashSet::new(),
@@ -538,7 +545,11 @@ impl MockState {
     fn request_window_size(&self, id: WinID, size: Size) {
         let mut inner = self.inner.force_write();
         inner.geometry_writes.push(id);
+        inner.resize_requests.push((id, size));
         if let Some(window) = inner.windows.get_mut(&id) {
+            if !window.resizable {
+                return;
+            }
             let mut target = size;
             if let Some(behavior) = &mut window.resize_behavior {
                 behavior.cached = Some(IRect::from_corners(
@@ -582,6 +593,16 @@ impl MockState {
             .get(&id)
             .map(|window| window.frame)
             .expect("window exists")
+    }
+
+    /// The sizes asked of window `id` since the last call.
+    pub(crate) fn take_resize_requests(&self, id: WinID) -> Vec<Size> {
+        let mut inner = self.inner.force_write();
+        let (mine, rest) = std::mem::take(&mut inner.resize_requests)
+            .into_iter()
+            .partition(|(window, _)| *window == id);
+        inner.resize_requests = rest;
+        mine.into_iter().map(|(_, size)| size).collect()
     }
 
     pub fn take_geometry_writes(&self) -> Vec<WinID> {
@@ -726,6 +747,23 @@ impl MockState {
                 .map(|w| w.subrole.clone())
                 .unwrap_or_default())
         });
+
+        let s = self.clone();
+        mw.expect_admission().returning(move |config, bundle_id| {
+            let inner = s.inner.force_read();
+            let window = inner.windows.get(&id);
+            crate::manager::Admission::evaluate(
+                window.map_or("AXWindow", |w| &w.role),
+                window.map_or("AXStandardWindow", |w| &w.subrole),
+                window.map(|w| w.title.as_str()),
+                config,
+                bundle_id,
+            )
+        });
+
+        let s = self.clone();
+        mw.expect_resizable()
+            .returning(move || s.inner.force_read().windows.get(&id).map(|w| w.resizable));
 
         let s = self.clone();
         mw.expect_child_role().returning(move || {

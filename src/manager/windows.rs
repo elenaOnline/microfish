@@ -1,8 +1,8 @@
 use accessibility_sys::{
-    AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout, AXValueCreate,
-    AXValueGetValue, kAXFloatingWindowSubrole, kAXPositionAttribute, kAXRaiseAction,
-    kAXSizeAttribute, kAXStandardWindowSubrole, kAXUnknownSubrole, kAXValueTypeCGPoint,
-    kAXValueTypeCGSize, kAXWindowRole,
+    AXUIElementCreateApplication, AXUIElementIsAttributeSettable, AXUIElementRef,
+    AXUIElementSetMessagingTimeout, AXValueCreate, AXValueGetValue, kAXFloatingWindowSubrole,
+    kAXPositionAttribute, kAXRaiseAction, kAXSizeAttribute, kAXStandardWindowSubrole,
+    kAXUnknownSubrole, kAXValueTypeCGPoint, kAXValueTypeCGSize,
 };
 use bevy::ecs::component::Component;
 use bevy::math::IRect;
@@ -21,7 +21,7 @@ use std::thread;
 use std::time::Duration;
 use stdext::function_name;
 use stdext::sync::rw_lock::RwLockExt;
-use tracing::{Level, debug, instrument, trace, warn};
+use tracing::{Level, debug, info, instrument, trace, warn};
 
 use super::skylight::{
     _AXUIElementGetWindow, _SLPSSetFrontProcessWithOptions, AXUIElementCopyAttributeValue,
@@ -69,6 +69,174 @@ fn resize_staging_origin(
     })
 }
 
+/// What an accessibility role and subrole say a window is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowKind {
+    /// `AXStandardWindow`: a document or app window. The only kind that tiles.
+    Standard,
+    /// `AXFloatingWindow`, `AXSystemFloatingWindow`: an inspector, palette, Find, colour or
+    /// font panel. `AppKit` keeps these above their owner and shows and hides them itself.
+    Panel,
+    /// `AXDialog`, `AXSystemDialog`: a standalone dialog or alert. It belongs where `AppKit`
+    /// put it, in front of whatever raised it, not in a row.
+    Dialog,
+    /// `AXSheet`, `AXDrawer`: a child of a window, never a window of its own.
+    Sheet,
+    /// `AXUnknown`: popovers, menus and tooltips.
+    Unknown,
+    /// Anything else, including a window whose subrole is not filled in yet.
+    Other,
+}
+
+impl WindowKind {
+    #[must_use]
+    pub fn classify(role: &str, subrole: &str) -> Self {
+        if matches!(role, "AXSheet" | "AXDrawer") {
+            return Self::Sheet;
+        }
+        match subrole {
+            s if s == kAXStandardWindowSubrole => Self::Standard,
+            s if s == kAXFloatingWindowSubrole || s == "AXSystemFloatingWindow" => Self::Panel,
+            "AXDialog" | "AXSystemDialog" => Self::Dialog,
+            s if s == kAXUnknownSubrole => Self::Unknown,
+            _ => Self::Other,
+        }
+    }
+
+    fn unmanaged_label(self) -> &'static str {
+        match self {
+            Self::Standard => "unmanaged: standard",
+            Self::Panel => "unmanaged: panel",
+            Self::Dialog => "unmanaged: dialog",
+            Self::Sheet => "unmanaged: sheet",
+            Self::Unknown => "unmanaged: popover or menu",
+            Self::Other => "unmanaged: other",
+        }
+    }
+}
+
+/// Whether the engine takes a window on, and what it read to decide.
+///
+/// Only standard windows are managed. A window rule with `manage = true` is the
+/// user's explicit opt-in for an app that misreports its windows, so it overrides
+/// the kind, panels and dialogs included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Admission {
+    pub kind: WindowKind,
+    pub forced: bool,
+    pub role: String,
+    pub subrole: String,
+}
+
+impl Admission {
+    #[must_use]
+    pub fn new(role: &str, subrole: &str, forced: bool) -> Self {
+        Self {
+            kind: WindowKind::classify(role, subrole),
+            forced,
+            role: role.to_string(),
+            subrole: subrole.to_string(),
+        }
+    }
+
+    /// Reads the decision from a window's attributes and the user's window rules.
+    #[must_use]
+    pub fn evaluate(
+        role: &str,
+        subrole: &str,
+        title: Option<&str>,
+        config: &Config,
+        bundle_id: &str,
+    ) -> Self {
+        let forced = title.is_some_and(|title| {
+            config
+                .find_window_properties(title, bundle_id)
+                .iter()
+                .any(|params| params.manage.is_some_and(|manage| manage))
+        });
+        Self::new(role, subrole, forced)
+    }
+
+    #[must_use]
+    pub fn managed(&self) -> bool {
+        self.kind == WindowKind::Standard || self.forced
+    }
+
+    /// The decision as the admission log line words it.
+    #[must_use]
+    pub fn decision(&self, floating: bool) -> &'static str {
+        match (self.managed(), floating, self.kind == WindowKind::Standard) {
+            (true, true, _) => "floating (window rule)",
+            (true, false, true) => "tiled",
+            (true, false, false) => "tiled (window rule manage = true)",
+            (false, ..) => self.kind.unmanaged_label(),
+        }
+    }
+}
+
+/// Window ids whose rejection is already in the log: a window an app keeps
+/// offering (a panel that takes focus on every use) is reported once.
+static REPORTED_REJECTIONS: LazyLock<Mutex<HashSet<WinID>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Whether this is the first time `window_id` is reported as rejected.
+fn first_rejection(window_id: WinID) -> bool {
+    const REPORTED_LIMIT: usize = 4096;
+    let mut reported = REPORTED_REJECTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if reported.len() > REPORTED_LIMIT {
+        reported.clear();
+    }
+    reported.insert(window_id)
+}
+
+/// The one INFO line per window that says what the engine did with it and why:
+/// `admission: window 4711 (Preview) role AXWindow subrole AXFloatingWindow
+/// resizable true: unmanaged: panel`.
+pub fn log_admission(
+    window_id: WinID,
+    app_name: &str,
+    admission: &Admission,
+    resizable: Option<bool>,
+    decision: &str,
+) {
+    info!(
+        "admission: window {window_id} ({app_name}) role {} subrole {} resizable {}: {decision}",
+        admission.role,
+        admission.subrole,
+        resizable.map_or_else(|| "?".to_string(), |resizable| resizable.to_string()),
+    );
+}
+
+/// Reports a rejection the first time a window is seen, `false` when it already was.
+#[must_use]
+pub fn report_rejection(
+    window_id: WinID,
+    app_name: &str,
+    admission: &Admission,
+    resizable: impl FnOnce() -> Option<bool>,
+) -> bool {
+    if !first_rejection(window_id) {
+        return false;
+    }
+    log_admission(
+        window_id,
+        app_name,
+        admission,
+        resizable(),
+        admission.decision(false),
+    );
+    true
+}
+
+/// The localized name of the running application with this pid.
+fn running_app_name(pid: Pid) -> String {
+    objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+        .and_then(|app| app.localizedName())
+        .map_or_else(|| format!("pid {pid}"), |name| name.to_string())
+}
+
 #[derive(Debug)]
 pub enum WindowPadding {
     Vertical(i32),
@@ -88,6 +256,10 @@ pub trait WindowApi: Send + Sync {
     fn child_role(&self) -> Result<bool>;
     fn role(&self) -> Result<String>;
     fn subrole(&self) -> Result<String>;
+    /// What kind of window this is and whether the engine takes it on; see [`Admission`].
+    fn admission(&self, config: &Config, bundle_id: &str) -> Admission;
+    /// Whether the app lets its size be set (`AXSize` is settable), if it answers.
+    fn resizable(&self) -> Option<bool>;
     fn is_minimized(&self) -> bool;
     fn is_full_screen(&self) -> bool;
     fn reposition(&mut self, origin: Origin);
@@ -234,23 +406,19 @@ impl WindowOS {
             title: RwLock::new(None),
         };
 
-        let forced = window.is_forced_manage(config, bundle_id);
-
-        if window.is_unknown() && !forced {
+        let admission = window.admission(config, bundle_id.unwrap_or_default());
+        if !admission.managed() {
+            let _ = report_rejection(
+                id,
+                &window
+                    .pid()
+                    .map_or_else(|_| "?".to_string(), running_app_name),
+                &admission,
+                || window.resizable(),
+            );
             return Err(Error::invalid_window(&format!(
-                "Ignoring AXUnknown window, id: {}, role {}, subrole {}",
-                window.id(),
-                window.role().unwrap_or_default(),
-                window.subrole().unwrap_or_default(),
-            )));
-        }
-
-        if !window.is_real() && !forced {
-            return Err(Error::invalid_window(&format!(
-                "Ignoring non-real window, id: {}, role {}, subrole {}",
-                window.id(),
-                window.role().unwrap_or_default(),
-                window.subrole().unwrap_or_default(),
+                "Ignoring {:?} window, id: {id}, role {}, subrole {}",
+                admission.kind, admission.role, admission.subrole,
             )));
         }
 
@@ -262,43 +430,6 @@ impl WindowOS {
             window.subrole().unwrap_or_default(),
         );
         Ok(window)
-    }
-
-    /// Checks whether a configured window rule forces this window to be managed
-    /// despite having a non-standard role/subrole.
-    fn is_forced_manage(&self, config: &Config, bundle_id: Option<&str>) -> bool {
-        let Ok(title) = self.title() else {
-            return false;
-        };
-        config
-            .find_window_properties(&title, bundle_id.unwrap_or_default())
-            .iter()
-            .any(|params| params.manage.is_some_and(|manage| manage))
-    }
-
-    /// Checks if the window's subrole is "`AXUnknownSubrole`".
-    ///
-    /// # Returns
-    ///
-    /// `true` if the subrole is unknown, `false` otherwise.
-    fn is_unknown(&self) -> bool {
-        self.subrole()
-            .is_ok_and(|subrole| subrole.eq(kAXUnknownSubrole))
-    }
-
-    /// Checks if the window is a "real" window based on its role and subrole.
-    /// It considers standard and floating window subroles as real.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the window is real, `false` otherwise.
-    fn is_real(&self) -> bool {
-        let role = self.role().ok();
-        let subrole = self.subrole().ok();
-
-        subrole.as_deref() == Some(kAXStandardWindowSubrole)
-            || (role.as_deref() == Some(kAXWindowRole)
-                && subrole.as_deref() == Some(kAXFloatingWindowSubrole))
     }
 
     fn app_reference(&self) -> Option<CFRetained<AXUIWrapper>> {
@@ -568,6 +699,29 @@ impl WindowApi for WindowOS {
     /// `Ok(String)` with the window subrole if successful, otherwise `Err(Error)`.
     fn subrole(&self) -> Result<String> {
         self.ax_element.subrole()
+    }
+
+    fn admission(&self, config: &Config, bundle_id: &str) -> Admission {
+        Admission::evaluate(
+            &self.role().unwrap_or_default(),
+            &self.subrole().unwrap_or_default(),
+            self.title().ok().as_deref(),
+            config,
+            bundle_id,
+        )
+    }
+
+    fn resizable(&self) -> Option<bool> {
+        let attribute = CFString::from_static_str(kAXSizeAttribute);
+        let mut settable = 0;
+        let error = unsafe {
+            AXUIElementIsAttributeSettable(
+                self.ax_element.as_ptr(),
+                std::ptr::from_ref(&*attribute).cast(),
+                &raw mut settable,
+            )
+        };
+        (error == 0).then_some(settable != 0)
     }
 
     #[instrument(level = Level::DEBUG, ret)]
