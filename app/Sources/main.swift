@@ -248,7 +248,7 @@ struct HUDStep {
 // always timer-style. Alpha is a pure function of time; the Navigator applies it each fast tick.
 struct HUDPresence {
  enum Kind { case show, row, scroll }
- static let revealDelay=0.15, releaseFade=0.12, slop=2.0
+ static let revealDelay=0.15, releaseFade=0.12, engageTravel=24.0
  var mode="release", delay=1.3, fade=0.22
  var visible=false, timer=false, forced=false, moved=false
  var chord=Chord(), escapedChord: Chord?
@@ -258,15 +258,17 @@ struct HUDPresence {
  static let deferWait=0.15
  var deferred: (kind: Kind, mtime: TimeInterval)?
  var anchor: TimeInterval=0, releaseAt: TimeInterval?
- var origin=CGPoint.zero
+ // Hover engages only by intent: the pointer moved into the HUD from outside, or travelled
+ // engageTravel inside it. A pointer resting (or nudged) where the HUD appeared never holds it.
+ var lastPointer=CGPoint.zero, travel=0.0, wasInside=false
  var fast: Bool { visible || pending != nil }
  func held(_ mods: Chord) -> Bool { !chord.isEmpty && chord.isSubset(of:mods) }
  mutating func present(now: TimeInterval, pointer: CGPoint, timer: Bool, chord: Chord) {
-  if !visible { origin=pointer; moved=false }
+  if !visible { lastPointer=pointer; travel=0; moved=false; wasInside=true }
   visible=true; self.timer=timer; self.chord=chord; anchor=now; releaseAt=nil; forced=false; pending=nil
  }
  mutating func hide() { visible=false; pending=nil; forced=false; releaseAt=nil; moved=false; timer=false; deferred=nil }
- mutating func holdRender(_ kind: Kind, mtime: TimeInterval) { deferred=(kind,deferred?.mtime ?? mtime) }
+ mutating func holdRender(_ kind: Kind, mtime: TimeInterval, now: TimeInterval = .infinity) { deferred=(kind,deferred?.mtime ?? min(mtime,now)) }
  mutating func releaseRender(snapshot: TimeInterval, now: TimeInterval) -> Kind? {
   guard let d=deferred, snapshot > d.mtime || now >= d.mtime+Self.deferWait else { return nil }
   deferred=nil
@@ -278,6 +280,7 @@ struct HUDPresence {
  // Returns the kind to render now, or nil (nothing yet, or a reveal is pending).
  mutating func navigate(_ kind: Kind, chord observed: Chord, mtime: TimeInterval, now: TimeInterval, pointer: CGPoint) -> Kind? {
   let t=kind == .scroll || mode == "timer"
+  if kind == .scroll { deferred=nil }
   if t || visible { present(now:now,pointer:pointer,timer:t,chord:observed.isEmpty && visible ? chord:observed); return kind }
   guard !observed.isEmpty else { return nil }
   let due=pending.flatMap { $0.chord.isSubset(of:observed) ? $0.due:nil } ?? min(mtime,now)+Self.revealDelay
@@ -296,6 +299,12 @@ struct HUDPresence {
   if mode == "release" && !chordHeld { forced=true; timer=false; releaseAt=nil; return false }
   anchor=now; return true
  }
+ // A plain keystroke (no ⌃⌥⌘) means the user moved on: like ⌘Tab, the HUD gets out of the way.
+ // Also catches Karabiner's Caps-tap Escape, too brief for a key-state poll.
+ mutating func typed(mods: Chord, dragging: Bool) -> Bool {
+  guard visible, !dragging, mods.isEmpty else { return false }
+  hide(); return true
+ }
  mutating func escape(mods: Chord, dragging: Bool) -> Bool {
   guard !dragging, visible || pending != nil else { return false }
   let was=visible
@@ -310,8 +319,12 @@ struct HUDPresence {
    else if now >= p.due { present(now:now,pointer:pointer,timer:false,chord:p.chord); deferred=nil; return HUDStep(present:p.kind,alpha:1,fast:true) }
   }
   guard visible else { return HUDStep(alpha:0,fast:pending != nil) }
-  let inside=frame.contains(pointer)
-  if !moved, inside, hypot(pointer.x-origin.x,pointer.y-origin.y) > Self.slop { moved=true }
+  let inside=frame.contains(pointer), step=hypot(pointer.x-lastPointer.x,pointer.y-lastPointer.y)
+  if !moved, inside {
+   if !wasInside && step > 0 { moved=true }
+   travel += step; if travel >= Self.engageTravel { moved=true }
+  }
+  wasInside=inside; lastPointer=pointer
   let busy=pressing || tabDrag
   let hold = busy || (!forced && ((moved && inside) || (timer ? mods.isSuperset(of:[.control,.option]) : held(mods))))
   if hold { anchor=now; releaseAt=nil; return HUDStep(fast:true) }
@@ -561,6 +574,8 @@ final class Navigator: NSObject, NSApplicationDelegate {
  var preferencesModified = Date.distantPast
  var hyperHold = HyperHold()
  var keyWatch = ChordInputWatch()
+ var typedCounter: UInt32 = 0
+ var watchTickQueued = false
  var motion = StripMotion()
  var renderRequested = false
  var lastRenderSig: String?
@@ -696,7 +711,12 @@ final class Navigator: NSObject, NSApplicationDelegate {
   let fd=open(URL(fileURLWithPath:path).deletingLastPathComponent().path,O_EVTONLY)
   guard fd >= 0 else { return }
   let source=DispatchSource.makeFileSystemObjectSource(fileDescriptor:fd,eventMask:.write,queue:.main)
-  source.setEventHandler { [weak self] in self?.tick(forcePoll:true) }
+  // Coalesce bursts (several renames per publish, title storms) to one tick per frame.
+  source.setEventHandler { [weak self] in
+   guard let self, !self.watchTickQueued else { return }
+   self.watchTickQueued=true
+   DispatchQueue.main.asyncAfter(deadline:.now()+1.0/120) { [weak self] in self?.watchTickQueued=false; self?.tick(forcePoll:true) }
+  }
   source.setCancelHandler { close(fd) }
   source.resume(); workWatch=source
  }
@@ -757,7 +777,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
  }
  // The engine writes the intent before it runs the command: hold the render for its snapshot.
  func navigateHUD(_ kind: HUDPresence.Kind, mtime: TimeInterval) {
-  if kind == .scroll { presentHUD(kind) } else { presence.holdRender(kind,mtime:mtime) }
+  if kind == .scroll { presentHUD(kind) } else { presence.holdRender(kind,mtime:mtime,now:Date.timeIntervalSinceReferenceDate) }
  }
  func tick(forcePoll: Bool = false) {
   let date=Date(), now=date.timeIntervalSinceReferenceDate
@@ -812,7 +832,10 @@ final class Navigator: NSObject, NSApplicationDelegate {
   navigationModifiersHeld=navigationHeld
   let exactHyper=isHyperClick(flags)
   let counter={ CGEventSource.counterForEventType(.combinedSessionState,eventType:$0) }
-  let otherKey=keyWatch.interrupted(exact:exactHyper,key:counter(.keyDown),leftDown:counter(.leftMouseDown),rightDown:counter(.rightMouseDown),otherDown:counter(.otherMouseDown),buttonsDown:NSEvent.pressedMouseButtons != 0)
+  let keys=counter(.keyDown)
+  if keys != typedCounter, presence.typed(mods:mods,dragging:pressingCard || tabDragRevealed) { hide() }
+  typedCounter=keys
+  let otherKey=keyWatch.interrupted(exact:exactHyper,key:keys,leftDown:counter(.leftMouseDown),rightDown:counter(.rightMouseDown),otherDown:counter(.otherMouseDown),buttonsDown:NSEvent.pressedMouseButtons != 0)
   let reveal=hyperHold.update(exactHyper:exactHyper && preferences.showOnHyper,otherKey:otherKey,now:now,delay:preferences.hyperDelay)
   // Physical Escape (edge) dismisses at once, unless a card press or drag owns it.
   let escapeDown=CGEventSource.keyState(.combinedSessionState,key:53)
@@ -961,8 +984,12 @@ final class Navigator: NSObject, NSApplicationDelegate {
  }
  func tabOutsideDrop(source: Int, point: CGPoint, commit: Bool) -> Bool {
   if !tabDragRevealed, !commit {
-   tabDragRevealed=true; rowNavigation=false; scrollNavigation=false
-   presence.present(now:Date.timeIntervalSinceReferenceDate,pointer:NSEvent.mouseLocation,timer:preferences.hide == "timer",chord:[])
+   tabDragRevealed=true
+   // An already-running session (e.g. Hyper held) keeps its chord; the drag only adds a hold.
+   if !presence.visible {
+    rowNavigation=false; scrollNavigation=false
+    presence.present(now:Date.timeIntervalSinceReferenceDate,pointer:NSEvent.mouseLocation,timer:preferences.hide == "timer",chord:[])
+   }
    render(previous)
   }
   let drop=panel.isVisible ? minimapTabDrop(source:source,point:point,targets:minimapDropTargets,entries:snapshot.entries) : nil
