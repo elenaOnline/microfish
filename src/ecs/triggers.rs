@@ -19,7 +19,7 @@ use super::{
     Timeout, Unmanaged,
 };
 use crate::config::Config;
-use crate::ecs::focus::FocusHistory;
+use crate::ecs::focus::{FocusHistory, KeyboardHold};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
@@ -111,6 +111,7 @@ pub(super) fn front_switched_trigger(
     applications: Query<&Application>,
     window_manager: Res<WindowManager>,
     mut config: GlobalState,
+    mut hold: ResMut<KeyboardHold>,
     mut commands: Commands,
 ) {
     const FRONT_SWITCH_RETRY_SEC: u64 = 2;
@@ -118,6 +119,10 @@ pub(super) fn front_switched_trigger(
         let Event::ApplicationFrontSwitched { psn } = event else {
             continue;
         };
+
+        // Before the process lookup: Spotlight, Raycast and the engine itself
+        // are not managed processes, and still end (or confirm) the hold.
+        hold.front_switched(*psn);
 
         let Some((BProcess(process), children)) =
             processes.iter().find(|process| &process.0.psn() == psn)

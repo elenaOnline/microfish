@@ -330,7 +330,7 @@ pub fn try_ax_window_id(element_ref: AXUIElementRef) -> Option<WinID> {
 
 // const CPS_ALL_WINDOWS: u32 = 0x100;
 const CPS_USER_GENERATED: u32 = 0x200;
-// const CPS_NO_WINDOWS: u32 = 0x400;
+pub(super) const CPS_NO_WINDOWS: u32 = 0x400;
 
 #[derive(Debug)]
 pub struct WindowOS {

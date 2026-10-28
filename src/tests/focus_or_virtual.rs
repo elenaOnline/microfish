@@ -134,7 +134,10 @@ fn test_plain_virtual_south_switches_workspace_even_with_a_stack_sibling() {
     TestHarness::new()
         .with_windows(2)
         .on_iteration(6, |world, _state| {
-            assert_focused!(world, 0);
+            // Row 1 is empty, so the engine holds the keyboard: window 0 is
+            // parked and no longer carries the focus marker.
+            let mut focused = world.query_filtered::<(), With<crate::ecs::FocusedMarker>>();
+            assert_eq!(focused.iter(world).count(), 0);
             assert_eq!(
                 active_virtual_index(world),
                 1,

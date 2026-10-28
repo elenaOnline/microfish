@@ -33,6 +33,7 @@ pub use workspace::WorkspaceObserver;
 
 pub(crate) mod app_launcher;
 mod display;
+pub(crate) mod hold;
 pub(crate) mod input;
 mod mission_control;
 pub mod notify;
@@ -392,6 +393,13 @@ impl PlatformCallbacks {
                 // Synthetic, only meant to end the wait above; must not count
                 // as dispatched or an idle wake-up would trigger `updateWindows`.
                 if EventLoopWaker::is_wake_event(&event) {
+                    continue;
+                }
+
+                // Only while the engine holds the keyboard for an empty row
+                // does it receive keys; those are answered here, not by Cocoa.
+                if hold::handle_event(&event) {
+                    dispatched = true;
                     continue;
                 }
 

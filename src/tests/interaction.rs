@@ -632,7 +632,9 @@ fn test_external_focus_reactivates_hidden_virtual_strip_when_marker_is_stale() {
         Event::Command {
             command: Command::Window(Operation::VirtualNumber(1)),
         },
-        Event::WindowFocused { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
         Event::Command {
             command: Command::PrintState,
         },
@@ -640,14 +642,18 @@ fn test_external_focus_reactivates_hidden_virtual_strip_when_marker_is_stale() {
 
     TestHarness::new()
         .with_windows(1)
-        .on_iteration(1, |world, _state| {
+        .on_iteration(1, |world, state| {
             let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
             let active = query
                 .iter(world)
                 .find_map(|(strip, active)| active.then_some(strip.virtual_index))
                 .expect("an active virtual strip");
             assert_eq!(active, 1);
-            assert_focused!(world, 0);
+            // The empty row holds the keyboard, so the parked window has no
+            // focus marker; the OS then focuses it from outside (Cmd-Tab).
+            let mut focused = world.query_filtered::<(), With<FocusedMarker>>();
+            assert_eq!(focused.iter(world).count(), 0);
+            state.focus_window(0);
         })
         .on_iteration(3, |world, _state| {
             let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
@@ -656,7 +662,13 @@ fn test_external_focus_reactivates_hidden_virtual_strip_when_marker_is_stale() {
                 .find_map(|(strip, active)| active.then_some(strip.virtual_index))
                 .expect("an active virtual strip");
             assert_eq!(active, 0);
-            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            // A real external focus (the marker is no longer stale) places the
+            // window the way any focus arrival does: on screen, below the
+            // menu bar.
+            let mut windows = world.query::<&Window>();
+            let frame = windows.iter(world).next().expect("window 0").frame();
+            assert!(frame.min.x >= 0 && frame.max.x <= TEST_DISPLAY_WIDTH);
+            assert_eq!(frame.min.y, TEST_MENUBAR_HEIGHT);
             assert_focused!(world, 0);
         })
         .run(commands);
