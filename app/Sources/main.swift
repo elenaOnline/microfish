@@ -223,13 +223,13 @@ struct HUDScrollState {
  var lanes: [Int:CGFloat] = [:]
  var fromTop: CGFloat?
 }
-struct Chord: OptionSet {
+struct HUDChord: OptionSet {
  let rawValue: Int
- static let control=Chord(rawValue:1), option=Chord(rawValue:2), command=Chord(rawValue:4)
- static let hyper: Chord = [.control,.option,.command]
+ static let control=HUDChord(rawValue:1), option=HUDChord(rawValue:2), command=HUDChord(rawValue:4)
+ static let hyper: HUDChord = [.control,.option,.command]
  init(rawValue: Int) { self.rawValue=rawValue }
  init(_ flags: NSEvent.ModifierFlags) {
-  var c=Chord()
+  var c=HUDChord()
   if flags.contains(.control) { c.insert(.control) }
   if flags.contains(.option) { c.insert(.option) }
   if flags.contains(.command) { c.insert(.command) }
@@ -251,8 +251,8 @@ struct HUDPresence {
  static let revealDelay=0.15, releaseFade=0.12, engageTravel=24.0
  var mode="release", delay=1.3, fade=0.22
  var visible=false, timer=false, forced=false, moved=false
- var chord=Chord(), escapedChord: Chord?
- var pending: (due: TimeInterval, kind: Kind, chord: Chord)?
+ var chord=HUDChord(), escapedChord: HUDChord?
+ var pending: (due: TimeInterval, kind: Kind, chord: HUDChord)?
  // The engine writes show/row intents before it runs the command: render once a newer snapshot
  // lands, or deferWait after the intent, whichever is first. The earliest intent keeps the deadline.
  static let deferWait=0.15
@@ -262,8 +262,8 @@ struct HUDPresence {
  // engageTravel inside it. A pointer resting (or nudged) where the HUD appeared never holds it.
  var lastPointer=CGPoint.zero, travel=0.0, wasInside=false
  var fast: Bool { visible || pending != nil }
- func held(_ mods: Chord) -> Bool { !chord.isEmpty && chord.isSubset(of:mods) }
- mutating func present(now: TimeInterval, pointer: CGPoint, timer: Bool, chord: Chord) {
+ func held(_ mods: HUDChord) -> Bool { !chord.isEmpty && chord.isSubset(of:mods) }
+ mutating func present(now: TimeInterval, pointer: CGPoint, timer: Bool, chord: HUDChord) {
   if !visible { lastPointer=pointer; travel=0; moved=false; wasInside=true }
   visible=true; self.timer=timer; self.chord=chord; anchor=now; releaseAt=nil; forced=false; pending=nil
  }
@@ -278,7 +278,7 @@ struct HUDPresence {
  // Ongoing strip motion counts as activity for a scroll (timer) session, like a hold.
  mutating func motion(now: TimeInterval) { if visible && timer { anchor=now; releaseAt=nil } }
  // Returns the kind to render now, or nil (nothing yet, or a reveal is pending).
- mutating func navigate(_ kind: Kind, chord observed: Chord, mtime: TimeInterval, now: TimeInterval, pointer: CGPoint) -> Kind? {
+ mutating func navigate(_ kind: Kind, chord observed: HUDChord, mtime: TimeInterval, now: TimeInterval, pointer: CGPoint) -> Kind? {
   let t=kind == .scroll || mode == "timer"
   if kind == .scroll { deferred=nil }
   if t || visible { present(now:now,pointer:pointer,timer:t,chord:observed.isEmpty && visible ? chord:observed); return kind }
@@ -287,7 +287,7 @@ struct HUDPresence {
   pending=(due,kind,observed)
   return nil
  }
- mutating func bareHoldReveal(now: TimeInterval, mods: Chord, pointer: CGPoint) -> Bool {
+ mutating func bareHoldReveal(now: TimeInterval, mods: HUDChord, pointer: CGPoint) -> Bool {
   if visible { anchor=now; return false }
   if let e=escapedChord, e.isSubset(of:mods) { return false }
   present(now:now,pointer:pointer,timer:mode == "timer",chord:mods); deferred=nil
@@ -301,18 +301,18 @@ struct HUDPresence {
  }
  // A plain keystroke (no ⌃⌥⌘) means the user moved on: like ⌘Tab, the HUD gets out of the way.
  // Also catches Karabiner's Caps-tap Escape, too brief for a key-state poll.
- mutating func typed(mods: Chord, dragging: Bool) -> Bool {
+ mutating func typed(mods: HUDChord, dragging: Bool) -> Bool {
   guard visible, !dragging, mods.isEmpty else { return false }
   hide(); return true
  }
- mutating func escape(mods: Chord, dragging: Bool) -> Bool {
+ mutating func escape(mods: HUDChord, dragging: Bool) -> Bool {
   guard !dragging, visible || pending != nil else { return false }
   let was=visible
   hide()
   if !mods.isEmpty { escapedChord=mods }
   return was
  }
- mutating func step(now: TimeInterval, mods: Chord, pointer: CGPoint, frame: CGRect, pressing: Bool, tabDrag: Bool) -> HUDStep {
+ mutating func step(now: TimeInterval, mods: HUDChord, pointer: CGPoint, frame: CGRect, pressing: Bool, tabDrag: Bool) -> HUDStep {
   if let e=escapedChord, !e.isSubset(of:mods) { escapedChord=nil }
   if let p=pending {
    if !p.chord.isSubset(of:mods) { pending=nil }
@@ -807,7 +807,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   } else { motion.reset() }
   tabBars.update(snapshot, windows: liveWindows)
   let flags=NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
-  let mods=Chord(flags), pointer=NSEvent.mouseLocation
+  let mods=HUDChord(flags), pointer=NSEvent.mouseLocation
   let intentPath=path.replacingOccurrences(of:".tsv",with:".intent")
   if pollSnapshot || fastMode, let attrs=try? FileManager.default.attributesOfItem(atPath:intentPath), let stamp=attrs[.modificationDate] as? Date, stamp != intentModified {
    intentModified=stamp
@@ -883,7 +883,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
  }
  func focusWindow(_ id: Int, updateMinimap: Bool = true) {
   if updateMinimap {
-   let mods=Chord(NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask))
+   let mods=HUDChord(NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask))
    if presence.clickCommitted(chordHeld:presence.held(mods),now:Date.timeIntervalSinceReferenceDate) {
     scrollNavigation = false
     rowNavigation = false
