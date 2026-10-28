@@ -474,6 +474,9 @@ impl WindowResolver {
                 for pending in rx {
                     match ax_window_id(pending.element.as_ptr()) {
                         Ok(window_id) => {
+                            if matches!(pending.kind, WindowNotification::Focused) {
+                                crate::focus_trace::os_focus(window_id);
+                            }
                             _ = events.send(pending.kind.into_event(window_id));
                         }
                         Err(err) => debug!("naming window for {:?}: {err}", pending.kind),
@@ -540,6 +543,9 @@ impl ObserverContext {
             return;
         };
 
+        if matches!(kind, WindowNotification::Focused) {
+            crate::focus_trace::mark_once("ax_notify");
+        }
         _ = self.resolver.send(PendingNotification { kind, element });
     }
 

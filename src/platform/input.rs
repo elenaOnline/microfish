@@ -645,10 +645,15 @@ impl InputHandler {
                 self.config.find_keybind(keycode, mask)
             })
             .and_then(|command| {
-                events
+                // Stage zero of a keyboard focus; dropped silently if this
+                // binding turns out not to move the focus.
+                crate::focus_trace::begin_key();
+                let sent = events
                     .send(Event::Command { command })
                     .inspect_err(|err| error!("Error sending command: {err}"))
-                    .ok()
+                    .ok();
+                crate::focus_trace::mark("queued");
+                sent
             })
             .is_some()
     }

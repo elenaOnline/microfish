@@ -212,6 +212,13 @@ pub enum Event {
     /// `paneru.windows` handler is given inside the daemon.
     WindowSetQuery { respond_to: Reply },
 
+    /// The navigator asked for a tiled window to be focused, and wants to be
+    /// told when the engine has it focused.
+    FocusRequest {
+        window: WinID,
+        respond_to: Reply,
+    },
+
     RowDrop {
         drop: crate::types::wire::RowDrop,
         respond_to: Reply,

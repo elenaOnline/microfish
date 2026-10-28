@@ -393,6 +393,7 @@ impl PlatformCallbacks {
                 // Synthetic, only meant to end the wait above; must not count
                 // as dispatched or an idle wake-up would trigger `updateWindows`.
                 if EventLoopWaker::is_wake_event(&event) {
+                    crate::focus_trace::mark_once("woke");
                     continue;
                 }
 

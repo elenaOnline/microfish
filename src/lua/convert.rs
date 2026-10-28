@@ -255,6 +255,7 @@ impl TryFrom<&Event> for LuaEvent {
             | Event::Command { .. }
             | Event::StateQuery { .. }
             | Event::WindowSetQuery { .. }
+            | Event::FocusRequest { .. }
             | Event::LayoutDrop { .. }
             | Event::RowDrop { .. }
             | Event::StateSubscribe { .. }

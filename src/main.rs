@@ -16,6 +16,7 @@ mod config;
 mod ecs;
 mod errors;
 mod events;
+mod focus_trace;
 #[cfg(feature = "lua")]
 mod lua;
 mod manager;

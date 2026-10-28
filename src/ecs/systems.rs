@@ -787,7 +787,17 @@ pub(crate) fn pump_events(
 
         // Polled before any timed wait: the Cocoa pump above already did this
         // frame's sleeping, so a quiet channel used to cost another millisecond.
+        //
+        // Once something has been taken, an empty channel ends the pump at once
+        // rather than waiting another millisecond for company: a timed wait on
+        // a semaphore is rarely shorter than 1.2 ms here, and it sat in front
+        // of every system for every request, click and key (a sampled engine
+        // spent ~1.5 ms per request in it). Producers push before they wake the
+        // pump, so anything not in the channel yet will wake the next pass.
         let received = match incoming_events.try_recv() {
+            Err(TryRecvError::Empty) if !received_events.is_empty() || pending_mouse.is_some() => {
+                Err(RecvTimeoutError::Timeout)
+            }
             Err(TryRecvError::Empty) => incoming_events.recv_timeout(Duration::from_millis(1)),
             Err(TryRecvError::Disconnected) => Err(RecvTimeoutError::Disconnected),
             Ok(event) => Ok(event),

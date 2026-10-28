@@ -335,12 +335,12 @@ fn reload(
                 let _ = to_main.try_send(FromLua::ConfigChanged);
             }
             info!("Reloaded Lua script {}", path.display());
-            flash(to_main, "Lua reloaded".to_string(), 1.5);
+            flash(to_main, "Settings reloaded".to_string(), 1.5);
             Some(runtime)
         }
         Err(err) => {
             error!("Reloading Lua script '{}': {err}", path.display());
-            flash(to_main, format!("Lua error: {err}"), 4.0);
+            flash(to_main, format!("Couldn’t load settings: {err}"), 4.0);
             None
         }
     }
@@ -803,7 +803,7 @@ mod tests {
         std::fs::write(&script, "this is not lua ===").unwrap();
         worker.send_reload(script.clone());
         assert!(
-            next_flash(&worker, "the reload error").starts_with("Lua error:"),
+            next_flash(&worker, "the reload error").starts_with("Couldn’t load settings:"),
             "a broken script should be reported"
         );
 
@@ -833,7 +833,7 @@ mod tests {
         )
         .unwrap();
         worker.send_reload(script.clone());
-        assert_eq!(next_flash(&worker, "the reload notice"), "Lua reloaded");
+        assert_eq!(next_flash(&worker, "the reload notice"), "Settings reloaded");
         assert!(
             worker.has_event_handlers(),
             "the reloaded script's handler should be visible to the fast path"
@@ -1034,7 +1034,7 @@ mod tests {
         else {
             panic!("expected the reload notice");
         };
-        assert_eq!(message, "Lua reloaded");
+        assert_eq!(message, "Settings reloaded");
 
         worker.send_binds(vec![1]);
         let FromLua::Flash { message, .. } = serve_until_effect(&worker, "the value read back")

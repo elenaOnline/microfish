@@ -1,7 +1,7 @@
 //! Small, window-addressed client for the native navigator. Never controls AX directly.
 use paneru::types::windowset::{LayoutOp, WindowSet};
 use paneru::types::wire::{self, Request, Response, SendPort, Sender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -53,34 +53,23 @@ async fn snapshot(sender: &Sender<Request>) -> Result<WindowSet> {
 
 async fn run(execute: bool, id: i32) -> Result<()> {
     let sender = wire::connect::<Request>(&wire::service_name())?;
-    let set = snapshot(&sender).await?;
-    if !focus_available(&set, id) {
-        return Err("window is no longer tiled on this desktop".into());
-    }
     if !execute {
+        let set = snapshot(&sender).await?;
+        if !focus_available(&set, id) {
+            return Err("window is no longer tiled on this desktop".into());
+        }
         println!("target is available; no focus command sent");
         return Ok(());
     }
-    sender
-        .send(&Request::WindowSetApply(vec![LayoutOp::Focus(id)]))
-        .await?;
-    // Wait for confirmed engine focus rather than reporting transport success.
-    // The engine atomically requests reveal for the same ID. No follow-up acts on
-    // whichever window
-    // happened to be focused before the click was handled.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let fresh = snapshot(&sender).await?;
-        if !focus_available(&fresh, id) {
-            return Err("target disappeared while focusing".into());
-        }
-        if fresh.focused() == Some(id) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("window did not accept focus".into());
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    // One round trip: the engine checks that the target is still tiled on this
+    // desktop, focuses it, and answers when it holds the focus (or after two
+    // seconds without). The snapshot before and the polling after that this
+    // replaced cost the main thread a window-set read each, and the first one
+    // came before the focus.
+    match sender.call(&Request::FocusWindow(id)).await? {
+        Response::Focused => Ok(()),
+        Response::Error(message) => Err(message.into()),
+        _ => Err("unexpected focus response".into()),
     }
 }
 

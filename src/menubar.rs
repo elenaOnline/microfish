@@ -184,10 +184,10 @@ impl MenuBarManager {
     fn rebuild_accessibility_menu(&mut self) {
         self.menu.removeAllItems();
 
-        let status = self.add_item("Paneru — Accessibility Required", None);
+        let status = self.add_item("Microfish Needs Permission", None);
         status.setEnabled(false);
 
-        let hint = self.add_item("Grant access; Paneru will start automatically", None);
+        let hint = self.add_item("Turn on Microfish in System Settings; it starts automatically", None);
         hint.setEnabled(false);
 
         self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
@@ -196,12 +196,12 @@ impl MenuBarManager {
             Some(sel!(showAccessibilityInstructions:)),
         );
         self.add_item(
-            "Open Accessibility Settings…",
+            "Open System Settings…",
             Some(sel!(openAccessibilitySettings:)),
         );
 
         self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
-        self.add_item("Quit Paneru", Some(sel!(quitPaneru:)));
+        self.add_item("Quit Microfish", Some(sel!(quitPaneru:)));
     }
 
     pub fn update(
@@ -254,11 +254,11 @@ impl MenuBarManager {
         self.manage_item = None;
         self.copy_rule_item = None;
 
-        let status = self.add_item("Paneru — Running", None);
+        let status = self.add_item("Microfish", None);
         status.setEnabled(false);
         self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
 
-        let width_header = self.add_item("Window width", None);
+        let width_header = self.add_item("Window Width", None);
         width_header.setEnabled(false);
         for &percentage in widths {
             let item = self.add_item(&format!("{percentage}%"), Some(sel!(setWidth:)));
@@ -277,7 +277,7 @@ impl MenuBarManager {
         self.copy_rule_item = Some(self.add_item("Copy Window Rule", Some(sel!(copyWindowRule:))));
 
         self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
-        self.add_item("Quit Paneru", Some(sel!(quitPaneru:)));
+        self.add_item("Quit Microfish", Some(sel!(quitPaneru:)));
         self.configured_widths = widths.to_vec();
     }
 
@@ -471,7 +471,7 @@ impl MenuBarManager {
         // A button starts out at `NSNoImage`, which draws its (empty) title and
         // nothing else: the item goes blank without this.
         button.setImagePosition(NSCellImagePosition::ImageOnly);
-        button.setToolTip(Some(&NSString::from_str("Paneru window manager")));
+        button.setToolTip(Some(&NSString::from_str("Microfish")));
         self.status_item.setLength(NSVariableStatusItemLength);
         true
     }

@@ -68,6 +68,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
         crate::ecs::layout_ops::apply_layout_ops.after(crate::ecs::view_history::observe),
     );
 
+    crate::ecs::focus_request::register(app);
     query::register_query_commands(app);
     // Empty store so the mock harness and saveless runs still have one to
     // answer from; the real app overwrites it from disk.
@@ -354,6 +355,7 @@ fn request_verified_focus(
     row_switch: bool,
     commands: &mut Commands,
 ) {
+    crate::focus_trace::mark("kb_request");
     commands.trigger(crate::ecs::focus::KeyboardFocusRequest {
         target: entity,
         source: focused_entity,
@@ -380,6 +382,7 @@ fn command_move_focus(
     else {
         return;
     };
+    crate::focus_trace::mark("kb_handler");
 
     let active_strip = active_display.active_strip();
 
