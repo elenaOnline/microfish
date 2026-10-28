@@ -1,6 +1,6 @@
 // Headless tests: folder tabs select on mouse-down. Appended after src/main.swift (NAVIGATOR_TESTS) by tests/run.py.
 // Real TabBars.update path with panels never ordered (ordersPanels=false); synthetic NSEvents; no window is shown.
-// The overflow menu is never opened (releasing on "..." would pop a menu), so overflow is checked on press and cancel only.
+// The overflow menu is never opened (pressing "..." would pop a menu), so overflow is checked by its wiring only.
 do {
  var n = 0
  func ok(_ c: @autoclosure () -> Bool, _ m: String) { precondition(c(), "press: " + m); n += 1 }
@@ -89,14 +89,14 @@ do {
   let d = use(r.card(7000)); d.mouseDown(with: ev(.leftMouseDown, mid)); d.cancelInteraction(); d.mouseUp(with: ev(.leftMouseUp, mid))
   ok(r.focused == [7001, 7000], "press then cancel then release: one focus, from the press")
  }
- // 4. Overflow: the "..." card keeps its menu on release; no select on press; nothing focused.
+ // 4. Overflow: the "..." card is a pull-down, so it opens its menu on press (like a native pop-up button).
+ // The menu is never opened here (tracking is modal), so this checks the wiring and that nothing is focused.
  do {
   let r = Rig(); r.bars.update(snap(8), windows: live(8, narrow))
   let more0 = (r.bars.stripView(column: 1)?.subviews.compactMap { $0 as? ColumnCard } ?? []).first { $0.entryID == 0 && $0.diagnosticName.hasPrefix("tab overflow") }!
   let more = use(more0)
-  ok(!more.selectsOnPress && more.onSelect == nil && more.onClick != nil, "overflow card is not a select-on-press card")
-  more.mouseDown(with: ev(.leftMouseDown, mid))
-  ok(r.focused.isEmpty, "pressing the overflow control focuses nothing")
+  ok(more.selectsOnPress && more.onSelect != nil && more.onClick != nil, "overflow card opens its menu on press (and keeps the release/VoiceOver path)")
+  ok(r.focused.isEmpty, "nothing focused by the overflow control")
   more.cancelInteraction()
   ok(r.focused.isEmpty, "cancelled overflow press focuses nothing")
   // Menu selection path is unchanged: selectMenu focuses the item's tag.

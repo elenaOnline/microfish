@@ -290,7 +290,7 @@ func tabDropExposed(point: CGPoint, panelID: Int, members: Set<Int>, windows: [L
 }
 // The tab cards are drawn views with no native accessibility. Expose them to
 // VoiceOver / Voice Control as the standard tab pattern: a tab group of radio
-// buttons whose value is the selection and whose press focuses the window.
+// buttons (announced as "tab") whose value is the selection and whose press focuses the window.
 final class TabAccessibilityElement: NSAccessibilityElement {
  var onPress: (() -> Void)?
  override func accessibilityPerformPress() -> Bool {
@@ -298,14 +298,37 @@ final class TabAccessibilityElement: NSAccessibilityElement {
   onPress(); return true
  }
 }
+// A tab narrower than this much label drops its title and centres the icon, as Safari and Finder do. The tooltip and
+// the VoiceOver label keep the name.
+let tabMinLabelWidth: CGFloat = 28
+func tabShowsTitle(labelWidth: CGFloat) -> Bool { labelWidth >= tabMinLabelWidth }
+/// "Safari — Inbox", or just "Safari" when the window has no title.
+func tabDisplayName(app: String, title: String) -> String { title.isEmpty ? app : "\(app) — \(title)" }
+func middleTruncated(_ text: String, limit: Int) -> String {
+ guard limit > 1, text.count > limit else { return text }
+ let keep = limit - 1, head = (keep + 1) / 2, tail = keep / 2
+ return String(text.prefix(head)) + "…" + String(text.suffix(tail))
+}
+/// One line of the "More tabs" menu: the app alone for an untitled window, a long title cut in the middle.
+func tabOverflowMenuTitle(app: String, title: String) -> String {
+ tabDisplayName(app: app, title: middleTruncated(title, limit: 48))
+}
+func tabStripAccessibilityLabel(selectedName: String, count: Int) -> String {
+ "Tabs: \(middleTruncated(selectedName, limit: 40)), \(count) windows"
+}
+struct TabAccessibilityAction {
+ let name: String
+ let run: () -> Void
+}
 struct TabAccessibilityItem {
  let card: NSView
  let label: String
  let help: String
  let selected: Bool?   // nil: a plain button (overflow), not a tab
  let press: () -> Void
+ var actions: [TabAccessibilityAction] = []   // what dragging does, for people who cannot drag
 }
-func installTabAccessibility(strip: NSView, items: [TabAccessibilityItem], vertical: Bool) {
+func installTabAccessibility(strip: NSView, items: [TabAccessibilityItem], vertical: Bool, label stripLabel: String = "Window tabs") {
  var elements: [TabAccessibilityElement] = []
  for item in items {
   item.card.setAccessibilityElement(false)
@@ -313,6 +336,12 @@ func installTabAccessibility(strip: NSView, items: [TabAccessibilityItem], verti
   let element = TabAccessibilityElement()
   element.setAccessibilityParent(strip)
   element.setAccessibilityRole(item.selected == nil ? .button : .radioButton)
+  if item.selected != nil { element.setAccessibilityRoleDescription("tab") }
+  if !item.actions.isEmpty {
+   element.setAccessibilityCustomActions(item.actions.map { action in
+    NSAccessibilityCustomAction(name: action.name) { action.run(); return true }
+   })
+  }
   element.setAccessibilityLabel(item.label)
   element.setAccessibilityHelp(item.help)
   element.setAccessibilityFrameInParentSpace(item.card.frame)
@@ -323,7 +352,7 @@ func installTabAccessibility(strip: NSView, items: [TabAccessibilityItem], verti
  }
  strip.setAccessibilityElement(true)
  strip.setAccessibilityRole(.tabGroup)
- strip.setAccessibilityLabel("Window tabs")
+ strip.setAccessibilityLabel(stripLabel)
  strip.setAccessibilityOrientation(vertical ? .vertical:.horizontal)
  strip.setAccessibilityChildren(elements)
  strip.setAccessibilityTabs(elements.filter { $0.accessibilityRole() == .radioButton })
@@ -375,6 +404,8 @@ private final class TabBarSurface {
   strip.layer?.backgroundColor = NSColor.clear.cgColor
   clip.addSubview(strip)
   panel.isExcludedFromWindowsMenu = true; seamPanel.isExcludedFromWindowsMenu = true
+  // Hide (⌘H) and Hide Others must never take the tab bars away from the windows they belong to.
+  panel.canHide = false; seamPanel.canHide = false
   panel.setAccessibilityLabel("Window tabs")
   seamPanel.animationBehavior = .none;seamPanel.hasShadow=false;seamPanel.level = .normal
   seamPanel.isFloatingPanel=false;seamPanel.isOpaque=false;seamPanel.backgroundColor = .clear
@@ -521,8 +552,8 @@ final class TabBars: NSObject {
       self?.focus?(entry.id)
      }
      let displayTitle=aliases[entry.bundle+"\t"+entry.title] ?? entry.title
-     let help = "Drag between tabs to regroup, or to a minimap gap to separate."
-     card.toolTip = "\(displayTitle.isEmpty ? entry.app : "\(entry.app) — \(displayTitle)")\n\(help)"
+     let name = tabDisplayName(app:entry.app,title:displayTitle)
+     card.toolTip = "\(name)\nDrag to reorder, or drop it in the Minimap to move it to another Column."
      card.wantsLayer = true
      let active = selection == entry.id
      if side && !active {card.setFrameSize(NSSize(width:40,height:card.frame.height))}
@@ -540,12 +571,31 @@ final class TabBars: NSObject {
      }
      let iconSize:CGFloat=side ? 22:16
      let contentY:CGFloat=side ? (card.bounds.height-iconSize)/2 : (style == "classic" || style == "folder-compact") ? (frame.height-16)/2 : (height >= 34 ? 8.25:6.25)
-     let icon = card.takeIcon(frame:CGRect(x:side ? 9:15,y:contentY,width:iconSize,height:iconSize))
+     // Below ~28 pt of label the title would be a clipped letter: show the icon alone, centred.
+     let labelWidth = style == "classic" ? width-39 : width-51
+     let showsTitle = !side && tabShowsTitle(labelWidth:labelWidth)
+     let iconX = side ? 9 : (showsTitle ? 15 : ((width-iconSize)/2*2).rounded()/2)
+     let icon = card.takeIcon(frame:CGRect(x:iconX,y:contentY,width:iconSize,height:iconSize))
      icon.image=icons[entry.bundle] ?? NSImage(named:NSImage.applicationIconName);card.addSubview(icon)
      let tabLabel = displayTitle.isEmpty ? entry.app:displayTitle
      card.setAccessibilityLabel(tabLabel)
-     accessibilityItems.append(TabAccessibilityItem(card:card,label:tabLabel,help:help,selected:active,press:{ [weak self] in self?.focus?(entry.id) }))
-     if !side {
+     // What a drag does, as actions: reorder within the group, or take the tab out into its own Column.
+     var actions: [TabAccessibilityAction] = []
+     if let at = members.firstIndex(where: { $0.id == entry.id }) {
+      if at > 0 {
+       let previous = members[at-1].id
+       actions.append(TabAccessibilityAction(name:side ? "Move Up":"Move Left",run:{ [weak self] in self?.reorder?(StripDrop(kind:.tab,source:entry.id,target:previous,before:true)) }))
+      }
+      if at < members.count-1 {
+       let next = members[at+1].id
+       actions.append(TabAccessibilityAction(name:side ? "Move Down":"Move Right",run:{ [weak self] in self?.reorder?(StripDrop(kind:.tab,source:entry.id,target:next,before:false)) }))
+      }
+      if let other = members.first(where: { $0.id != entry.id }) {
+       actions.append(TabAccessibilityAction(name:"Move to New Column",run:{ [weak self] in self?.reorder?(StripDrop(kind:.detach,source:entry.id,target:other.id,before:false)) }))
+      }
+     }
+     accessibilityItems.append(TabAccessibilityItem(card:card,label:tabLabel,help:"Shows this window.",selected:active,press:{ [weak self] in self?.focus?(entry.id) },actions:actions))
+     if showsTitle {
       let label=card.takeLabel(displayTitle.isEmpty ? entry.app:displayTitle)
       label.frame=CGRect(x:38,y:contentY-1,width:max(0,width-51),height:18)
       label.font = .systemFont(ofSize:style == "classic" ? 12.5:13,weight:active ? .semibold:.regular);label.lineBreakMode = .byTruncatingTail
@@ -566,25 +616,34 @@ final class TabBars: NSObject {
      let face = FolderTabFace(frame:more.bounds); face.style=style; face.increaseContrast=increaseContrast;face.reduceTransparency=reduceTransparency; more.addSubview(face)
      let label = more.takeLabel("…"); label.frame = CGRect(x: 7, y: (more.bounds.height-18)/2, width: 20, height: 18); more.addSubview(label)
      more.diagnosticName="tab overflow column=\(column)"
-     more.toolTip = "All tabs (\(members.count))"
+     more.toolTip = "Show all tabs (\(members.count))"
      more.onPress = { [weak bar] down in bar?.pressed = down }
-     let showMenu: (NSEvent?) -> Void = { [weak self, weak more] event in
+     // A pull-down: the menu hangs from the button (beside it on the side rail) and opens as the button goes down.
+     let showMenu: () -> Void = { [weak self, weak more] in
       guard let self, let more else { return }
       let menu = NSMenu()
       for member in members {
-       let item = NSMenuItem(title: "\(member.app) — \(self.aliases[member.bundle+"\t"+member.title] ?? member.title)", action: #selector(self.selectMenu(_:)), keyEquivalent: "")
+       let item = NSMenuItem(title: tabOverflowMenuTitle(app:member.app,title:self.aliases[member.bundle+"\t"+member.title] ?? member.title), action: #selector(self.selectMenu(_:)), keyEquivalent: "")
        item.target = self; item.tag = member.id; item.state = member.id == selection ? .on : .off; menu.addItem(item)
       }
-      if let event { NSMenu.popUpContextMenu(menu, with: event, for: more) }
-      // VoiceOver press: return before the menu's modal tracking starts.
-      else { DispatchQueue.main.async { menu.popUp(positioning: nil, at: NSPoint(x: 0, y: more.bounds.height), in: more) } }
+      menu.popUp(positioning: nil, at: side ? NSPoint(x: more.bounds.width, y: more.bounds.height) : NSPoint(x: 0, y: 0), in: more)
      }
-     more.onClick = { showMenu(NSApp.currentEvent) }
+     more.selectsOnPress = true
+     more.onSelect = { [weak more] in
+      showMenu()
+      // Menu tracking swallows the mouse-up: end the press here so the bar is not left frozen.
+      more?.cancelInteraction()
+     }
+     more.onClick = { showMenu() }
      more.setAccessibilityLabel("More tabs")
-     accessibilityItems.append(TabAccessibilityItem(card:more,label:"More tabs",help:"All tabs (\(members.count))",selected:nil,press:{ showMenu(nil) }))
+     // VoiceOver press: return before the menu's modal tracking starts.
+     accessibilityItems.append(TabAccessibilityItem(card:more,label:"More tabs",help:"Shows a menu of all \(members.count) tabs",selected:nil,press:{ DispatchQueue.main.async { showMenu() } }))
      view.addSubview(more)
     }
-    installTabAccessibility(strip: view, items: accessibilityItems, vertical: side)
+    let selectedMember = members.first(where: { $0.id == selection }) ?? members[0]
+    let stripLabel = tabStripAccessibilityLabel(selectedName:tabDisplayName(app:selectedMember.app,title:aliases[selectedMember.bundle+"\t"+selectedMember.title] ?? selectedMember.title),count:members.count)
+    bar.panel.setAccessibilityLabel(stripLabel)
+    installTabAccessibility(strip: view, items: accessibilityItems, vertical: side, label: stripLabel)
     // Never paint guessed opaque rectangles over app chrome. These masks are
     // transparent everywhere the captured app is opaque, including controls.
     let seams=bar.seams
