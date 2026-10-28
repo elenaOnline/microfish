@@ -1152,6 +1152,10 @@ pub(crate) fn window_moved_update_frame(
             if !intrudes_on_displays(new_frame, position.0, &display_frames(&displays)) {
                 corrections.parked(entity, position.0, now);
             } else if corrections.displaced(entity, position.0, now) {
+                info!(
+                    "hidden-row window {window_id} moved on screen to {:?}; parking it again",
+                    new_frame.min
+                );
                 window.reposition(position.0);
             }
             // Preserve the layout target even if an app refuses correction.
@@ -1221,7 +1225,12 @@ pub(crate) fn audit_parked_windows(
             Ok(frame) if !intrudes_on_displays(frame, position.0, &displays) => {
                 corrections.parked(entity, position.0, now);
             }
-            Ok(_) if corrections.displaced(entity, position.0, now) => {
+            Ok(frame) if corrections.displaced(entity, position.0, now) => {
+                info!(
+                    "audit: hidden-row window {} found on screen at {:?}; parking it again",
+                    window.id(),
+                    frame.min
+                );
                 window.reposition(position.0);
             }
             _ => {}

@@ -143,6 +143,10 @@ pub(super) fn front_switched_trigger(
         if let Ok(focused_id) = app.focused_window_id().inspect_err(|err| {
             warn!("can not get current focus of '{}': {err}", process.name());
         }) {
+            info!(
+                "front switch to {}: focused window {focused_id}",
+                process.name()
+            );
             if let Some(point) = window_manager.cursor_position()
                 && window_manager
                     .find_window_at_point(&point)
@@ -348,6 +352,7 @@ pub(super) fn window_focused_trigger(
         let mut owner = None;
         let mut owning_workspace_id = None;
         let mut active_workspace_id = None;
+        let mut owner_row = 0;
         for (strip_entity, mut strip, active) in &mut workspaces {
             if active {
                 active_workspace_id = Some(strip.id());
@@ -360,6 +365,7 @@ pub(super) fn window_focused_trigger(
                 }
                 owning_workspace_id = Some(strip.id());
                 owner = Some((strip_entity, active));
+                owner_row = strip.virtual_index;
             }
         }
 
@@ -372,6 +378,13 @@ pub(super) fn window_focused_trigger(
             && !active
             && let Ok(mut entity_commands) = ctx.commands.get_entity(strip_entity)
         {
+            // Behavior trace: a focus change revealing a hidden row is the
+            // moment a window "jumps" rows, so it is worth a line in the log.
+            info!(
+                "focus on window {window_id} ({}) reveals row {}",
+                app.name(),
+                owner_row + 1
+            );
             entity_commands.try_insert(ActiveWorkspaceMarker);
         }
 
@@ -1370,6 +1383,14 @@ pub(super) fn apply_window_positions(
                 }
                 None => strip.append(entity),
             }
+            info!(
+                "new window {} ({}) placed in row {} column {}, app frontmost {}",
+                window.id(),
+                app.name(),
+                strip.virtual_index + 1,
+                strip.index_of(entity).map_or(0, |index| index + 1),
+                app.is_frontmost()
+            );
         }
 
         // During init, skip per-window reshuffles. finish_setup does a single

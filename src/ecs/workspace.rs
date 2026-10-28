@@ -15,7 +15,7 @@ use bevy::prelude::{Changed, Or};
 use bevy::time::common_conditions::on_timer;
 use std::collections::HashSet;
 use std::time::Duration;
-use tracing::{Level, debug, error, instrument, warn};
+use tracing::{Level, debug, error, info, instrument, warn};
 
 use super::{ActiveDisplayMarker, SpawnWindowTrigger};
 use crate::commands::{
@@ -1312,6 +1312,7 @@ fn column_nearest_viewport_center(
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_lines)]
 pub(crate) fn show_active_workspace(
     activated: Single<Entity, Added<ActiveWorkspaceMarker>>,
     windows: Windows,
@@ -1375,6 +1376,11 @@ pub(crate) fn show_active_workspace(
         return;
     };
     debug!("showing virtual workspace {} ({})", strip.id(), *activated);
+    info!(
+        "row {} shown, {} windows",
+        strip.virtual_index + 1,
+        strip.all_windows().len()
+    );
 
     // If no previous strip position exists, then the workspace was not hidden.
     if let Some(PreviousStripPosition { origin, focus }) = previous_position {
@@ -1457,6 +1463,11 @@ pub(crate) fn show_active_workspace(
             column_nearest_viewport_center(strip, origin.x, viewport.center().x, &windows)
         });
         if let Some(target) = target {
+            info!(
+                "row {}: focusing window {}",
+                strip.virtual_index + 1,
+                windows.get(target).map_or(0, |window| window.id())
+            );
             spawn_restore_focus_guard(target, &mut commands);
 
             // The same ordered handoff keyboard navigation uses: the windows
