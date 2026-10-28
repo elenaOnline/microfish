@@ -5,14 +5,14 @@ private func mapDark(_ view:NSView)->Bool { view.effectiveAppearance.bestMatch(f
 private func mapTeal(_ view:NSView)->NSColor { mapColor(mapDark(view) ? 0x3CC6C4:0x00898B) }
 
 
-struct SpatialWindow {
+struct SpatialWindow: Equatable {
     let row: Int, column: Int, id: Int
     let frame: CGRect
     let tabbed: Bool
     let selected: Int
     let app: String, bundle: String, title: String
 }
-struct SpatialSnapshot {
+struct SpatialSnapshot: Equatable {
     let activeRow: Int
     let focused: Int
     let viewport: CGRect
@@ -80,8 +80,8 @@ struct SpatialMapLayout {
         self.tiles = tiles; self.viewports = ports; self.rowFrames = frames
     }
 }
-struct SpatialPin: Decodable {
-    struct Member: Decodable { let id: Int; let width: Int; let height: Int }
+struct SpatialPin: Decodable, Equatable {
+    struct Member: Decodable, Equatable { let id: Int; let width: Int; let height: Int }
     let display: UInt32
     let display_size: [Int]
     let columns: [[Member]]
@@ -171,7 +171,11 @@ private final class SpatialHitButton: NSButton {
         self.tile = tile; self.owner = owner; super.init(frame: tile.rect)
         isBordered = false; title = ""; target = self; action = #selector(pressed)
         toolTip = "\(tile.window.app) — \(tile.window.title). Drag to move the whole column."
-        setAccessibilityLabel(toolTip)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel("\(tile.window.app), \(tile.window.title)")
+        setAccessibilityHelp("Row \(tile.window.row), column \(tile.window.column + 1). Press to focus this window. Drag to move the whole column.")
+        if owner.snapshot.focused == tile.window.id { setAccessibilityValueDescription("Current window") }
+        setAccessibilityCustomActions(owner.moveActions(for: tile))
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func draw(_ dirtyRect: NSRect) {}
@@ -179,6 +183,17 @@ private final class SpatialHitButton: NSButton {
     override func mouseDragged(with event: NSEvent) { owner?.track(event: event) }
     override func mouseUp(with event: NSEvent) { owner?.finish(event: event) }
     @objc private func pressed() { owner?.focus(tile.window) }
+}
+/// Drawn-only targets (pin badges, overflow pills) exposed to VoiceOver.
+private final class SpatialAXElement: NSAccessibilityElement {
+    weak var owner: SpatialMapView?
+    var rect: CGRect = .zero
+    var press: (() -> Void)?
+    override func accessibilityFrame() -> NSRect {
+        guard let owner, let window = owner.window else { return .zero }
+        return window.convertToScreen(owner.convert(rect, to: nil))
+    }
+    override func accessibilityPerformPress() -> Bool { guard let press else { return false }; press(); return true }
 }
 final class SpatialMapView: NSView {
     override var isFlipped: Bool { true }
@@ -195,23 +210,51 @@ final class SpatialMapView: NSView {
     private var dragTimer: Timer?
     private var lastWindowPoint: CGPoint?
     var hasDragTimer: Bool { dragTimer != nil }
-    var pins: [Int: SpatialPin] = [:] { didSet { needsDisplay = true } }
-    var pinPadding: CGFloat = 4
+    var pins: [Int: SpatialPin] = [:] { didSet { if pins != oldValue { needsDisplay = true } } }
+    var pinPadding: CGFloat = 4 { didSet { if pinPadding != oldValue { needsDisplay = true } } }
     private var icons: [String: NSImage] = [:]
+    private var missingIcons = Set<String>()
+    /// Counts repaint requests (observable even without an on-screen window).
+    private(set) var displayRequests = 0
+    override var needsDisplay: Bool { willSet { if newValue { displayRequests += 1 } } }
+    var onEscape: (() -> Void)?
+    /// Test hook; nil follows System Settings > Accessibility > Display > Increase contrast.
+    var increaseContrastOverride: Bool?
+    private var increaseContrast: Bool { increaseContrastOverride ?? NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast }
     private var requestedWidth: CGFloat
     init(snapshot: SpatialSnapshot, width: CGFloat, onFocus: ((Int) -> Void)?) {
         self.snapshot = snapshot; self.map = SpatialMapLayout(snapshot: snapshot, width: width); self.onFocus = onFocus; requestedWidth = width
         super.init(frame: CGRect(x: 0, y: 0, width: map.width, height: map.height))
         setAccessibilityRole(.group); setAccessibilityLabel("Spatial window overview"); rebuild()
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(displayEnvironmentChanged), name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(displayEnvironmentChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
     }
+    @objc private func displayEnvironmentChanged(_ note: Notification) { needsDisplay = true }
+    // Dark/light switches while the popover is open must repaint the hand-drawn map.
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    deinit { dragTimer?.invalidate(); if let monitor { NSEvent.removeMonitor(monitor) } }
-    func update(_ snapshot: SpatialSnapshot) {
-        if drag != nil { pending = snapshot; return }
+    deinit {
+        dragTimer?.invalidate(); if let monitor { NSEvent.removeMonitor(monitor) }
+        NSWorkspace.shared.notificationCenter.removeObserver(self); NotificationCenter.default.removeObserver(self)
+    }
+    /// True when a newer snapshot no longer has the dragged window in its row, so the drop could only target stale data.
+    private func dragSourceGone(in next: SpatialSnapshot) -> Bool {
+        guard let state = drag else { return false }
+        return !next.windows.contains { $0.id == state.sourceID && $0.row == state.sourceRow }
+    }
+    func update(_ snapshot: SpatialSnapshot, force: Bool = false) {
+        if drag != nil {
+            if snapshot == self.snapshot { pending = nil; return }
+            pending = snapshot
+            if dragSourceGone(in: snapshot) { cancelDrag() }
+            return
+        }
+        // The engine rewrites the snapshot constantly; an identical one must not rebuild or repaint.
+        if !force && snapshot == self.snapshot { return }
         self.snapshot = snapshot; map = SpatialMapLayout(snapshot: snapshot, width: requestedWidth)
         setFrameSize(NSSize(width: map.width, height: map.height)); rebuild(); needsDisplay = true
     }
-    func resizeViewport(width: CGFloat) { if abs(width-requestedWidth) > 0.5 { cancelDrag(); requestedWidth = max(1,width); update(snapshot) } }
+    func resizeViewport(width: CGFloat) { if abs(width-requestedWidth) > 0.5 { cancelDrag(); requestedWidth = max(1,width); update(snapshot, force: true) } }
     private func rebuild() {
         subviews.forEach { $0.removeFromSuperview() }
         for tile in map.tiles { addSubview(SpatialHitButton(tile: tile, owner: self)) }
@@ -248,13 +291,16 @@ final class SpatialMapView: NSView {
     func finish(event: NSEvent) { finish(point: convert(event.locationInWindow, from: nil)) }
     func finish(point: CGPoint) {
         guard let state = drag else { return }
-        let target = state.moved && visibleRect.contains(point) ? spatialDrop(snapshot: snapshot, map: map, drag: state, point: point) : nil
+        var target = state.moved && visibleRect.contains(point) ? spatialDrop(snapshot: snapshot, map: map, drag: state, point: point) : nil
+        // A snapshot queued during the drag can remove the anchor the drop was computed against.
+        if let next = pending, let anchor = target?.anchor, !next.windows.contains(where: { $0.id == anchor }) { target = nil }
         let clicked = !state.moved ? map.tiles.first(where: { $0.window.id == state.sourceID && $0.rect.contains(point) })?.window : nil
         cancelDrag()
         if let target { onMove?(target.sourceID, target.sourceRow, target.row, target.anchor, target.after) }
         else if let clicked { focus(clicked) }
     }
-    override func cancelOperation(_ sender: Any?) { cancelDrag() }
+    override func cancelOperation(_ sender: Any?) { if drag != nil { cancelDrag() } else { onEscape?() } }
+    override func keyDown(with event: NSEvent) { if event.keyCode == 53 { cancelOperation(self) } else { super.keyDown(with: event) } }
     func cancelDrag() {
         dragTimer?.invalidate(); dragTimer = nil; lastWindowPoint = nil
         drag = nil; drop = nil
@@ -288,7 +334,46 @@ final class SpatialMapView: NSView {
     }
     override func hitTest(_ point: NSPoint) -> NSView? {
         let local=convert(point,from:superview)
+        // The row ruler is painted over the tiles; clicks and tooltips there must not reach hidden tiles.
+        if bounds.contains(local) && local.x < visibleRect.minX+36 { return self }
         return pinAt(local) != nil || overflowAt(local) != nil ? self : super.hitTest(point)
+    }
+    /// Move-column alternatives to dragging, for VoiceOver and Switch Control.
+    fileprivate func moveActions(for tile: SpatialTile) -> [NSAccessibilityCustomAction] {
+        let rows = snapshot.rows
+        guard let index = rows.firstIndex(of: tile.window.row) else { return [] }
+        return [(index-1,"above"),(index+1,"below")].compactMap { target, side in
+            guard rows.indices.contains(target) else { return nil }
+            let row = rows[target]
+            return NSAccessibilityCustomAction(name: "Move column to row \(row), \(side)") { [weak self] in
+                guard let self, let drop = self.accessibilityDrop(sourceID: tile.window.id, toRow: row) else { return false }
+                self.onMove?(drop.sourceID, drop.sourceRow, drop.row, drop.anchor, drop.after); return true
+            }
+        }
+    }
+    /// The drop a drag to the far end of `row` would produce, computed against the current snapshot.
+    func accessibilityDrop(sourceID: Int, toRow row: Int) -> SpatialDrop? {
+        guard let source = snapshot.windows.first(where: { $0.id == sourceID }), let index = snapshot.rows.firstIndex(of: row) else { return nil }
+        let state = SpatialDrag(sourceID: source.id, sourceRow: source.row, sourceColumn: source.column, origin: .zero)
+        return spatialDrop(snapshot: snapshot, map: map, drag: state, point: CGPoint(x: map.width-1, y: CGFloat(index)*SpatialMapLayout.rowHeight+SpatialMapLayout.rowHeight/2))
+    }
+    override func accessibilityChildren() -> [Any]? {
+        var extra: [Any] = []
+        for entry in pinGeometry() {
+            let element = SpatialAXElement(); element.owner = self; element.rect = entry.badge
+            element.setAccessibilityParent(self); element.setAccessibilityRole(.button)
+            element.setAccessibilityLabel("Pinned view \(entry.slot)"); element.setAccessibilityHelp("Press to jump to this pinned view.")
+            let slot = entry.slot; element.press = { [weak self] in self?.onPin?(slot) }
+            extra.append(element)
+        }
+        for item in overflowGeometry() {
+            let element = SpatialAXElement(); element.owner = self; element.rect = item.rect
+            element.setAccessibilityParent(self); element.setAccessibilityRole(.button)
+            element.setAccessibilityLabel("\(item.count) more \(item.count == 1 ? "column" : "columns") \(item.after ? "to the right" : "to the left") in row \(item.row)")
+            let after = item.after; element.press = { [weak self] in self?.revealOverflow(after: after) }
+            extra.append(element)
+        }
+        return subviews + extra
     }
     override func mouseDown(with event:NSEvent) { let point=convert(event.locationInWindow,from:nil);pressedPin=pinAt(point);pressedOverflow=overflowAt(point)?.after }
     override func mouseUp(with event:NSEvent) {
@@ -329,7 +414,7 @@ final class SpatialMapView: NSView {
                 let left=max(frame.minX,visibleRect.minX+38),right=min(frame.maxX,visibleRect.maxX-10)
                 let slot=CGRect(x:left,y:frame.minY+1,width:max(1,right-left),height:frame.height-2)
                 let path=NSBezierPath(roundedRect:slot,xRadius:7,yRadius:7);path.setLineDash([1,2],count:2,phase:0);path.lineWidth=1
-                (active ? teal:NSColor.labelColor.withAlphaComponent(0.22)).setStroke();path.stroke()
+                (active ? teal:NSColor.labelColor.withAlphaComponent(increaseContrast ? 0.55:0.22)).setStroke();path.stroke()
                 text(active ? "Empty row · you’re here":"Empty row",in:CGRect(x:slot.minX+8,y:slot.midY-7,width:slot.width-16,height:16),color:active ? teal:.secondaryLabelColor,size:10,centered:true)
             }
         }
@@ -342,8 +427,8 @@ final class SpatialMapView: NSView {
             NSGraphicsContext.saveGraphicsState();rect.clip()
             let path=NSBezierPath(roundedRect:rect.insetBy(dx:0.5,dy:0.5),xRadius:5,yRadius:5)
             mapColor(focused ? (dark ? 0x1D4647:0xDCEEEE):(dark ? 0x3A3E3F:0xFFFFFF)).withAlphaComponent(alpha).setFill();path.fill()
-            (focused || moving ? teal:(dark ? NSColor.white:NSColor.black).withAlphaComponent(0.10)).withAlphaComponent(moving ? 0.4:focused ? 1:0.10).setStroke()
-            path.lineWidth=focused ? 1.2:0.5;if moving {path.setLineDash([1,2],count:2,phase:0)};path.stroke()
+            (focused || moving ? teal:(dark ? NSColor.white:NSColor.black).withAlphaComponent(0.10)).withAlphaComponent(moving ? 0.4:focused ? 1:(increaseContrast ? 0.55:0.10)).setStroke()
+            path.lineWidth=focused ? 1.2:(increaseContrast ? 1:0.5);if moving {path.setLineDash([1,2],count:2,phase:0)};path.stroke()
             let members=tile.window.tabbed ? snapshot.windows.filter {$0.row==tile.window.row && $0.column==tile.window.column}:[tile.window]
             var seen=Set<String>();var group=members.filter {seen.insert($0.bundle.isEmpty ? $0.app:$0.bundle).inserted}
             if let i=group.firstIndex(where:{$0.bundle==tile.window.bundle}) {group.append(group.remove(at:i))}
@@ -399,7 +484,8 @@ final class SpatialMapView: NSView {
     }
     private func icon(_ bundle: String) -> NSImage? {
         if let icon = icons[bundle] { return icon }
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) else { return nil }
+        if missingIcons.contains(bundle) { return nil }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) else { missingIcons.insert(bundle); return nil }
         let icon = NSWorkspace.shared.icon(forFile: url.path); icons[bundle] = icon; return icon
     }
     private func text(_ value: String, in rect: CGRect, color: NSColor, size: CGFloat = 10, centered:Bool=false) {
@@ -426,6 +512,7 @@ struct SpatialPanelGeometry {
     }
 }
 private final class SpatialGearButton: NSButton {
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
     override func draw(_ dirtyRect: NSRect) { NSImage(systemSymbolName:"gearshape",accessibilityDescription:"Settings")?.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors:[mapColor(mapDark(self) ? 0xA1A1A6:0x6E6E73)]))?.draw(in:bounds.insetBy(dx:5,dy:5)) }
 }
 private final class SpatialClipView:NSClipView {
@@ -442,7 +529,21 @@ final class SpatialContentView: NSView {
     let mapView: SpatialMapView
     let scrollView = NSScrollView()
     private(set) var geometry: SpatialPanelGeometry
-    var message = "Drag a column to move it between rows" { didSet { needsDisplay = true } }
+    static let defaultMessage = "Drag a column to move it between rows"
+    var message = SpatialContentView.defaultMessage {
+        didSet {
+            needsDisplay = true
+            // Status text is painted, not an accessibility element: speak changes for VoiceOver.
+            if message != oldValue && message != Self.defaultMessage {
+                NSAccessibility.post(element: self, notification: .announcementRequested, userInfo: [.announcement: message, .priority: NSAccessibilityPriorityLevel.medium.rawValue])
+            }
+        }
+    }
+    var onEscape: (() -> Void)? { didSet { mapView.onEscape = onEscape } }
+    override func cancelOperation(_ sender: Any?) { onEscape?() }
+    override func keyDown(with event: NSEvent) { if event.keyCode == 53 { cancelOperation(self) } else { super.keyDown(with: event) } }
+    override func accessibilityPerformCancel() -> Bool { guard let onEscape else { return false }; onEscape(); return true }
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
     var onSettings: (() -> Void)?
     var onRefresh: (() -> Void)?
     var onViews: (() -> Void)?
@@ -453,6 +554,7 @@ final class SpatialContentView: NSView {
         geometry = SpatialPanelGeometry(available: available, rowCount: snapshot.rows.count)
         mapView = SpatialMapView(snapshot: snapshot, width: max(1, geometry.scroll.width-14), onFocus: nil)
         super.init(frame: CGRect(origin: .zero, size: geometry.size))
+        setAccessibilityRole(.group); setAccessibilityLabel("Window map")
         // Gutters and overflow pills depend on visibleRect. Copying old pixels
         // during scrolling would move those fixed decorations into the map.
         let clip=SpatialClipView();scrollView.contentView=clip
@@ -464,7 +566,7 @@ final class SpatialContentView: NSView {
         gear.title = ""; gear.isBordered = false; gear.target = self; gear.action = #selector(settings); gear.toolTip = "Settings"; gear.setAccessibilityLabel("Settings")
         gear.frame = CGRect(x: max(0,bounds.width-44), y: min(12,geometry.header.height/4), width: min(30,bounds.width), height: min(30,geometry.header.height)); addSubview(gear)
         refreshButton.target = self; refreshButton.action = #selector(refresh)
-        refreshButton.bezelStyle = .rounded
+        refreshButton.bezelStyle = .rounded; refreshButton.setAccessibilityLabel("Refresh windows")
         refreshButton.toolTip = "Rediscover windows and restore the saved layout. Windows may briefly move."
         refreshButton.frame = CGRect(x: max(0,bounds.width-132), y: 12, width: 82, height: 28)
         addSubview(refreshButton)
@@ -516,7 +618,7 @@ final class SpatialContentView: NSView {
         ("Window map" as NSString).draw(in:CGRect(x:12,y:12,width:100,height:17),withAttributes:[.font:NSFont.systemFont(ofSize:12,weight:.semibold),.foregroundColor:NSColor.labelColor])
         NSColor.separatorColor.withAlphaComponent(0.6).setStroke()
         let path = NSBezierPath(); path.move(to: CGPoint(x: 16,y: geometry.header.maxY-1)); path.line(to: CGPoint(x: bounds.width-16,y: geometry.header.maxY-1)); path.move(to: CGPoint(x: 16,y: geometry.footer.minY)); path.line(to: CGPoint(x: bounds.width-16,y: geometry.footer.minY)); path.lineWidth = 0.5; path.stroke()
-        let normal=message=="Drag a column to move it between rows"
+        let normal=message==Self.defaultMessage
         let showLegend=normal && bounds.width>=500
         (message as NSString).draw(in:CGRect(x:12,y:geometry.footer.minY+9,width:showLegend ? bounds.width-250:bounds.width-24,height:14),withAttributes:[.font:NSFont.systemFont(ofSize:9),.foregroundColor:NSColor.secondaryLabelColor,.paragraphStyle:paragraph])
         if showLegend {
@@ -528,6 +630,12 @@ final class SpatialContentView: NSView {
             ("Pinned view · click to jump" as NSString).draw(at:CGPoint(x:x+84,y:y-2),withAttributes:[.font:NSFont.systemFont(ofSize:9),.foregroundColor:NSColor.secondaryLabelColor])
         }
     }
+}
+/// A transient popover closes on the mouse-down that lands on its own status item, so the
+/// mouse-up action would immediately reopen it. True when this click is the tail of such a close.
+func spatialStatusClickClosesPopover(closedByPressAt: TimeInterval?, now: TimeInterval) -> Bool {
+    guard let closedByPressAt else { return false }
+    return now - closedByPressAt >= 0 && now - closedByPressAt < 1.5
 }
 final class SpatialOverviewController: NSObject, NSPopoverDelegate {
     var onFocus: ((Int) -> Void)?
@@ -543,12 +651,20 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
     private let popover = NSPopover()
     private var snapshot = SpatialSnapshot("")
     private var content: SpatialContentView?
+    private var closedByStatusPressAt: TimeInterval?
     func attach(to item: NSStatusItem) {
         self.item = item; menu = item.menu; item.menu = nil
+        // Switching apps (Cmd-Tab) must dismiss the map like a menu; the transient behavior only watches clicks.
+        NotificationCenter.default.addObserver(self, selector: #selector(appResigned), name: NSApplication.didResignActiveNotification, object: nil)
         item.button?.target = self; item.button?.action = #selector(clicked)
         item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp]); updateGlyph(); popover.delegate = self
     }
-    func update(text: String) { snapshot = SpatialSnapshot(text); updateGlyph(); content?.mapView.update(snapshot); loadPins() }
+    @objc private func appResigned(_ note: Notification) { if popover.isShown { popover.performClose(nil) } }
+    func update(text: String) {
+        let next = SpatialSnapshot(text); let changed = next != snapshot
+        snapshot = next; if changed { updateGlyph() }
+        content?.mapView.update(next); loadPins()
+    }
     private func loadPins() {
         guard let map = content?.mapView else { return }
         let data=(try? Data(contentsOf:URL(fileURLWithPath:pinsPath))) ?? Data()
@@ -560,7 +676,15 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
         if let data=try? Data(contentsOf:root.appendingPathComponent("config/preferences.json")), let prefs=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any], let gap=prefs["windowGap"] as? Double { map.pinPadding=gap }
     }
     func showMoveResult(_ success: Bool) { content?.message = success ? "Column moved" : "Move not confirmed · layout may have changed" }
-    func popoverWillClose(_ notification: Notification) { content?.mapView.cancelDrag() }
+    func popoverWillClose(_ notification: Notification) {
+        content?.mapView.cancelDrag()
+        if let window = item?.button?.window, NSEvent.pressedMouseButtons & 1 != 0, window.frame.contains(NSEvent.mouseLocation) { closedByStatusPressAt = ProcessInfo.processInfo.systemUptime }
+    }
+    func popoverDidClose(_ notification: Notification) {
+        item?.button?.highlight(false)
+        // Drop the hidden map so snapshot updates stop re-laying-out and re-reading pins while closed.
+        if content?.window == nil { content = nil; popover.contentViewController = nil }
+    }
     private func updateGlyph() {
         let state = snapshot
         let image = NSImage(size: NSSize(width: 25, height: 19), flipped: false) { _ in
@@ -621,9 +745,16 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
     }
     @objc private func clicked() {
         guard let button = item?.button else { return }
-        if NSApp.currentEvent?.type == .rightMouseUp, let menu, let event = NSApp.currentEvent { NSMenu.popUpContextMenu(menu, with: event, for: button); return }
+        if NSApp.currentEvent?.type == .rightMouseUp, let menu, let event = NSApp.currentEvent {
+            if popover.isShown { popover.performClose(nil) }
+            NSMenu.popUpContextMenu(menu, with: event, for: button); return
+        }
+        let pressClosed = spatialStatusClickClosesPopover(closedByPressAt: closedByStatusPressAt, now: ProcessInfo.processInfo.systemUptime)
+        closedByStatusPressAt = nil
         if popover.isShown { popover.performClose(nil); return }
-        let available = button.window?.screen?.visibleFrame.size ?? NSScreen.main?.visibleFrame.size ?? NSSize(width: 800,height: 600)
+        if pressClosed { return }
+        let screen = button.window?.screen ?? NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
+        let available = screen?.visibleFrame.size ?? NSSize(width: 800,height: 600)
         let root = SpatialContentView(snapshot: snapshot, available: available); content = root; loadPins()
         root.onViews = { [weak self, weak root] in if let root { self?.showViews(in:root) } }
         root.refreshButton.isEnabled = !refreshing
@@ -637,6 +768,7 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
                 self.content?.message = success ? "Windows refreshed" : "Refresh failed · see work/refresh.log"
             }
         }
+        root.onEscape = { [weak self] in self?.popover.performClose(nil) }
         root.onSettings = { [weak self] in self?.popover.performClose(nil); self?.onSettings?() }
         root.mapView.onPin = { [weak self] slot in self?.popover.performClose(nil); self?.onViewAction?("view-pin",slot) }
         root.mapView.onFocus = { [weak self] id in self?.onFocus?(id); self?.popover.performClose(nil) }
@@ -646,5 +778,7 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
         popover.contentViewController = controller; popover.contentSize = root.bounds.size; popover.behavior = .transient
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentSize = root.bounds.size
+        button.highlight(true)
+        root.window?.makeFirstResponder(root.mapView)
     }
 }
