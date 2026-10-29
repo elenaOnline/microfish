@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?><!-- sparkle-sign-warning:
+IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
+--><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+  <channel>
+    <title>Microfish</title>
+    <link>https://github.com/elenaOnline/microfish</link>
+    <description>Updates for Microfish.</description>
+    <language>en</language>
+    <item>
+      <title>Microfish 0.1.0-beta.1</title>
+      <pubDate>Thu, 29 Oct 2026 07:35:34 GMT</pubDate>
+      <sparkle:version>10001</sparkle:version>
+      <sparkle:shortVersionString>0.1.0-beta.1</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+      <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+      <sparkle:channel>beta</sparkle:channel>
+      <description>&lt;p&gt;Microfish 0.1.0-beta.1 is a beta (pre-release). Its notes are on &lt;a href="https://github.com/elenaOnline/microfish/releases/tag/v0.1.0-beta.1"&gt;the GitHub release page&lt;/a&gt;.&lt;/p&gt;</description>
+      <enclosure url="https://github.com/elenaOnline/microfish/releases/download/v0.1.0-beta.1/Microfish-0.1.0-beta.1.zip" length="11031518" type="application/octet-stream" sparkle:edSignature="Rzdmlz2X19sr1R1sXddBmg/n+zTdPpqX5Xai/IVz9lgNkw0UcKIvrOYQz3l44ISulEpyAVVSMTy0OjXGx4mtDg=="></enclosure>
+    </item>
+  </channel>
+</rss><!-- sparkle-signatures:
+edSignature: vmeRvUJzLt4RDgoAVLaaxrXkB4erEi5htoi35OI3cNY8RMnx93XX7uyUdGGeAZRHWtSapUMdOxBX+d6bEKH1Dg==
+length: 1548
+-->
