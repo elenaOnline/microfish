@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# CI: choose the developer directory (an Xcode, or the Command Line Tools) with the newest macOS SDK whose own
-# linker can read it, select it, and say which SDK it brings.
+# CI: choose the Xcode with the newest macOS SDK that its own linker can link the engine's private framework
+# against, select it, and point DEVELOPER_DIR at it so the engine's build.rs uses the same SDKs.
 #
-# Why not simply "newest Xcode": a runner image can carry Command Line Tools with a newer SDK than any of its
-# Xcodes (macos-26 in October 2026: Xcode 26.6 with SDK 26.5, CLT with SDK 27.0). The helper is written against
-# the macOS 27 SDK (`NSMenuItem.preferredImageVisibility` has no 26.x declaration), and the engine's build.rs
-# links the private SkyLight framework from the SDKs of $DEVELOPER_DIR, or of the CLT when it is unset. Mixing
-# the two (Xcode 26's ld reading the CLT's 27 SDK) fails with "tapi error: unknown architecture arm64e.x1".
-# So each candidate is probed by linking SkyLight with its own tools, and the build sees one consistent
-# toolchain: DEVELOPER_DIR is exported for an Xcode (build.rs then searches that Xcode's SDKs) and left unset
-# for the CLT (build.rs's default).
+# Only an Xcode will do for the helper: the Command Line Tools ship no SwiftUI macro plugins (with SDK 27,
+# `@State` is a macro: "plugin for module 'SwiftUIMacros' not found"). The CLT is a fallback when no Xcode
+# links. The engine's build.rs adds the private SkyLight framework from the SDKs of $DEVELOPER_DIR (the CLT's
+# when it is unset); on macos-26 (October 2026) the CLT carries SDK 27.0, which Xcode 26's ld cannot read
+# ("tapi error: unknown architecture arm64e.x1"). Exporting DEVELOPER_DIR keeps the engine and the linker on
+# one SDK. The helper builds with an Xcode 26 SDK: its two macOS 27-only calls sit behind
+# `#if compiler(>=6.4)` (Xcode 27's Swift), so a 26 build only lacks those (hidden menu-item images on 27).
 set -euo pipefail
 probe_dir="$(mktemp -d)"; trap 'rm -rf "$probe_dir"' EXIT
 printf 'int main(void){return 0;}\n' > "$probe_dir/p.c"
@@ -22,20 +21,26 @@ links_skylight() {   # the candidate's clang+ld against the candidate's SDK, wit
     -framework SkyLight "$probe_dir/p.c" -o "$probe_dir/p" 2>"$probe_dir/err" || { sed 's/^/    /' "$probe_dir/err" | head -n 3; return 1; }
 }
 
-candidates=()
-for app in /Applications/Xcode*.app; do [ -d "$app/Contents/Developer" ] && candidates+=("$app/Contents/Developer"); done
-[ -d /Library/Developer/CommandLineTools/usr/bin ] && candidates+=(/Library/Developer/CommandLineTools)
-
+pick() {   # newest SDK among the given developer directories that links SkyLight
+  local dev v ok; best=""; best_sdk="0"
+  for dev in "$@"; do
+    v="$(sdk_version "$dev")"
+    if links_skylight "$dev"; then ok=yes; else ok=no; fi
+    echo "  $dev: macOS SDK $v, links SkyLight: $ok"
+    [ "$ok" = yes ] || continue
+    if [ "$(printf '%s\n%s\n' "$best_sdk" "$v" | sort -V | tail -n 1)" = "$v" ] && [ "$v" != "$best_sdk" ]; then
+      best="$dev"; best_sdk="$v"
+    fi
+  done
+}
+xcodes=()
+for app in /Applications/Xcode*.app; do [ -d "$app/Contents/Developer" ] && xcodes+=("$(cd "$app/Contents/Developer" && pwd -P)"); done
 best=""; best_sdk="0"
-for dev in "${candidates[@]}"; do
-  v="$(sdk_version "$dev")"
-  if links_skylight "$dev"; then ok=yes; else ok=no; fi
-  echo "  $dev: macOS SDK $v, links SkyLight: $ok"
-  [ "$ok" = yes ] || continue
-  if [ "$(printf '%s\n%s\n' "$best_sdk" "$v" | sort -V | tail -n 1)" = "$v" ] && [ "$v" != "$best_sdk" ]; then
-    best="$dev"; best_sdk="$v"
-  fi
-done
+[ "${#xcodes[@]}" -gt 0 ] && pick $(printf '%s\n' "${xcodes[@]}" | sort -u)
+if [ -z "$best" ] && [ -d /Library/Developer/CommandLineTools/usr/bin ]; then
+  echo "::warning::No Xcode links SkyLight; falling back to the Command Line Tools (no SwiftUI macro plugins)."
+  pick /Library/Developer/CommandLineTools
+fi
 [ -n "$best" ] || { echo "::error::No developer directory on this runner links the SkyLight framework with its own SDK."; exit 1; }
 
 echo "Using $best (macOS SDK $best_sdk)"
