@@ -308,7 +308,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/release"
-          zip_path="$(app/Scripts/package.sh "$RUNNER_TEMP/out/Microfish.app" --out "$RUNNER_TEMP/release" | head -n 1)"
+          # Capture, then take the first line: `| head -n 1` closes the pipe early and pipefail fails the step.
+          packaged="$(app/Scripts/package.sh "$RUNNER_TEMP/out/Microfish.app" --out "$RUNNER_TEMP/release")"
+          printf '%s\n' "$packaged"
+          zip_path="$(printf '%s\n' "$packaged" | sed -n 1p)"
           echo "zip=$zip_path" >> "$GITHUB_OUTPUT"
           plutil -extract LSMinimumSystemVersion raw "$RUNNER_TEMP/out/Microfish.app/Contents/Info.plist" > "$RUNNER_TEMP/release/min-macos.txt"
           ls -l "$RUNNER_TEMP/release"
