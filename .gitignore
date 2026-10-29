@@ -8,3 +8,7 @@ CLAUDE.md
 .direnv
 **/.DS_Store
 flamegraph.svg
+
+# Build outputs of app/Scripts/build-app.sh
+/build/
+__pycache__/
