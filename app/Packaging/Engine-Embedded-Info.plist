@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Embedded into the engine binary (Mach-O __TEXT,__info_plist) when it is built with
+  `--features microfish`, in place of upstream's assets/Info.plist. It carries only the
+  identity, so there is no version here to drift: the nested app's Engine-Info.plist is
+  the one that gets versioned. Keep the identifier equal to that file's.
+-->
+<plist version="1.0">
+  <dict>
+    <key>CFBundleIdentifier</key>
+    <string>net.webreceptor.microfish.engine</string>
+    <key>CFBundleName</key>
+    <string>Microfish Engine</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSUIElement</key>
+    <true/>
+  </dict>
+</plist>
