@@ -22,7 +22,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 APP = HERE.parent.parent
 CATALOG = APP / 'Resources/shortcut-defaults.json'
-DEFAULT_REFERENCE = HERE.parents[3] / 'reference/apply-settings.py'   # polish/teams/distribution/reference
+DEFAULT_REFERENCE = HERE / 'reference_apply_settings.py'   # the original Python backend, kept as the oracle
 
 THIN_INIT = b'-- Microfish user configuration.\ndofile(os.getenv("MICROFISH_RESOURCES").."/Lua/microfish.lua")\n-- settings revision 0\n'
 CATALOG_IDS = [a['id'] for a in json.loads(CATALOG.read_text())]
