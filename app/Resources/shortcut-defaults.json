@@ -1,0 +1,434 @@
+[
+  {
+    "id": "focus_leftarrow",
+    "label": "Focus left",
+    "default": "ctrl + alt + cmd - leftarrow",
+    "command": "window focus west"
+  },
+  {
+    "id": "focus_rightarrow",
+    "label": "Focus right",
+    "default": "ctrl + alt + cmd - rightarrow",
+    "command": "window focus east"
+  },
+  {
+    "id": "focus_h",
+    "label": "Focus left",
+    "default": "ctrl + alt + cmd - h",
+    "command": "window focus west"
+  },
+  {
+    "id": "focus_l",
+    "label": "Focus right",
+    "default": "ctrl + alt + cmd - l",
+    "command": "window focus east"
+  },
+  {
+    "id": "focus_j",
+    "label": "Focus down in stack",
+    "default": "ctrl + alt + cmd - j",
+    "command": "window focus south"
+  },
+  {
+    "id": "focus_k",
+    "label": "Focus up in stack",
+    "default": "ctrl + alt + cmd - k",
+    "command": "window focus north"
+  },
+  {
+    "id": "row_north",
+    "label": "Row up",
+    "default": "ctrl + alt + cmd - uparrow",
+    "command": "window row north"
+  },
+  {
+    "id": "row_south",
+    "label": "Row down",
+    "default": "ctrl + alt + cmd - downarrow",
+    "command": "window row south"
+  },
+  {
+    "id": "swap_leftarrow",
+    "label": "Swap left",
+    "default": "ctrl + alt + cmd + shift - leftarrow",
+    "command": "window swap west"
+  },
+  {
+    "id": "swap_rightarrow",
+    "label": "Swap right",
+    "default": "ctrl + alt + cmd + shift - rightarrow",
+    "command": "window swap east"
+  },
+  {
+    "id": "swap_h",
+    "label": "Swap left",
+    "default": "ctrl + alt + cmd + shift - h",
+    "command": "window swap west"
+  },
+  {
+    "id": "swap_l",
+    "label": "Swap right",
+    "default": "ctrl + alt + cmd + shift - l",
+    "command": "window swap east"
+  },
+  {
+    "id": "swap_j",
+    "label": "Swap down in stack",
+    "default": "ctrl + alt + cmd + shift - j",
+    "command": "window swap south"
+  },
+  {
+    "id": "swap_k",
+    "label": "Swap up in stack",
+    "default": "ctrl + alt + cmd + shift - k",
+    "command": "window swap north"
+  },
+  {
+    "id": "move_row_north",
+    "label": "Move window to row above",
+    "default": "ctrl + alt + cmd + shift - uparrow",
+    "command": "window rowmove north"
+  },
+  {
+    "id": "move_row_south",
+    "label": "Move window to row below",
+    "default": "ctrl + alt + cmd + shift - downarrow",
+    "command": "window rowmove south"
+  },
+  {
+    "id": "move_column_north",
+    "label": "Move column to row above",
+    "default": "ctrl + alt + cmd + shift - u",
+    "command": "window rowcolumnmove north"
+  },
+  {
+    "id": "move_column_south",
+    "label": "Move column to row below",
+    "default": "ctrl + alt + cmd + shift - i",
+    "command": "window rowcolumnmove south"
+  },
+  {
+    "id": "grow",
+    "label": "Make wider",
+    "default": "ctrl + alt + cmd - r",
+    "command": "window resize"
+  },
+  {
+    "id": "center",
+    "label": "Center window",
+    "default": "ctrl + alt + cmd - c",
+    "command": "window center"
+  },
+  {
+    "id": "fullwidth",
+    "label": "Full width",
+    "default": "ctrl + alt + cmd - f",
+    "command": "window fullwidth"
+  },
+  {
+    "id": "float",
+    "label": "Float or tile",
+    "default": "ctrl + alt + cmd - space",
+    "command": "window manage"
+  },
+  {
+    "id": "display",
+    "label": "Next display",
+    "default": "ctrl + alt + cmd - n",
+    "command": "window nextdisplay"
+  },
+  {
+    "id": "stack_left",
+    "label": "Stack into left column",
+    "default": "ctrl + alt + cmd - leftbracket",
+    "command": "window stack"
+  },
+  {
+    "id": "unstack",
+    "label": "Unstack",
+    "default": "ctrl + alt + cmd - backslash",
+    "command": "window unstack"
+  },
+  {
+    "id": "tabs",
+    "label": "Show as tabs",
+    "default": "ctrl + alt + cmd - t",
+    "command": "window tabbeddisplay"
+  },
+  {
+    "id": "equalize",
+    "label": "Equalize heights",
+    "default": "ctrl + alt + cmd - e",
+    "command": "window equalize"
+  },
+  {
+    "id": "stack_right",
+    "label": "Stack into right column",
+    "default": "ctrl + alt + cmd - rightbracket",
+    "command": ""
+  },
+  {
+    "id": "quit",
+    "label": "Quit Microfish",
+    "default": "ctrl + alt + cmd - q",
+    "command": "quit"
+  },
+  {
+    "id": "shrink",
+    "label": "Make narrower",
+    "default": "ctrl + alt + cmd + shift - r",
+    "command": "window shrink"
+  },
+  {
+    "id": "grow_height",
+    "label": "Make taller",
+    "default": "ctrl + alt + cmd + shift - equal",
+    "command": "window vertical grow"
+  },
+  {
+    "id": "shrink_height",
+    "label": "Make shorter",
+    "default": "ctrl + alt + cmd + shift - minus",
+    "command": "window vertical shrink"
+  },
+  {
+    "id": "focus_column_1",
+    "label": "Focus column 1",
+    "default": "ctrl + alt - 1",
+    "command": "window focus 1"
+  },
+  {
+    "id": "swap_column_1",
+    "label": "Swap with column 1",
+    "default": "ctrl + alt + shift - 1",
+    "command": ""
+  },
+  {
+    "id": "focus_column_2",
+    "label": "Focus column 2",
+    "default": "ctrl + alt - 2",
+    "command": "window focus 2"
+  },
+  {
+    "id": "swap_column_2",
+    "label": "Swap with column 2",
+    "default": "ctrl + alt + shift - 2",
+    "command": ""
+  },
+  {
+    "id": "focus_column_3",
+    "label": "Focus column 3",
+    "default": "ctrl + alt - 3",
+    "command": "window focus 3"
+  },
+  {
+    "id": "swap_column_3",
+    "label": "Swap with column 3",
+    "default": "ctrl + alt + shift - 3",
+    "command": ""
+  },
+  {
+    "id": "focus_column_4",
+    "label": "Focus column 4",
+    "default": "ctrl + alt - 4",
+    "command": "window focus 4"
+  },
+  {
+    "id": "swap_column_4",
+    "label": "Swap with column 4",
+    "default": "ctrl + alt + shift - 4",
+    "command": ""
+  },
+  {
+    "id": "focus_column_5",
+    "label": "Focus column 5",
+    "default": "ctrl + alt - 5",
+    "command": "window focus 5"
+  },
+  {
+    "id": "swap_column_5",
+    "label": "Swap with column 5",
+    "default": "ctrl + alt + shift - 5",
+    "command": ""
+  },
+  {
+    "id": "focus_column_6",
+    "label": "Focus column 6",
+    "default": "ctrl + alt - 6",
+    "command": "window focus 6"
+  },
+  {
+    "id": "swap_column_6",
+    "label": "Swap with column 6",
+    "default": "ctrl + alt + shift - 6",
+    "command": ""
+  },
+  {
+    "id": "focus_column_7",
+    "label": "Focus column 7",
+    "default": "ctrl + alt - 7",
+    "command": "window focus 7"
+  },
+  {
+    "id": "swap_column_7",
+    "label": "Swap with column 7",
+    "default": "ctrl + alt + shift - 7",
+    "command": ""
+  },
+  {
+    "id": "focus_column_8",
+    "label": "Focus column 8",
+    "default": "ctrl + alt - 8",
+    "command": "window focus 8"
+  },
+  {
+    "id": "swap_column_8",
+    "label": "Swap with column 8",
+    "default": "ctrl + alt + shift - 8",
+    "command": ""
+  },
+  {
+    "id": "focus_column_9",
+    "label": "Focus column 9",
+    "default": "ctrl + alt - 9",
+    "command": "window focus 9"
+  },
+  {
+    "id": "swap_column_9",
+    "label": "Swap with column 9",
+    "default": "ctrl + alt + shift - 9",
+    "command": ""
+  },
+  {
+    "id": "undo_move",
+    "label": "Undo last move",
+    "default": "ctrl + alt + cmd - z",
+    "command": "window undo"
+  },
+  {
+    "id": "view_back",
+    "label": "Previous view",
+    "default": "ctrl + alt + cmd - tab",
+    "command": "window viewback"
+  },
+  {
+    "id": "view_pin_0",
+    "label": "Go to View 0",
+    "default": "ctrl + alt + cmd - 0",
+    "command": "window viewpin 0"
+  },
+  {
+    "id": "view_save_0",
+    "label": "Replace View 0",
+    "default": "ctrl + alt + cmd + shift - 0",
+    "command": "window viewsave 0"
+  },
+  {
+    "id": "view_pin_1",
+    "label": "Go to View 1",
+    "default": "ctrl + alt + cmd - 1",
+    "command": "window viewpin 1"
+  },
+  {
+    "id": "view_save_1",
+    "label": "Replace View 1",
+    "default": "ctrl + alt + cmd + shift - 1",
+    "command": "window viewsave 1"
+  },
+  {
+    "id": "view_pin_2",
+    "label": "Go to View 2",
+    "default": "ctrl + alt + cmd - 2",
+    "command": "window viewpin 2"
+  },
+  {
+    "id": "view_save_2",
+    "label": "Replace View 2",
+    "default": "ctrl + alt + cmd + shift - 2",
+    "command": "window viewsave 2"
+  },
+  {
+    "id": "view_pin_3",
+    "label": "Go to View 3",
+    "default": "ctrl + alt + cmd - 3",
+    "command": "window viewpin 3"
+  },
+  {
+    "id": "view_save_3",
+    "label": "Replace View 3",
+    "default": "ctrl + alt + cmd + shift - 3",
+    "command": "window viewsave 3"
+  },
+  {
+    "id": "view_pin_4",
+    "label": "Go to View 4",
+    "default": "ctrl + alt + cmd - 4",
+    "command": "window viewpin 4"
+  },
+  {
+    "id": "view_save_4",
+    "label": "Replace View 4",
+    "default": "ctrl + alt + cmd + shift - 4",
+    "command": "window viewsave 4"
+  },
+  {
+    "id": "view_pin_5",
+    "label": "Go to View 5",
+    "default": "ctrl + alt + cmd - 5",
+    "command": "window viewpin 5"
+  },
+  {
+    "id": "view_save_5",
+    "label": "Replace View 5",
+    "default": "ctrl + alt + cmd + shift - 5",
+    "command": "window viewsave 5"
+  },
+  {
+    "id": "view_pin_6",
+    "label": "Go to View 6",
+    "default": "ctrl + alt + cmd - 6",
+    "command": "window viewpin 6"
+  },
+  {
+    "id": "view_save_6",
+    "label": "Replace View 6",
+    "default": "ctrl + alt + cmd + shift - 6",
+    "command": "window viewsave 6"
+  },
+  {
+    "id": "view_pin_7",
+    "label": "Go to View 7",
+    "default": "ctrl + alt + cmd - 7",
+    "command": "window viewpin 7"
+  },
+  {
+    "id": "view_save_7",
+    "label": "Replace View 7",
+    "default": "ctrl + alt + cmd + shift - 7",
+    "command": "window viewsave 7"
+  },
+  {
+    "id": "view_pin_8",
+    "label": "Go to View 8",
+    "default": "ctrl + alt + cmd - 8",
+    "command": "window viewpin 8"
+  },
+  {
+    "id": "view_save_8",
+    "label": "Replace View 8",
+    "default": "ctrl + alt + cmd + shift - 8",
+    "command": "window viewsave 8"
+  },
+  {
+    "id": "view_pin_9",
+    "label": "Go to View 9",
+    "default": "ctrl + alt + cmd - 9",
+    "command": "window viewpin 9"
+  },
+  {
+    "id": "view_save_9",
+    "label": "Replace View 9",
+    "default": "ctrl + alt + cmd + shift - 9",
+    "command": "window viewsave 9"
+  }
+]
