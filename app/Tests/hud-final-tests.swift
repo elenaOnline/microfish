@@ -96,7 +96,11 @@ do {
   return Array(UnsafeBufferPointer(start:rep.bitmapData!,count:rep.bytesPerRow*rep.pixelsHigh))
  }
  func darkness(_ px: [UInt8]) -> Int { stride(from:0,to:px.count,by:4).reduce(0) { $0+255-Int(px[$1]) } }   // red channel: the fill is the same, only the stroke differs
- fcheck(darkness(snap(true,active:false)) > darkness(snap(false,active:false))+40000,"\(darkness(snap(true,active:false))) vs \(darkness(snap(false,active:false))): inactive card stroke is stronger with Increase Contrast")
+ // Relative, not an absolute pixel margin: the rep's size follows the backing scale (2x on a Retina Mac, 1x on a CI
+ // runner), and macOS 26 draws the stroke a little lighter than 27. Measured: macOS 27 Retina 1.229x, macOS 26 on CI 1.116x.
+ let icDark=darkness(snap(true,active:false)), plainDark=darkness(snap(false,active:false))
+ print("  Increase Contrast stroke darkness: \(icDark) vs \(plainDark) (x\(String(format:"%.3f",Double(icDark)/Double(max(plainDark,1)))))")
+ fcheck(Double(icDark) > Double(plainDark)*1.08,"\(icDark) vs \(plainDark): inactive card stroke is stronger with Increase Contrast")
  fcheck(snap(true,active:true) != snap(false,active:true),"active ring changes with Increase Contrast")
  let slot=HUDEmptySlot(frame:CGRect(x:0,y:0,width:200,height:36)); slot.appearance=NSAppearance(named:.aqua)
  func slotBytes(_ ic: Bool) -> [UInt8] { hudIncreaseContrastOverride=ic; defer { hudIncreaseContrastOverride=nil }; let r=slot.bitmapImageRepForCachingDisplay(in:slot.bounds)!; slot.cacheDisplay(in:slot.bounds,to:r); return Array(UnsafeBufferPointer(start:r.bitmapData!,count:r.bytesPerRow*r.pixelsHigh)) }
