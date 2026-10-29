@@ -7,6 +7,15 @@
 #
 # Result: app/Vendor/Sparkle/{Sparkle.framework,bin/{generate_keys,sign_update,generate_appcast},VERSION}.
 # Only the framework and bin/ are kept; the sample app, symbols and old DSA scripts are dropped.
+#
+# Building the app against it (swiftc only; Updates.swift is the one file that imports Sparkle):
+#   swiftc ... app/Sources/*.swift \
+#     -F app/Vendor/Sparkle -framework Sparkle \
+#     -Xlinker -rpath -Xlinker @executable_path/../Frameworks
+# then embed it in the bundle KEEPING the framework's symlinks (cp -R would break them):
+#   ditto app/Vendor/Sparkle/Sparkle.framework Microfish.app/Contents/Frameworks/Sparkle.framework
+#   app/Scripts/sign-sparkle.sh Microfish.app/Contents/Frameworks/Sparkle.framework "$MICROFISH_SIGN_IDENTITY"
+# and sign the app last (never --deep). Info.plist keys: SUFeedURL, SUPublicEDKey, SUEnableAutomaticChecks=YES.
 set -eu
 here=${0:A:h}; vendor=$here/../Vendor; lock=$vendor/sparkle.lock; dest=$vendor/Sparkle
 source $lock
