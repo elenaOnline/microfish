@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for Microfish Engine.app.
+
+  LuaJIT's trace compiler writes machine code into memory it mmaps and then flips to
+  executable. The LuaJIT that mlua vendors does not use MAP_JIT (that needs a build-time
+  define it does not set), so `com.apple.security.cs.allow-jit` alone is NOT enough: the
+  process is killed (SIGKILL, exit 137) the first time a Lua function gets hot.
+  `allow-unsigned-executable-memory` is what works. Measured with app/Tests/jit-probe.lua
+  through examples/lua_probe.rs, signed `codesign -s - -o runtime`:
+      no entitlement        killed
+      allow-jit             killed
+      allow-unsigned-exec.  runs, trace compiler active
+  Evidence and method: polish notes engine.md, "Hardened runtime and LuaJIT".
+-->
+<plist version="1.0">
+  <dict>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+  </dict>
+</plist>
