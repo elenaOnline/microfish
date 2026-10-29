@@ -5,7 +5,7 @@ import AppKit
 
 // Watches one file path with a DispatchSource. The engine publishes by writing
 // "<path>.tmp" and renaming it over <path>, which replaces the inode, so the
-// descriptor is reopened on delete/rename. Watching the file (not work/) keeps
+// descriptor is reopened on delete/rename. Watching the file (not its folder) keeps
 // the helper's own log from feeding back into the watcher.
 final class FileWatcher {
  let path: String

@@ -3,7 +3,7 @@ import SwiftUI
 import Observation
 
 // Microfish Settings: an AppKit preferences window (NSToolbar, preference style) whose panes are
-// SwiftUI grouped forms. One draft spans every pane; Apply hands it to scripts/apply-settings.py,
+// SwiftUI grouped forms. One draft spans every pane; Apply hands it to the apply step,
 // which owns validation and the generated Lua. Only keys the user changed are rewritten, so saved
 // values the UI cannot represent exactly survive an Apply untouched.
 
@@ -69,7 +69,7 @@ struct SettingsPrefs: Equatable {
 
 struct ShortcutAction { let id: String; let label: String; let chord: String; let command: String }
 
-// Presentation only: groups and paired rows over the catalogue in config/shortcut-defaults.json.
+// Presentation only: groups and paired rows over the catalogue in the bundled shortcut-defaults.json.
 // Catalogue entries missing here still appear, under "Other", so a new action is never hidden.
 enum ShortcutLayout {
     struct Row: Identifiable { let id: String; let title: String; let ids: [String] }
@@ -147,7 +147,6 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
 
 @MainActor @Observable final class SettingsStore {
     enum Phase: Equatable { case idle, applying, waiting, confirmed, unconfirmed, rejected(String), failed(String) }
-    let rootURL: URL
     private(set) var raw: [String: Any] = [:]
     private(set) var saved = SettingsPrefs()
     var draft = SettingsPrefs() { didSet { if draft != oldValue { draftChanged(from: oldValue) } } }
@@ -202,14 +201,14 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
     @ObservationIgnored private var persistWork: DispatchWorkItem?
     @ObservationIgnored private var confirmTimer: Timer?
 
-    init(rootURL: URL) { self.rootURL = rootURL; load() }
+    init() { load() }
 
-    var prefsURL: URL { rootURL.appendingPathComponent("config/preferences.json") }
-    var pendingURL: URL { rootURL.appendingPathComponent("work/settings-drafts/pending.json") }
+    var prefsURL: URL { MicrofishPaths.preferences }
+    var pendingURL: URL { MicrofishPaths.drafts.appendingPathComponent("pending.json") }
     var defaults: [String: String] { Dictionary(catalog.map { ($0.id, $0.chord) }, uniquingKeysWith: { a, _ in a }) }
 
     func load() {
-        if let data = try? Data(contentsOf: rootURL.appendingPathComponent("config/shortcut-defaults.json")), let list = try? JSONSerialization.jsonObject(with: data) as? [[String: String]] {
+        if let data = try? Data(contentsOf: MicrofishPaths.shortcutCatalog), let list = try? JSONSerialization.jsonObject(with: data) as? [[String: String]] {
             catalog = list.compactMap { a in a["id"].map { ShortcutAction(id: $0, label: a["label"] ?? $0, chord: a["default"] ?? "", command: a["command"] ?? "") } }
         }
         raw = (try? Data(contentsOf: prefsURL)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
@@ -223,7 +222,7 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
         }
         restoredDraft = next != saved
         invalid = [:]; draft = next; revision += 1
-        if phase == .idle { phase = Self.restingPhase(rootURL, prefsURL: prefsURL) }
+        if phase == .idle { phase = Self.restingPhase(prefsURL: prefsURL) }
         if !restoredDraft { try? FileManager.default.removeItem(at: pendingURL) }
     }
     /// Picks up preferences written elsewhere without discarding the user's edits: fields the user
@@ -305,17 +304,17 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
         recordingNote = nil
         var out = raw
         for f in SettingsPrefs.fields where !f.same(draft, saved) { out[f.key] = f.write(draft) }
-        let submitted = draft, root = rootURL
-        let logOffset = SettingsController.engineLogURL(root).flatMap { (try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? NSNumber)?.uint64Value }
+        let submitted = draft
+        let logOffset = Optional(MicrofishPaths.engineLog).flatMap { (try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? NSNumber)?.uint64Value }
         phase = .applying; justApplied = false
         DispatchQueue.global(qos: .userInitiated).async {
             let result: Result<String, Error> = Result {
-                let directory = root.appendingPathComponent("work/settings-drafts")
+                let directory = MicrofishPaths.drafts
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 let path = directory.appendingPathComponent(UUID().uuidString + ".json")
                 try JSONSerialization.data(withJSONObject: out, options: [.prettyPrinted, .sortedKeys]).write(to: path, options: .atomic)
                 defer { try? FileManager.default.removeItem(at: path) }
-                let (status, data) = try SettingsController.run("/usr/bin/python3", [root.appendingPathComponent("scripts/apply-settings.py").path, path.path])
+                let (status, data) = try SettingsController.run("/usr/bin/python3", [MicrofishPaths.resources.appendingPathComponent("apply-settings.py").path, path.path], environment: MicrofishPaths.childEnvironment)
                 let message = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
                 if status != 0 && message.isEmpty { NSLog("apply-settings exited with %d", status) }
                 guard status == 0 else { throw NSError(domain: "Settings", code: Int(status), userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "Something went wrong while saving." : message]) }
@@ -340,7 +339,8 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
     /// reload leaves the previous configuration running, so it is reported rather than hidden.
     private func watchEngine(logOffset: UInt64?) {
         confirmTimer?.invalidate()
-        guard let log = SettingsController.engineLogURL(rootURL), let offset = logOffset else { phase = .unconfirmed; return }
+        let log = MicrofishPaths.engineLog
+        guard let offset = logOffset else { phase = .unconfirmed; return }
         let started = Date()
         confirmTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] timer in
             DispatchQueue.global(qos: .utility).async {
@@ -358,9 +358,9 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
     }
     /// What the engine last said about the saved settings: a reload logged after preferences.json
     /// was written means it is running them.
-    nonisolated static func restingPhase(_ root: URL, prefsURL: URL) -> Phase {
-        guard let log = SettingsController.engineLogURL(root),
-              let size = (try? FileManager.default.attributesOfItem(atPath: log.path)[.size] as? NSNumber)?.uint64Value,
+    nonisolated static func restingPhase(prefsURL: URL) -> Phase {
+        let log = MicrofishPaths.engineLog
+        guard let size = (try? FileManager.default.attributesOfItem(atPath: log.path)[.size] as? NSNumber)?.uint64Value,
               let written = try? FileManager.default.attributesOfItem(atPath: prefsURL.path)[.modificationDate] as? Date,
               let handle = try? FileHandle(forReadingFrom: log) else { return .idle }
         defer { try? handle.close() }
@@ -374,11 +374,10 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
         return .idle
     }
     func refreshWindows() {
-        let root = rootURL
         windowsNote = "Reading windows…"
         DispatchQueue.global(qos: .userInitiated).async {
             let result: Result<([LiveWindowEntry], Int?), Error> = Result {
-                let (status, data) = try SettingsController.run(SettingsController.engineExecutable(root) ?? "", ["query", "state", "--json"])
+                let (status, data) = try SettingsController.run(MicrofishPaths.engineExecutable.path, ["query", "state", "--json"], environment: MicrofishPaths.childEnvironment)
                 guard status == 0, let state = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw NSError(domain: "Settings", code: 2, userInfo: [NSLocalizedDescriptionKey: "Microfish isn’t responding."]) }
                 let me = ProcessInfo.processInfo.processName
                 let list = (state["virtual_workspaces"] as? [[String: Any]] ?? []).flatMap { $0["windows"] as? [[String: Any]] ?? [] }.compactMap { w -> LiveWindowEntry? in
@@ -482,13 +481,13 @@ final class SettingsWindow: NSWindow {
     private(set) var pane: SettingsPane = .behavior
     private var switchGeneration = 0
     private let recorder = ShortcutRecorder()
-    private let recordingQueue = DispatchQueue(label: "local.paneru.shortcut-recording")
+    private let recordingQueue = DispatchQueue(label: "net.webreceptor.microfish.shortcut-recording")
     fileprivate weak var searchField: NSSearchField?
     private static let paneKey = "MicrofishSettingsPane", originKey = "MicrofishSettingsWindowTopLeft"
     static let width: CGFloat = 600
 
-    nonisolated init(rootURL: URL) {
-        store = MainActor.assumeIsolated { SettingsStore(rootURL: rootURL) }
+    nonisolated override init() {
+        store = MainActor.assumeIsolated { SettingsStore() }
         super.init()
         MainActor.assumeIsolated {
             store.openPane = { [weak self] in self?.select($0, animate: true) }
@@ -756,10 +755,10 @@ final class SettingsWindow: NSWindow {
     }
     @objc private func menuShow() { present() }
     @objc private func menuAbout() {
-        NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "Microfish", .applicationIcon: Self.appIcon(store.rootURL) as Any].compactMapValues { $0 })
+        NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "Microfish", .applicationIcon: Self.appIcon() as Any].compactMapValues { $0 })
         NSApp.activate()
     }
-    nonisolated static func appIcon(_ root: URL) -> NSImage? { NSImage(contentsOf: root.appendingPathComponent("assets/microfish-icon.png")) }
+    nonisolated static func appIcon() -> NSImage? { NSImage(contentsOf: MicrofishPaths.appIcon) ?? NSImage(contentsOf: MicrofishPaths.appIcon.deletingPathExtension().appendingPathExtension("png")) }
     /// While Settings is open the helper behaves like an app: menu bar, ⌘Tab, Dock tile. It returns to
     /// a menu-bar accessory when Settings closes. Off until the engine ignores its own helper even
     /// when that helper is a regular app (BOARD 2026-10-28 00:35; engine exclusion live in 0a1ba64).
@@ -767,7 +766,7 @@ final class SettingsWindow: NSWindow {
     private func enterAppMode() {
         guard Self.becomesRegularApp, NSApp.activationPolicy() != .regular else { return }
         NSApp.setActivationPolicy(.regular)
-        if let icon = Self.appIcon(store.rootURL) { NSApp.applicationIconImage = icon }
+        if let icon = Self.appIcon() { NSApp.applicationIconImage = icon }
     }
     private func leaveAppMode() {
         guard Self.becomesRegularApp, NSApp.activationPolicy() == .regular else { return }
@@ -780,24 +779,25 @@ final class SettingsWindow: NSWindow {
 
     // MARK: Recording
     private func configureRecorder() {
-        let bridge = store.rootURL.appendingPathComponent("bin/PaneruNavigatorCommand").path
+        let bridge = MicrofishPaths.bridgeExecutable.path
+        let bridgeEnvironment = MicrofishPaths.childEnvironment
         let queue = recordingQueue
         recorder.suspend = { completion in
             let token = UUID().uuidString.lowercased()
             queue.async {
                 do {
-                    var result = try Self.run(bridge, ["record-begin", token])
+                    var result = try Self.run(bridge, ["record-begin", token], environment: bridgeEnvironment)
                     // A quick switch to another slot can arrive while the previous capture's lease is
                     // still being released; give that release a moment, once.
                     if result.0 != 0, String(decoding: result.1, as: UTF8.self).contains("lease") {
                         Thread.sleep(forTimeInterval: 0.25)
-                        result = try Self.run(bridge, ["record-begin", token])
+                        result = try Self.run(bridge, ["record-begin", token], environment: bridgeEnvironment)
                     }
                     guard result.0 == 0 else { throw NSError(domain: "ShortcutRecorder", code: Int(result.0), userInfo: [NSLocalizedDescriptionKey: "Couldn’t start recording. Microfish isn’t responding."]) }
-                    completion(.success({ queue.async { _ = try? Self.run(bridge, ["record-end", token]) } }))
+                    completion(.success({ queue.async { _ = try? Self.run(bridge, ["record-end", token], environment: bridgeEnvironment) } }))
                 } catch {
                     // A timed-out acknowledgement may still have installed the lease.
-                    _ = try? Self.run(bridge, ["record-end", token])
+                    _ = try? Self.run(bridge, ["record-end", token], environment: bridgeEnvironment)
                     completion(.failure(error))
                 }
             }
@@ -821,17 +821,6 @@ final class SettingsWindow: NSWindow {
     }
 
     // MARK: Processes
-    nonisolated static func engineExecutable(_ root: URL) -> String? {
-        guard let data = try? Data(contentsOf: root.appendingPathComponent("config/trial.plist")),
-              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else { return nil }
-        return (plist["ProgramArguments"] as? [String])?.first
-    }
-    nonisolated static func engineLogURL(_ root: URL) -> URL? {
-        guard let data = try? Data(contentsOf: root.appendingPathComponent("config/trial.plist")),
-              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-              let path = plist["StandardErrorPath"] as? String else { return nil }
-        return URL(fileURLWithPath: path)
-    }
     /// nil while the engine hasn't reloaded since `offset`; otherwise whether the reload succeeded.
     nonisolated static func reloadVerdict(_ log: URL, from offset: UInt64) -> Result<Void, Error>? {
         guard let handle = try? FileHandle(forReadingFrom: log) else { return nil }
@@ -850,8 +839,9 @@ final class SettingsWindow: NSWindow {
         }
         return nil
     }
-    nonisolated static func run(_ executable: String, _ arguments: [String], timeout: TimeInterval = 15) throws -> (Int32, Data) {
+    nonisolated static func run(_ executable: String, _ arguments: [String], environment: [String: String]? = nil, timeout: TimeInterval = 15) throws -> (Int32, Data) {
         let p = Process(); p.executableURL = URL(fileURLWithPath: executable); p.arguments = arguments
+        if let environment { p.environment = environment }
         let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe; try p.run()
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
         timer.schedule(deadline: .now() + timeout)
@@ -986,8 +976,8 @@ struct FooterBar: View {
                         .accessibilityLabel("Show conflicting shortcut")
                 }
                 if store.hasBadOutcome && store.conflictCount == 0 && store.flagged.isDisjoint(with: store.invalid.keys) && store.recordingNote == nil && store.recordingID == nil {
-                    if case .rejected = store.phase, let log = SettingsController.engineLogURL(store.rootURL) {
-                        Button("Open Log") { NSWorkspace.shared.open(log) }.buttonStyle(.link).foregroundStyle(settingsAccent).font(.callout)
+                    if case .rejected = store.phase {
+                        Button("Open Log") { NSWorkspace.shared.open(MicrofishPaths.engineLog) }.buttonStyle(.link).foregroundStyle(settingsAccent).font(.callout)
                     }
                     Button("Dismiss") { store.dismissOutcome() }.buttonStyle(.link).foregroundStyle(settingsAccent).font(.callout)
                 }

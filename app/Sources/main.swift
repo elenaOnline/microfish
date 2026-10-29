@@ -804,54 +804,7 @@ final class StripPanel: NSPanel {
  override var canBecomeMain: Bool { false }
 }
 struct Entry { let id: Int; let column: Int; let app: String; let bundle: String; let title: String; var tabHeight: Int = 0; var selectedID: Int = 0 }
-// Clean quit of the whole product: engine first (Command::Quit -> AppExit saves the session and
-// restores windows), then the helper. Both launchd jobs have KeepAlive false, so nothing
-// respawns; Microfish.app relaunches both. Runner and clock are injected so tests never reach
-// the real binary. Exit codes: noLaunch = could not start the engine binary, timedOut = our own
-// per-call deadline killed a hung child (the engine may be mid-shutdown: not proof it is gone).
-struct QuitSequence {
- enum Outcome: Equatable {
-  case stopped, absent, stuck, sendFailed, unreachable
-  // Only a confirmed-gone engine lets the helper go; otherwise the tabs stay usable.
-  var helperMayExit: Bool { self == .stopped || self == .absent }
- }
- static let noLaunch: Int32 = -1, timedOut: Int32 = 124
- var run: ([String]) -> Int32
- var now: () -> Double = { ProcessInfo.processInfo.systemUptime }
- var sleep: (Double) -> Void = { Thread.sleep(forTimeInterval: $0) }
- var timeout = 5.0, interval = 0.1
- // `query active` answers only while the daemon is serving the socket. nil = cannot tell.
- func alive() -> Bool? {
-  let code = run(["query","active"])
-  return code == 0 || code == QuitSequence.timedOut ? true : code == QuitSequence.noLaunch ? nil : false
- }
- func execute() -> Outcome {
-  guard let up = alive() else { return .unreachable }
-  if !up { return .absent }
-  if run(["send-cmd","quit"]) != 0 { return alive() == false ? .stopped : .sendFailed }
-  let deadline = now() + timeout
-  while true {
-   if alive() == false { return .stopped }
-   if now() >= deadline { return .stuck }
-   sleep(interval)
-  }
- }
- // Production runner: the engine binary next to this helper, silent, each call bounded.
- static func process(_ executable: URL, callLimit: Double = 2) -> ([String]) -> Int32 {
-  return { arguments in
-   let child = Process(); child.executableURL = executable; child.arguments = arguments
-   child.standardOutput = FileHandle.nullDevice; child.standardError = FileHandle.nullDevice
-   do { try child.run() } catch { return noLaunch }
-   let deadline = Date().addingTimeInterval(callLimit)
-   while child.isRunning {
-    if Date() >= deadline { child.terminate(); child.waitUntilExit(); return timedOut }
-    Thread.sleep(forTimeInterval: 0.02)
-   }
-   return child.terminationStatus
-  }
- }
-}
-// Runs the engine bridge (PaneruNavigatorCommand) one command at a time, in submission order, so the engine
+// Runs the engine bridge (microfish-command) one command at a time, in submission order, so the engine
 // receives commands in the order the user made them. Completion is event-driven: the next command starts
 // when the previous process has exited (terminationHandler) and its stderr has closed, with no thread parked
 // in Process.waitUntilExit, which returned ~65 ms after the child had exited (focus-latency-report.md).
@@ -881,6 +834,8 @@ final class CommandRunner {
   }
  }
  let executable: URL
+ /// The bridge reaches this install's engine through its environment (`MicrofishPaths.childEnvironment`).
+ var environment: [String:String]? = MicrofishPaths.childEnvironment
  private let queue: DispatchQueue
  private let lock = NSLock()
  private var pending: [Job] = []
@@ -901,6 +856,7 @@ final class CommandRunner {
   let command = Process()
   command.executableURL = executable
   command.arguments = job.arguments
+  if let environment { command.environment = environment }
   command.standardOutput = FileHandle.nullDevice
   let errors = Pipe(); command.standardError = errors
   let running = Running()
@@ -952,7 +908,9 @@ final class Navigator: NSObject, NSApplicationDelegate {
  // or back to idle when the engine would not stop. A second request while not idle does nothing.
  enum QuitPhase { case idle, stopping, finishing }
  var quitPhase = QuitPhase.idle
- var quitSequenceOverride: QuitSequence?
+ /// The engine's lifecycle. Tests inject a fake; a test build refuses the live one.
+ var engineControlOverride: EngineControlling?
+ lazy var engineControl: EngineControlling = engineControlOverride ?? EngineControl.live()
  var quitBackground: (@escaping () -> Void) -> Void = { DispatchQueue.global(qos:.userInitiated).async(execute:$0) }
  var quitMain: (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute:$0) }
  #if NAVIGATOR_TESTS
@@ -972,7 +930,6 @@ final class Navigator: NSObject, NSApplicationDelegate {
  var settings: SettingsController?
  let spatialOverview=SpatialOverviewController()
  #endif
- var rootURL: URL { URL(fileURLWithPath:path).deletingLastPathComponent().deletingLastPathComponent() }
  var panel: StripPanel!
  var previous = ""
  var modified = Date.distantPast
@@ -998,11 +955,12 @@ final class Navigator: NSObject, NSApplicationDelegate {
  var displayLinkScreen: UInt32?
  var timer: Timer?
  var icons: [String:NSImage] = [:]
- let commandQueue = DispatchQueue(label: "local.paneru.navigator.commands", qos: .userInitiated)
+ let commandQueue = DispatchQueue(label: "net.webreceptor.microfish.commands", qos: .userInitiated)
  lazy var commandRunner = CommandRunner(
-  executable: URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.deletingLastPathComponent().appendingPathComponent("PaneruNavigatorCommand"),
+  executable: MicrofishPaths.bridgeExecutable,
   queue: commandQueue)
- init(path: String) { self.path=path }
+ /// `path` is the snapshot the engine writes (`Runtime/navigator.tsv`); tests point it at a fixture.
+ init(path: String = MicrofishPaths.snapshot.path) { self.path=path }
  // Status menu: Settings, Reload, then Quit last, as menu bar apps do (⌘Q while the menu is open).
  func makeStatusMenu() -> NSMenu {
   let menu=NSMenu()
@@ -1013,15 +971,6 @@ final class Navigator: NSObject, NSApplicationDelegate {
   if #available(macOS 27.0, *) { for item in menu.items where !item.isSeparatorItem { item.preferredImageVisibility = .hidden } }
   return menu
  }
- func liveQuitSequence() -> QuitSequence {
-  #if NAVIGATOR_TESTS
-  // A test that gets here would reach the real engine: refuse (tests inject quitSequenceOverride).
-  return QuitSequence(run:{ _ in preconditionFailure("test reached the real engine") })
-  #else
-  let engine=URL(fileURLWithPath:CommandLine.arguments[0]).standardizedFileURL.deletingLastPathComponent().appendingPathComponent("Microfish")
-  return QuitSequence(run:QuitSequence.process(engine))
-  #endif
- }
  // Stops the engine cleanly (it saves the session), then the helper. If the engine does not
  // stop within the timeout the helper stays: killing it would leave a live engine with no tabs,
  // minimap or Settings, and a retry from this menu stays possible. Beep + log say so.
@@ -1030,13 +979,13 @@ final class Navigator: NSObject, NSApplicationDelegate {
   quitPhase = .stopping
   if panel != nil { hide() }
   NSLog("Navigator quit: stopping engine")
-  let sequence = quitSequenceOverride ?? liveQuitSequence()
+  let control = engineControl
   quitBackground { [weak self] in
-   let outcome = sequence.execute()
+   let outcome = control.stop()
    self?.quitMain { [weak self] in self?.finishQuit(outcome) }
   }
  }
- func finishQuit(_ outcome: QuitSequence.Outcome) {
+ func finishQuit(_ outcome: EngineStopOutcome) {
   NSLog("Navigator quit: engine %@",String(describing:outcome))
   if outcome.helperMayExit { quitPhase = .finishing; quitExit() }
   else { quitPhase = .idle; quitFailed() }
@@ -1062,6 +1011,9 @@ final class Navigator: NSObject, NSApplicationDelegate {
   panel.collectionBehavior=[.canJoinAllSpaces,.fullScreenAuxiliary,.ignoresCycle,.transient]
   panel.animationBehavior = .none
   panel.canHide=false   // ⌘H / Hide Others must not blank the HUD, and orderFront while hidden would un-hide the app
+  #if !NAVIGATOR_TESTS
+  MicrofishProvisioning.run()
+  #endif
   intentModified = (try? FileManager.default.attributesOfItem(atPath:path.replacingOccurrences(of:".tsv",with:".intent"))[.modificationDate] as? Date) ?? .distantPast
   reloadPreferences()
   let status=NSStatusBar.system.statusItem(withLength:NSStatusItem.variableLength)
@@ -1073,25 +1025,17 @@ final class Navigator: NSObject, NSApplicationDelegate {
   let menu=makeStatusMenu()
   status.menu=menu; statusItem=status
   #if !NAVIGATOR_TESTS
-  spatialOverview.pinsPath = rootURL.appendingPathComponent("work/state/paneru/view-pins.json").path
+  spatialOverview.pinsPath = MicrofishPaths.viewPins.path
   spatialOverview.onViewAction = { [weak self] action, slot in
    self?.sendCommand([action] + (slot.map { [String($0)] } ?? []))
   }
   spatialOverview.onSettings = { [weak self] in self?.openSettings() }
   spatialOverview.onRefresh = { [weak self] completion in
    guard let self else { completion(false); return }
-   let root=self.rootURL
+   let control = self.engineControl
    DispatchQueue.global(qos:.userInitiated).async {
-    let process=Process(); process.executableURL=URL(fileURLWithPath:"/usr/bin/python3")
-    process.arguments=[root.appendingPathComponent("scripts/refresh-microfish.py").path]
-    let log=root.appendingPathComponent("work/refresh.log")
-    FileManager.default.createFile(atPath:log.path,contents:nil)
-    let output=try? FileHandle(forWritingTo:log)
-    process.standardOutput=output; process.standardError=output
-    var success=false
-    do { try process.run(); process.waitUntilExit(); success=process.terminationStatus == 0 } catch { }
-    try? output?.close()
-    DispatchQueue.main.async { completion(success) }
+    let result = EngineRefresh(engine:control).run()
+    DispatchQueue.main.async { completion(result.success) }
    }
   }
   spatialOverview.onReload = { [weak self] in self?.reloadPreferences() }
@@ -1116,7 +1060,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   // geometry is paced by the owning display in common run-loop modes.
   // Files announce the engine's changes (per-file watchers, coalesced to one tick per event burst).
   signals.onWake = { [weak self] in self?.tick(forcePoll: true) }
-  signals.watch([rootURL.path+"/config/preferences.json",path,path.replacingOccurrences(of:".tsv",with:".intent")])
+  signals.watch([MicrofishPaths.preferences.path,path,path.replacingOccurrences(of:".tsv",with:".intent")])
   tabBars.onSampled = { [weak self] in self?.signals.sampleReady() }
   // Bars visible: the 30 Hz clock keeps the bare-Hyper keystroke baselines fresh between lifecycle ticks.
   signals.onFastFire = { [weak self] in
@@ -1130,7 +1074,23 @@ final class Navigator: NSObject, NSApplicationDelegate {
    if self.displayLink == nil || !screenPresent { self.tick() }
   }
   observeEnvironment()
+  #if !NAVIGATOR_TESTS
+  startEngine()
+  #endif
  }
+ #if !NAVIGATOR_TESTS
+ // Opening the app starts the engine: register the agent, and kickstart it unless it already answers.
+ // A problem the user can fix gets one standard alert (approval in Login Items, or the Accessibility grant).
+ func startEngine() {
+  let control=engineControl
+  DispatchQueue.global(qos:.userInitiated).async {
+   let outcome=control.start()
+   NSLog("Navigator launch: engine %@",String(describing:outcome))
+   guard let alert=EngineAlert.forStart(outcome) else { return }
+   DispatchQueue.main.async { alert.present { control.openLoginItemsSettings() } }
+  }
+ }
+ #endif
  // Spaces, displays, appearance and accessibility options change under a visible HUD.
  func observeEnvironment() {
   let workspace=NSWorkspace.shared.notificationCenter
@@ -1153,14 +1113,14 @@ final class Navigator: NSObject, NSApplicationDelegate {
  @objc func openSettings() {
   #if !NAVIGATOR_TESTS
   if settings == nil {
-   settings=SettingsController(rootURL:rootURL)
+   settings=SettingsController()
    settings?.onApplied = { [weak self] in self?.reloadPreferences() }
   }
   settings?.show()
   #endif
  }
  func reloadPreferences() {
-  let url=rootURL.appendingPathComponent("config/preferences.json")
+  let url=MicrofishPaths.preferences
   preferences=NavigatorPreferences(try? Data(contentsOf:url))
   preferencesModified=(try? FileManager.default.attributesOfItem(atPath:url.path)[.modificationDate] as? Date) ?? .distantPast
   tabBars.aliases=preferences.aliases
@@ -1213,7 +1173,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   let date=Date(), now=date.timeIntervalSinceReferenceDate
   let pollSnapshot = signals.takeFileChange() || forcePoll
   if pollSnapshot {
-   let prefsPath=rootURL.appendingPathComponent("config/preferences.json").path
+   let prefsPath=MicrofishPaths.preferences.path
    let prefsStamp=(try? FileManager.default.attributesOfItem(atPath:prefsPath)[.modificationDate] as? Date) ?? .distantPast
    if prefsStamp != preferencesModified { reloadPreferences(); signals.requestRead() }
   }
@@ -1679,7 +1639,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
 #if !NAVIGATOR_TESTS
 let app=NSApplication.shared
 app.setActivationPolicy(.accessory)
-let delegate=Navigator(path:CommandLine.arguments[1])
+let delegate=Navigator()
 app.delegate=delegate
 app.run()
 

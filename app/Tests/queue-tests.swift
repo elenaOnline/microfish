@@ -91,13 +91,11 @@ do {
   pump { secondAt != 0 }
   ok(firstAt - t0 < 600 && secondAt - t0 < 1000, "stderr held by a grandchild does not hold the queue (\(firstAt - t0), \(secondAt - t0) ms)")
  }
- // End to end through Navigator.sendCommand: the bridge is found next to this executable; completion runs on main.
+ // End to end through Navigator.sendCommand: the bridge is MicrofishPaths.bridgeExecutable (MICROFISH_BRIDGE); completion runs on main.
  do {
-  let beside = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.deletingLastPathComponent().appendingPathComponent("PaneruNavigatorCommand")
-  try? FileManager.default.removeItem(at: beside)
-  try! FileManager.default.copyItem(at: fake, to: beside)
-  defer { try? FileManager.default.removeItem(at: beside) }
   let nav = Navigator(path: dir.appendingPathComponent("navigator.tsv").path)
+  ok(nav.commandRunner.executable == MicrofishPaths.bridgeExecutable, "the bridge comes from MicrofishPaths")
+  nav.commandRunner = CommandRunner(executable: fake, queue: nav.commandQueue)
   var accepted: [(Bool, Bool)] = []
   for name in ["a1", "slow2", "a3"] { nav.sendCommand([name]) { accepted.append(($0, Thread.isMainThread)) } }
   pump { accepted.count == 3 }

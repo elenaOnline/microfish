@@ -4,31 +4,31 @@
 --src, and compares the PNG bytes. Offscreen bitmaps only: nothing is shown.
 With the new tree each HUD/map state is also rendered through the reuse path (names ending -REUSED, built after the
 pooled views served other content) and compared with the base's fresh render of the same state.
-Usage: tests/pixel-diff.py [--src DIR] [--base-ref REF | --base DIR] [--scratch DIR]"""
+Usage: pixel-diff.py --base DIR [--src DIR] [--scratch DIR]   (BASE and SRC are Sources/ directories)"""
 from pathlib import Path
 import argparse, filecmp, shutil, subprocess, sys
 here = Path(__file__).resolve().parent; repo = here.parent
 p = argparse.ArgumentParser()
-p.add_argument('--src', default=str(repo/'src')); p.add_argument('--base-ref', default='main'); p.add_argument('--base')
-p.add_argument('--scratch', default='/tmp/mfperf/leak/pixel')
+p.add_argument('--src', default=str(repo/'Sources')); p.add_argument('--base')
+p.add_argument('--scratch', default='/tmp/microfish-app-tests/pixel')
 a = p.parse_args(); scratch = Path(a.scratch); shutil.rmtree(scratch, ignore_errors=True); scratch.mkdir(parents=True)
-if a.base: base = Path(a.base)
-else:
-    base = scratch/'base'; base.mkdir()
-    # The main tree sits inside the Intelligence repo; its navigator history lives in polish/navigator.git.
-    gitdir = repo/'polish'/'navigator.git'
-    git = ['git', '--git-dir', str(gitdir)] if gitdir.is_dir() else ['git', '-C', str(repo)]
-    tar = subprocess.run([*git, 'archive', a.base_ref, 'src'], check=True, capture_output=True).stdout
-    subprocess.run(['tar', '-x', '-C', str(base)], input=tar, check=True); base = base/'src'
+# The baseline is a tree of the old sources (a src/ directory from before the change under test).
+if not a.base: sys.exit('pixel-diff needs --base DIR: a tree of the old sources to compare against')
+base = Path(a.base)
 new = Path(a.src)
-FW = ['-framework', 'AppKit', '-framework', 'QuartzCore']
-OTHERS = ['TabBars.swift', 'Settings.swift', 'ShortcutRecorder.swift', 'SpatialOverview.swift', 'LiveSignals.swift']
+FW = ['-framework', 'AppKit', '-framework', 'QuartzCore', '-framework', 'ServiceManagement']
+OLD_OTHERS = ['TabBars.swift', 'Settings.swift', 'ShortcutRecorder.swift', 'SpatialOverview.swift', 'LiveSignals.swift']
+def others_for(src, kind):
+    listed = Path(src)/'SOURCES'   # the current tree lists its sources; an old tree has the fixed set
+    if not listed.exists(): return ['SpatialOverview.swift'] if kind == 'map' else OLD_OTHERS
+    every = [l.strip() for l in listed.read_text().splitlines() if l.strip() and l.strip() != 'main.swift']
+    return ['Paths.swift', 'EngineControl.swift', 'SpatialOverview.swift'] if kind == 'map' else every   # the map is built without Navigator
 def build(src, tag, kind, defines):
     d = scratch/f'{kind}-{tag}'; d.mkdir()
     if kind == 'map':
-        (d/'main.swift').write_text((here/'pixel-describe.swift').read_text() + '\n' + (here/'pixel-render-map.swift').read_text()); others = ['SpatialOverview.swift']; defs = defines
+        (d/'main.swift').write_text((here/'pixel-describe.swift').read_text() + '\n' + (here/'pixel-render-map.swift').read_text()); others = others_for(src, kind); defs = ['NAVIGATOR_TESTS'] + defines
     else:
-        (d/'main.swift').write_text((Path(src)/'main.swift').read_text() + '\n' + (here/'pixel-describe.swift').read_text() + '\n' + (here/f'pixel-render-{kind}.swift').read_text()); others = OTHERS; defs = ['NAVIGATOR_TESTS'] + defines
+        (d/'main.swift').write_text((Path(src)/'main.swift').read_text() + '\n' + (here/'pixel-describe.swift').read_text() + '\n' + (here/f'pixel-render-{kind}.swift').read_text()); others = others_for(src, kind); defs = ['NAVIGATOR_TESTS'] + defines
     subprocess.run(['swiftc', '-suppress-warnings', *sum([['-D', x] for x in defs], []), *[str(Path(src)/f) for f in others], str(d/'main.swift'), '-o', str(d/'r'), *FW], check=True)
     (d/'png').mkdir(); subprocess.run([str(d/'r'), str(d/'png')], check=True, cwd=d, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return d/'png'
