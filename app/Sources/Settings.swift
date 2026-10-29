@@ -3,7 +3,7 @@ import SwiftUI
 import Observation
 
 // Microfish Settings: an AppKit preferences window (NSToolbar, preference style) whose panes are
-// SwiftUI grouped forms. One draft spans every pane; Apply hands it to scripts/apply-settings.py,
+// SwiftUI grouped forms. One draft spans every pane; Apply hands it to SettingsApply (SettingsApply.swift),
 // which owns validation and the generated Lua. Only keys the user changed are rewritten, so saved
 // values the UI cannot represent exactly survive an Apply untouched.
 
@@ -315,9 +315,9 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
                 let path = directory.appendingPathComponent(UUID().uuidString + ".json")
                 try JSONSerialization.data(withJSONObject: out, options: [.prettyPrinted, .sortedKeys]).write(to: path, options: .atomic)
                 defer { try? FileManager.default.removeItem(at: path) }
-                let (status, data) = try SettingsController.run("/usr/bin/python3", [root.appendingPathComponent("scripts/apply-settings.py").path, path.path])
-                let message = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-                if status != 0 && message.isEmpty { NSLog("apply-settings exited with %d", status) }
+                let applied = SettingsApply.run(draft: path)
+                let (status, message) = (applied.status, applied.message)
+                if status != 0 && message.isEmpty { NSLog("settings apply exited with %d", status) }
                 guard status == 0 else { throw NSError(domain: "Settings", code: Int(status), userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "Something went wrong while saving." : message]) }
                 return message
             }
@@ -419,7 +419,7 @@ struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; l
         default: return nil
         }
     }
-    /// apply-settings.py prints one plain sentence for every failure it knows (details go to its log), so
+    /// SettingsApply reports one plain sentence for every failure it knows (details go to its log), so
     /// show that sentence; anything else (a crash, several lines) gets the generic line.
     nonisolated static func failureText(_ message: String) -> String {
         let generic = "Couldn’t apply these settings. Microfish kept the previous ones."
