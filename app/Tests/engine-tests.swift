@@ -63,10 +63,10 @@ let plist = root.appendingPathComponent("agent.plist")
 func writePlist(_ body: String) { try! body.write(to: plist, atomically: true, encoding: .utf8) }
 writePlist("<plist>v1</plist>")
 
-func makeControl(_ world: FakeWorld, _ agent: FakeAgent, defaults: UserDefaults) -> (EngineControl, () -> Double) {
+func makeControl(_ world: FakeWorld, _ agent: FakeAgent, defaults: UserDefaults, inspector: EngineBuildInspecting? = nil) -> (EngineControl, () -> Double) {
     let c = EngineControl(runner: world, service: agent, defaults: defaults,
                           engine: URL(fileURLWithPath: "/fake/Microfish Engine"), launchctl: URL(fileURLWithPath: "/bin/launchctl"),
-                          label: "test.engine", domainTarget: "gui/501/test.engine", plist: plist, environment: ["PANERU_MACH_SERVICE": "test.engine"])
+                          label: "test.engine", domainTarget: "gui/501/test.engine", plist: plist, environment: ["PANERU_MACH_SERVICE": "test.engine"], inspector: inspector)
     var t = 0.0
     c.now = { t }; c.sleep = { t += $0 }
     return (c, { t })
@@ -312,4 +312,87 @@ do {
     result = refresh(engine, p).run()
     echeck(result.success && fm.fileExists(atPath: p.backups.appendingPathComponent("20260101-000000/state-before").path), "no State folder yet: empty backups")
 }
+// MARK: a running engine from another build (unclean update)
+struct FakeInspector: EngineBuildInspecting { var match: EngineBuildMatch; func compare() -> EngineBuildMatch { match } }
+do {
+    // Same build: adopted, nothing stopped or started.
+    let world = FakeWorld(); world.active = true
+    let (c, _) = makeControl(world, FakeAgent(.enabled), defaults: freshDefaults(), inspector: FakeInspector(match: .same))
+    echeck(c.start() == .alreadyRunning && world.launchctlCalls.isEmpty, "same build is adopted: \(world.launchctlCalls)")
+    // Cannot tell: adopted too (an engine we cannot identify is never killed).
+    let w2 = FakeWorld(); w2.active = true
+    let (c2, _) = makeControl(w2, FakeAgent(.enabled), defaults: freshDefaults(), inspector: FakeInspector(match: .unknown))
+    echeck(c2.start() == .alreadyRunning && w2.launchctlCalls.isEmpty, "unknown build is adopted")
+}
+do {
+    // Different build: stopped through the normal stop (SIGTERM, session saved), then started once.
+    let world = FakeWorld(); world.active = true
+    let (c, _) = makeControl(world, FakeAgent(.enabled), defaults: freshDefaults(), inspector: FakeInspector(match: .different))
+    let outcome = c.start()
+    echeck(outcome == .replacedStale && outcome.isRunning, "stale engine replaced: \(outcome)")
+    echeck(world.launchctlCalls == ["launchctl kill SIGTERM gui/501/test.engine", "launchctl kickstart gui/501/test.engine"], "one kill, one kickstart, in order: \(world.launchctlCalls)")
+    echeck(world.active, "the new engine answers")
+    echeck(EngineAlert.forStart(.replacedStale) == nil, "no alert for a clean replacement")
+    // A second start finds the new engine (the inspector would say .same in life) and does nothing more.
+    let again = FakeWorld(); again.active = true
+    let (c2, _) = makeControl(again, FakeAgent(.enabled), defaults: freshDefaults(), inspector: FakeInspector(match: .same))
+    echeck(c2.start() == .alreadyRunning && again.launchctlCalls.isEmpty, "no restart loop")
+}
+do {
+    // The stale engine will not stop: left alone, never started over it, one plain sentence for the user.
+    let world = FakeWorld(); world.active = true; world.diesAfter = nil
+    let (c, _) = makeControl(world, FakeAgent(.enabled), defaults: freshDefaults(), inspector: FakeInspector(match: .different))
+    let outcome = c.start()
+    echeck(outcome == .staleEngineStuck && outcome.isRunning, "stuck stale engine: \(outcome)")
+    echeck(!world.launchctlCalls.contains { $0.contains("kickstart") } && world.active, "not started over, still running")
+    let a = EngineAlert.forStart(.staleEngineStuck)!
+    echeck(a.action == nil && a.actionTitle == nil && a.message.filter { $0 == "." }.count == 1 && a.message.hasSuffix("."), "a standard alert with one sentence: \(a.message)")
+    // The stop cannot reach it at all: also left alone.
+    let w2 = FakeWorld(); w2.active = true; w2.killStatus = 113; w2.sendCmdStatus = 1
+    let (c2, _) = makeControl(w2, FakeAgent(.enabled), defaults: freshDefaults(), inspector: FakeInspector(match: .different))
+    echeck(c2.start() == .staleEngineStuck && !w2.launchctlCalls.contains { $0.contains("kickstart") }, "unreachable stale engine is left alone")
+    // Not running at all: the inspector is never consulted and a plain start happens.
+    let w3 = FakeWorld()
+    let (c3, _) = makeControl(w3, FakeAgent(.enabled), defaults: freshDefaults(), inspector: FakeInspector(match: .different))
+    echeck(c3.start() == .started && w3.launchctlCalls == ["launchctl kickstart gui/501/test.engine"], "nothing running: plain start")
+}
+// The system inspector's parts, against real facts about this very process (read-only, no launchd).
+do {
+    let printed = """
+    gui/501/net.webreceptor.microfish.engine = {
+    \tactive count = 1
+    \tstate = running
+    \tprogram = /Applications/Microfish.app/Contents/Helpers/Microfish Engine.app/Contents/MacOS/Microfish Engine
+    \tpid = 4242
+    \tendpoints = {
+    \t}
+    }
+    """
+    echeck(SystemEngineInspector.pid(fromLaunchctlPrint: printed) == 4242, "pid parsed from launchctl print")
+    echeck(SystemEngineInspector.pid(fromLaunchctlPrint: "state = waiting\n") == nil, "no pid while not running")
+    echeck(SystemEngineInspector.pid(fromLaunchctlPrint: "pid = 0\n") == nil && SystemEngineInspector.pid(fromLaunchctlPrint: "") == nil, "zero and empty are not pids")
+    let me = URL(fileURLWithPath: CommandLine.arguments[0])
+    let running = SystemEngineInspector.runningImage(pid: getpid())
+    echeck(running != nil && running == SystemEngineInspector.identity(of: me), "this process's image is identified as its own executable file")
+    // A different file is different even with identical content.
+    let copy = root.appendingPathComponent("copy-of-me")
+    try! fm.copyItem(at: me, to: copy)
+    echeck(SystemEngineInspector.identity(of: copy) != running, "a copy of the executable is a different build")
+    echeck(SystemEngineInspector.runningImage(pid: 0x7ffffff0) == nil && SystemEngineInspector.identity(of: root.appendingPathComponent("nope")) == nil, "missing process or file: nil")
+    // End to end through the runner: launchd names our pid; the 'bundled' engine is our executable (same) or a copy (different).
+    final class PrintRunner: EngineProcessRunner {
+        var output = ""; var status: Int32 = 0
+        func run(_ executable: URL, _ arguments: [String], environment: [String: String]?, timeout: TimeInterval) -> CommandResult { CommandResult(status: status, output: output) }
+    }
+    let runner = PrintRunner(); runner.output = "\tpid = \(getpid())\n"
+    func inspect(_ engine: URL) -> SystemEngineInspector { SystemEngineInspector(runner: runner, launchctl: URL(fileURLWithPath: "/bin/launchctl"), domainTarget: "gui/501/test.engine", engine: engine) }
+    echeck(inspect(me).compare() == .same, "running image is this bundle's engine file: same")
+    echeck(inspect(copy).compare() == .different, "running image differs from the bundle's file: different")
+    echeck(inspect(root.appendingPathComponent("nope")).compare() == .unknown, "bundle file missing: unknown")
+    runner.status = 113
+    echeck(inspect(me).compare() == .unknown, "job not known to launchd: unknown")
+    runner.status = 0; runner.output = "\tstate = waiting\n"
+    echeck(inspect(me).compare() == .unknown, "job has no pid: unknown")
+}
+
 print("engine checks passed:", engineChecks)

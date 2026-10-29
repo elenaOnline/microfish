@@ -1072,6 +1072,11 @@ final class Navigator: NSObject, NSApplicationDelegate, NSMenuItemValidation {
   return true
  }
  func applicationDidFinishLaunching(_ notification: Notification) {
+  #if !NAVIGATOR_TESTS
+  // Another Microfish is already running, or this copy is in the wrong place (disk image, translocated, outside
+  // Applications): start nothing, register nothing. quitPhase .finishing lets the terminate through untouched.
+  if !LaunchGate.proceed() { quitPhase = .finishing; NSApp.terminate(nil); return }
+  #endif
   panel=StripPanel(contentRect:.zero,styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
   panel.level = .floating
   panel.isOpaque=false; panel.backgroundColor = .clear; panel.hasShadow=true

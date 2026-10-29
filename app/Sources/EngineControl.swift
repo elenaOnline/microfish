@@ -100,6 +100,67 @@ struct UnavailableAgentService: AgentService {
     func openLoginItemsSettings() {}
 }
 
+// MARK: Which build is the running engine
+
+/// A file's identity: device and inode. A running process keeps its executable's inode even after the file is
+/// renamed or replaced, so equal identity means "this very file", whatever the path says now.
+struct FileIdentity: Equatable { var device: UInt64; var inode: UInt64 }
+
+enum EngineBuildMatch: Equatable {
+    /// The running engine was started from this bundle's engine executable.
+    case same
+    /// It was started from a different file: a previous build that outlived an unclean update.
+    case different
+    /// Cannot tell (not a launchd job, no such process, unreadable): such an engine is never touched.
+    case unknown
+}
+
+protocol EngineBuildInspecting {
+    func compare() -> EngineBuildMatch
+}
+
+/// Reads the engine's pid from launchd (`launchctl print gui/<uid>/<label>`), asks the kernel which file that
+/// process is running (`proc_pidinfo` region 0 = its executable), and compares it with the bundle's engine file.
+/// Needs no cooperation from the engine; touches nothing; raises no permission prompt.
+struct SystemEngineInspector: EngineBuildInspecting {
+    let runner: EngineProcessRunner
+    let launchctl: URL
+    let domainTarget: String
+    let engine: URL
+
+    func compare() -> EngineBuildMatch {
+        let printed = runner.run(launchctl, ["print", domainTarget], environment: nil, timeout: 5)
+        guard printed.status == 0, let pid = Self.pid(fromLaunchctlPrint: printed.output),
+              let running = Self.runningImage(pid: pid), let bundled = Self.identity(of: engine) else { return .unknown }
+        return running == bundled ? .same : .different
+    }
+
+    /// The first `pid = N` line of a `launchctl print` job description (absent while the job is not running).
+    static func pid(fromLaunchctlPrint text: String) -> Int32? {
+        for line in text.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("pid = ") else { continue }
+            if let pid = Int32(trimmed.dropFirst("pid = ".count)), pid > 0 { return pid }
+        }
+        return nil
+    }
+
+    static func identity(of url: URL) -> FileIdentity? {
+        var st = stat()
+        guard stat(url.path, &st) == 0 else { return nil }
+        return FileIdentity(device: UInt64(st.st_dev), inode: UInt64(st.st_ino))
+    }
+
+    /// The vnode behind the process's first mapped region, which is its main executable.
+    static func runningImage(pid: Int32) -> FileIdentity? {
+        var info = proc_regionwithpathinfo()
+        let size = Int32(MemoryLayout<proc_regionwithpathinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDREGIONPATHINFO, 0, &info, size) == size else { return nil }
+        let stat = info.prp_vip.vip_vi.vi_stat
+        return FileIdentity(device: UInt64(stat.vst_dev), inode: UInt64(stat.vst_ino))
+    }
+}
+
 // MARK: Outcomes
 
 enum EngineRegistration: Equatable {
@@ -119,13 +180,18 @@ enum EngineStartOutcome: Equatable {
     case alreadyRunning
     /// Kickstarted and answering.
     case started
+    /// The running engine belonged to another build (left over from an unclean update): stopped with its session
+    /// saved, then started from this bundle.
+    case replacedStale
+    /// ...but that older engine would not stop. It is left running and in use.
+    case staleEngineStuck
     case requiresApproval
     case notFound
     /// Launched, but `query active` did not answer in time: almost always no Accessibility grant.
     case notResponding
     /// `launchctl kickstart` or registration failed.
     case failed(String)
-    var isRunning: Bool { self == .alreadyRunning || self == .started }
+    var isRunning: Bool { self == .alreadyRunning || self == .started || self == .replacedStale || self == .staleEngineStuck }
 }
 
 enum EngineStopOutcome: Equatable {
@@ -167,6 +233,8 @@ final class EngineControl: EngineControlling {
     let domainTarget: String
     let plist: URL
     let environment: [String: String]
+    /// nil = never replaces a running engine (tests, query-only controllers).
+    let inspector: EngineBuildInspecting?
     var now: () -> Double = { ProcessInfo.processInfo.systemUptime }
     var sleep: (Double) -> Void = { Thread.sleep(forTimeInterval: $0) }
     /// How long a started engine has to answer, and how long a stopping one has to exit.
@@ -182,7 +250,9 @@ final class EngineControl: EngineControlling {
          label: String = MicrofishPaths.engineLabel,
          domainTarget: String = MicrofishPaths.engineDomainTarget,
          plist: URL = MicrofishPaths.agentPlist,
-         environment: [String: String] = MicrofishPaths.childEnvironment) {
+         environment: [String: String] = MicrofishPaths.childEnvironment,
+         inspector: EngineBuildInspecting? = nil) {
+        self.inspector = inspector
         self.runner = runner; self.service = service; self.defaults = defaults
         self.engine = engine; self.launchctl = launchctl; self.label = label
         self.domainTarget = domainTarget; self.plist = plist; self.environment = environment
@@ -193,7 +263,10 @@ final class EngineControl: EngineControlling {
         #if NAVIGATOR_TESTS
         preconditionFailure("test reached the live engine control")
         #else
-        return EngineControl(runner: SystemProcessRunner(), service: SMAgentService())
+        let runner = SystemProcessRunner()
+        return EngineControl(runner: runner, service: SMAgentService(),
+                             inspector: SystemEngineInspector(runner: runner, launchctl: URL(fileURLWithPath: "/bin/launchctl"),
+                                                              domainTarget: MicrofishPaths.engineDomainTarget, engine: MicrofishPaths.engineExecutable))
         #endif
     }
 
@@ -277,16 +350,25 @@ final class EngineControl: EngineControlling {
         case .failed(let message): return .failed(message)
         case .ready, .registered: break
         }
-        if isActive() == true { return .alreadyRunning }
+        var replacing = false
+        if isActive() == true {
+            // An engine from another build (the helper died or was force-quit, Sparkle swapped the bundle, the old
+            // engine kept running) must not be adopted: stop it the normal way (it saves its session), then start ours.
+            // One attempt per start(); an engine we cannot identify is adopted as before.
+            guard inspector?.compare() == .different else { return .alreadyRunning }
+            guard stop().helperMayExit else { return .staleEngineStuck }
+            replacing = true
+        }
+        let up: EngineStartOutcome = replacing ? .replacedStale : .started
         let kick = runner.run(launchctl, ["kickstart", domainTarget], environment: nil, timeout: 5)
         if kick.status != 0 {
             // A kickstart that fails while the engine answers anyway (it just came up) is not a failure.
-            if isActive() == true { return .started }
+            if isActive() == true { return up }
             return .failed("launchctl kickstart exited \(kick.status)")
         }
         let deadline = now() + startTimeout
         while true {
-            if isActive() == true { return .started }
+            if isActive() == true { return up }
             if now() >= deadline { return .notResponding }
             sleep(interval)
         }
@@ -330,7 +412,10 @@ struct EngineAlert: Equatable {
 
     static func forStart(_ outcome: EngineStartOutcome) -> EngineAlert? {
         switch outcome {
-        case .alreadyRunning, .started: return nil
+        case .alreadyRunning, .started, .replacedStale: return nil
+        case .staleEngineStuck:
+            return EngineAlert(title: "Microfish is still running an older version",
+                               message: "The older engine wouldn’t quit, so it is still in use; restart your Mac to switch to the new one.")
         case .requiresApproval:
             return EngineAlert(title: "Microfish needs your approval",
                                message: "Allow Microfish in System Settings > General > Login Items & Extensions, then open Microfish again.",
