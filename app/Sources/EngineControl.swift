@@ -339,7 +339,7 @@ struct EngineAlert: Equatable {
             return EngineAlert(title: "Microfish couldn’t start", message: "Microfish.app is damaged. Reinstall it, then open Microfish again.")
         case .notResponding:
             return EngineAlert(title: "Microfish couldn’t start",
-                               message: "Microfish didn’t respond. In System Settings > Privacy & Security > Device Control and Data Access, make sure Microfish is turned on, then open Microfish again.",
+                               message: "Microfish didn’t respond. In System Settings > Privacy & Security > Device Control and Data Access, make sure Microfish Engine and Microfish are turned on, then open Microfish again.",
                                actionTitle: "Open System Settings", action: .openAccessibility)
         case .failed:
             return EngineAlert(title: "Microfish couldn’t start", message: "Something went wrong while starting Microfish. Try opening it again.")
