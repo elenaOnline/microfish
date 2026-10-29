@@ -8,3 +8,7 @@ TabBars.swift
 Settings.swift
 ShortcutRecorder.swift
 SpatialOverview.swift
+SettingsApply.swift
+UpdateModel.swift
+UpdatesPane.swift
+Updates.swift

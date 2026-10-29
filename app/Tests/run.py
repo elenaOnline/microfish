@@ -19,7 +19,7 @@ p.add_argument('suites', nargs='*')
 a = p.parse_args(); src = Path(a.src); scratch = Path(a.scratch)
 scratch.mkdir(parents=True, exist_ok=True)
 SOURCES = [l.strip() for l in (src/'SOURCES').read_text().splitlines() if l.strip() and not l.startswith('#')]
-OTHERS = [f for f in SOURCES if f != 'main.swift']
+OTHERS = [f for f in SOURCES if f not in ('main.swift', 'Updates.swift')]   # Updates.swift is the only file that imports Sparkle
 FW = ['-framework', 'AppKit', '-framework', 'QuartzCore', '-framework', 'ServiceManagement']
 
 # A throwaway install layout for the suite's environment: defaults from app/Resources, nothing real.
@@ -49,7 +49,7 @@ SKIPPED = {k: 'its test sources live in the old workspace (work/*-tests.swift, p
 SUITES = {'provision': suite_provision, 'engine': suite_engine, 'quit': with_main('quit', 'quit-tests.swift'),
           'live': with_main('live', 'live-signals-tests.swift'), 'press': with_main('press', 'press-tests.swift'),
           'tabfix': with_main('tabfix', 'tab-fixes-tests.swift'), 'queue': with_main('queue', 'queue-tests.swift'),
-          'hudfix': with_main('hudfix', 'hud-final-tests.swift'), 'leak': suite_leak, 'pixel': suite_pixel}
+          'hudfix': with_main('hudfix', 'hud-final-tests.swift'), 'updatestop': with_main('updatestop', 'update-stop-tests.swift'), 'leak': suite_leak, 'pixel': suite_pixel}
 wanted = a.suites or list(SUITES) + list(SKIPPED)
 for n in wanted:
     if n in SKIPPED: print(f'== suite {n}: SKIPPED ({SKIPPED[n]})'); continue

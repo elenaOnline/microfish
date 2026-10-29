@@ -21,7 +21,7 @@ OLD_OTHERS = ['TabBars.swift', 'Settings.swift', 'ShortcutRecorder.swift', 'Spat
 def others_for(src, kind):
     listed = Path(src)/'SOURCES'   # the current tree lists its sources; an old tree has the fixed set
     if not listed.exists(): return ['SpatialOverview.swift'] if kind == 'map' else OLD_OTHERS
-    every = [l.strip() for l in listed.read_text().splitlines() if l.strip() and l.strip() != 'main.swift']
+    every = [l.strip() for l in listed.read_text().splitlines() if l.strip() and l.strip() not in ('main.swift', 'Updates.swift')]
     return ['Paths.swift', 'EngineControl.swift', 'SpatialOverview.swift'] if kind == 'map' else every   # the map is built without Navigator
 def build(src, tag, kind, defines):
     d = scratch/f'{kind}-{tag}'; d.mkdir()

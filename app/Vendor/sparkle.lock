@@ -1,0 +1,9 @@
+# Pinned Sparkle release. Read by app/Scripts/fetch-sparkle.sh (shell-sourceable KEY=VALUE).
+# Sparkle 2.10.1, published 2026-10-25 (latest stable 2.x at pinning time, 2026-10-28).
+# The SHA-256 below was computed from the downloaded Sparkle-2.10.1.tar.xz and matches the
+# digest GitHub recorded for that release asset (releases/tags/2.10.1 assets[].digest).
+# Sparkle publishes no separate checksum file or signature for the tarball.
+SPARKLE_VERSION=2.10.1
+SPARKLE_URL=https://github.com/sparkle-project/Sparkle/releases/download/2.10.1/Sparkle-2.10.1.tar.xz
+SPARKLE_SHA256=1a856d2a9edb8e628de88121d7be04cf0e2167f8641650b78fca00b14244cf27
+SPARKLE_TAG_COMMIT=ab7d71291238df6e0492143b120c9b696a35f603

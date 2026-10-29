@@ -12,3 +12,5 @@ flamegraph.svg
 # Build outputs of app/Scripts/build-app.sh
 /build/
 __pycache__/
+# Sparkle, fetched by app/Scripts/fetch-sparkle.sh (pinned in app/Vendor/sparkle.lock)
+/app/Vendor/Sparkle/

@@ -754,7 +754,9 @@ final class SpatialContentView: NSView {
         let quitItem = NSMenuItem(title: "Quit Microfish", action: #selector(quit), keyEquivalent: "q"); quitItem.keyEquivalentModifierMask = .command; quitItem.target = self
         menu.addItem(settingsItem); menu.addItem(.separator()); menu.addItem(quitItem)
         // As in the status menu: macOS 27 adds an image to "Settings…" by its action, and not to Quit.
+        #if compiler(>=6.4)  // NSMenuItem.preferredImageVisibility is in the macOS 27 SDK only
         if #available(macOS 27.0, *) { for item in menu.items where !item.isSeparatorItem { item.preferredImageVisibility = .hidden } }
+        #endif
         return menu
     }
     @objc private func gearMenu() {

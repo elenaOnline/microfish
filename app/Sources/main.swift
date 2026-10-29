@@ -885,7 +885,7 @@ final class CommandRunner {
   }
  }
 }
-final class Navigator: NSObject, NSApplicationDelegate {
+final class Navigator: NSObject, NSApplicationDelegate, NSMenuItemValidation {
  let path: String
  var hudAppearance:NSAppearance?
  var preferences = NavigatorPreferences()
@@ -911,6 +911,14 @@ final class Navigator: NSObject, NSApplicationDelegate {
  /// The engine's lifecycle. Tests inject a fake; a test build refuses the live one.
  var engineControlOverride: EngineControlling?
  lazy var engineControl: EngineControlling = engineControlOverride ?? EngineControl.live()
+ // Updates (Sparkle, see Updates.swift). nil in tests and in an unbundled dev run.
+ var updater: UpdateChecking?
+ // The engine was stopped for an update that is about to replace the bundle; the terminate that follows
+ // goes straight through instead of running the quit sequence a second time.
+ var engineStoppedForUpdate = false
+ var updateStopWaiters: [(Bool) -> Void] = []
+ // Brings the engine back if an update that stopped it never replaced the bundle (set by the app's launch code).
+ var restartEngineAfterAbortedUpdate: (() -> Void)?
  var quitBackground: (@escaping () -> Void) -> Void = { DispatchQueue.global(qos:.userInitiated).async(execute:$0) }
  var quitMain: (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute:$0) }
  #if NAVIGATOR_TESTS
@@ -961,14 +969,17 @@ final class Navigator: NSObject, NSApplicationDelegate {
   queue: commandQueue)
  /// `path` is the snapshot the engine writes (`Runtime/navigator.tsv`); tests point it at a fixture.
  init(path: String = MicrofishPaths.snapshot.path) { self.path=path }
- // Status menu: Settings, Reload, then Quit last, as menu bar apps do (⌘Q while the menu is open).
+ // Status menu: Settings, Check for Updates, then Quit last, as menu bar apps do (⌘Q while the menu is open).
  func makeStatusMenu() -> NSMenu {
   let menu=NSMenu()
   let settingsItem=NSMenuItem(title:"Settings…",action:#selector(openSettings),keyEquivalent:","); settingsItem.keyEquivalentModifierMask = .command; settingsItem.target=self; menu.addItem(settingsItem)
+  let updatesItem=NSMenuItem(title:"Check for Updates…",action:#selector(checkForUpdates(_:)),keyEquivalent:""); updatesItem.target=self; menu.addItem(updatesItem)
   menu.addItem(.separator())
   let quit=NSMenuItem(title:"Quit Microfish",action:#selector(quitMicrofish(_:)),keyEquivalent:"q"); quit.keyEquivalentModifierMask = .command; quit.target=self; menu.addItem(quit)
   // macOS 27 adds an image to some rows by action name (Settings… got one, Quit did not): none of ours show one.
+  #if compiler(>=6.4)  // NSMenuItem.preferredImageVisibility is in the macOS 27 SDK only
   if #available(macOS 27.0, *) { for item in menu.items where !item.isSeparatorItem { item.preferredImageVisibility = .hidden } }
+  #endif
   return menu
  }
  // Stops the engine cleanly (it saves the session), then the helper. If the engine does not
@@ -989,14 +1000,73 @@ final class Navigator: NSObject, NSApplicationDelegate {
   NSLog("Navigator quit: engine %@",String(describing:outcome))
   if outcome.helperMayExit { quitPhase = .finishing; quitExit() }
   else { quitPhase = .idle; quitFailed() }
+  resolveUpdateStop(outcome.helperMayExit)
+ }
+ // Sparkle is about to replace the bundle: stop the engine exactly as Quit Microfish does (it saves the
+ // session), but leave the helper running, because Sparkle terminates it next. done(false) = the engine would
+ // not stop, so nothing is installed now. A Quit already in flight is joined, not repeated.
+ func stopEngineForUpdate(_ done: @escaping (Bool) -> Void) {
+  switch quitPhase {
+  case .finishing: engineStoppedForUpdate = true; done(true)
+  case .stopping: updateStopWaiters.append(done)
+  case .idle:
+   quitPhase = .stopping
+   updateStopWaiters.append(done)
+   if panel != nil { hide() }
+   NSLog("Navigator update: stopping engine")
+   let control = engineControl
+   quitBackground { [weak self] in
+    let outcome = control.stop()
+    self?.quitMain { [weak self] in self?.finishUpdateStop(outcome) }
+   }
+  }
+ }
+ func finishUpdateStop(_ outcome: EngineStopOutcome) {
+  NSLog("Navigator update: engine %@",String(describing:outcome))
+  quitPhase = .idle
+  resolveUpdateStop(outcome.helperMayExit)
+ }
+ func resolveUpdateStop(_ stopped: Bool) {
+  if stopped { engineStoppedForUpdate = true }
+  let waiters=updateStopWaiters; updateStopWaiters=[]
+  for waiter in waiters { waiter(stopped) }
+ }
+ // The update cycle ended. If it ended with this helper still running after the engine was stopped for it, the
+ // bundle was not replaced: take the engine back rather than leave the user without a window manager.
+ func updateCycleEnded() {
+  guard engineStoppedForUpdate else { return }
+  engineStoppedForUpdate = false
+  NSLog("Navigator update: cycle ended with the engine stopped")
+  restartEngineAfterAbortedUpdate?()
+ }
+ @objc func checkForUpdates(_ sender: Any?) { MainActor.assumeIsolated { updater?.checkForUpdates() } }
+ func validateMenuItem(_ item: NSMenuItem) -> Bool {
+  guard item.action == #selector(checkForUpdates(_:)) else { return true }
+  return MainActor.assumeIsolated {
+   item.title = updater?.waitingVersion.map { "Update Available (\($0))…" } ?? "Check for Updates…"
+   return updater?.canCheckForUpdates ?? false
+  }
  }
  func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
   // Our own quit is done, or the system is logging out: go. Anything else (Dock-tile Quit while
   // Settings is open, terminate:) takes the full quit so the helper never dies alone.
-  if quitPhase == .finishing || systemQuit() { return .terminateNow }
+  if quitPhase == .finishing || engineStoppedForUpdate || systemQuit() { return .terminateNow }
   quitMicrofish(nil)
   return .terminateCancel
  }
+ #if !NAVIGATOR_TESTS
+ // Sparkle's standard windows. Only a real app bundle with a feed and a public key gets an updater.
+ func startUpdater() {
+  guard MicrofishUpdateController.isConfigured else { return }
+  MainActor.assumeIsolated {
+   let controller=MicrofishUpdateController()
+   controller.prepareForUpdate = { [weak self] done in if let self { self.stopEngineForUpdate(done) } else { done(false) } }
+   controller.updateCycleEnded = { [weak self] in self?.updateCycleEnded() }
+   do { try controller.start(); updater=controller }
+   catch { NSLog("Updates: could not start the updater: %@",error.localizedDescription) }
+  }
+ }
+ #endif
  func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
   openSettings()
   return true
@@ -1025,6 +1095,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   let menu=makeStatusMenu()
   status.menu=menu; statusItem=status
   #if !NAVIGATOR_TESTS
+  startUpdater()
   spatialOverview.pinsPath = MicrofishPaths.viewPins.path
   spatialOverview.onViewAction = { [weak self] action, slot in
    self?.sendCommand([action] + (slot.map { [String($0)] } ?? []))
@@ -1075,6 +1146,7 @@ final class Navigator: NSObject, NSApplicationDelegate {
   }
   observeEnvironment()
   #if !NAVIGATOR_TESTS
+  restartEngineAfterAbortedUpdate = { [weak self] in self?.startEngine() }
   startEngine()
   #endif
  }

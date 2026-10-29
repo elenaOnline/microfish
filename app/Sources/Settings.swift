@@ -135,10 +135,10 @@ enum Chord {
 // MARK: - Store
 
 enum SettingsPane: String, CaseIterable, Identifiable {
-    case behavior, rows, shortcuts, appearance, minimap, rules
+    case behavior, rows, shortcuts, appearance, minimap, rules, updates
     var id: String { rawValue }
-    var title: String { ["Behavior", "Rows", "Shortcuts", "Appearance", "Minimap", "Window Rules"][Self.allCases.firstIndex(of: self)!] }
-    var symbol: String { ["slider.horizontal.3", "rectangle.grid.1x2", "keyboard", "paintbrush", "rectangle.inset.filled.on.rectangle", "list.bullet.rectangle"][Self.allCases.firstIndex(of: self)!] }
+    var title: String { ["Behavior", "Rows", "Shortcuts", "Appearance", "Minimap", "Window Rules", "Updates"][Self.allCases.firstIndex(of: self)!] }
+    var symbol: String { ["slider.horizontal.3", "rectangle.grid.1x2", "keyboard", "paintbrush", "rectangle.inset.filled.on.rectangle", "list.bullet.rectangle", "arrow.triangle.2.circlepath"][Self.allCases.firstIndex(of: self)!] }
 }
 
 struct LiveWindowEntry: Identifiable, Hashable { let id: Int; let app: String; let bundle: String; let title: String; let floating: Bool
@@ -745,9 +745,11 @@ final class SettingsWindow: NSWindow {
         }
         // "Quit Microfish" is nil-targeted to the navigator's full, clean quit (engine and helper
         // together); AppKit disables it until the app delegate implements quitMicrofish:.
+        let updates = Selector(("checkForUpdates:"))
+        let updateItems: [NSMenuItem] = (NSApp.delegate as AnyObject?)?.responds(to: updates) == true ? [item("Check for Updates…", updates, "")] : []
         let quit = Selector(("quitMicrofish:"))
         let quitItems: [NSMenuItem] = (NSApp.delegate as AnyObject?)?.responds(to: quit) == true ? [.separator(), item("Quit Microfish", quit, "q")] : []
-        menu("Microfish", [item("About Microfish", #selector(menuAbout), "", target: self), .separator(), item("Settings…", #selector(menuShow), ",", target: self)] + quitItems)
+        menu("Microfish", [item("About Microfish", #selector(menuAbout), "", target: self)] + updateItems + [.separator(), item("Settings…", #selector(menuShow), ",", target: self)] + quitItems)
         menu("Edit", [item("Undo", Selector(("undo:")), "z"), item("Redo", Selector(("redo:")), "z", [.command, .shift]), .separator(), item("Cut", #selector(NSText.cut(_:)), "x"), item("Copy", #selector(NSText.copy(_:)), "c"), item("Paste", #selector(NSText.paste(_:)), "v"), item("Select All", #selector(NSText.selectAll(_:)), "a"), .separator(), item("Find Shortcut…", #selector(menuFind), "f", target: self)])
         menu("Window", [item("Minimize", #selector(NSWindow.performMiniaturize(_:)), "m"), item("Close", #selector(NSWindow.performClose(_:)), "w")])
         NSApp.mainMenu = main
@@ -892,6 +894,7 @@ struct SettingsPaneView: View {
                 case .appearance: AppearancePane(store: store)
                 case .minimap: MinimapPane(store: store)
                 case .rules: RulesPane(store: store)
+                case .updates: UpdatesPane()
                 }
             }
             .formStyle(.grouped)
@@ -904,6 +907,10 @@ struct FooterBar: View {
     @Bindable var store: SettingsStore
     private var showsResetAll: Bool { store.currentPane == .shortcuts }
     private var pane: SettingsPane { store.currentPane }
+    /// Updates apply the moment they change, like System Settings, so Revert and Apply have nothing to do
+    /// on that pane. They stay whenever the shared draft or the last Apply still has something to say (edits
+    /// made on other panes must remain reachable), so the footer never hides a pending change.
+    private var showsButtons: Bool { pane != .updates || store.isDirty || state != nil }
     var body: some View {
         VStack(spacing: 0) {
             Divider()
@@ -925,15 +932,17 @@ struct FooterBar: View {
                     .help("Restore every shortcut to its default")
                     .padding(.trailing, 4)
             }
-            Button("Revert") { store.revert() }.disabled(!store.canRevert)
-                .help("Discard unapplied changes")
-            // Not the default button: Return in a field or the search box must never push a draft
-            // spanning every pane to the live window manager. ⌘S applies from anywhere.
-            Button("Apply") { store.apply() }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut("s", modifiers: .command)
-                .disabled(!store.canApply)
-                .help("Apply all changes (⌘S)")
+            if showsButtons {
+                Button("Revert") { store.revert() }.disabled(!store.canRevert)
+                    .help("Discard unapplied changes")
+                // Not the default button: Return in a field or the search box must never push a draft
+                // spanning every pane to the live window manager. ⌘S applies from anywhere.
+                Button("Apply") { store.apply() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut("s", modifiers: .command)
+                    .disabled(!store.canApply)
+                    .help("Apply all changes (⌘S)")
+            }
         }
         .controlSize(.regular)
         .padding(.horizontal, 20).padding(.vertical, 10)
@@ -981,13 +990,15 @@ struct FooterBar: View {
                     }
                     Button("Dismiss") { store.dismissOutcome() }.buttonStyle(.link).foregroundStyle(settingsAccent).font(.callout)
                 }
+            } else if pane == .updates {
+                Text("Changes on this pane take effect immediately.").font(.callout).foregroundStyle(.secondary)
             }
         }
         // Two lines of room in every state, so a long message never changes the bar's height or is cut.
         .frame(maxWidth: .infinity, minHeight: Self.statusHeight, alignment: .leading)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(current.map { "Status: " + $0.text } ?? "")
-        .accessibilityHidden(current == nil)
+        .accessibilityHidden(current == nil && pane != .updates)
     }
     static let statusHeight: CGFloat = 32
 }

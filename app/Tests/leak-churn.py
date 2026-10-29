@@ -11,7 +11,7 @@ here = Path(__file__).resolve().parent
 p = argparse.ArgumentParser(); p.add_argument('--src', default=str(here.parent/'Sources')); p.add_argument('--old', action='store_true')
 p.add_argument('--n', default='120'); p.add_argument('--max', default='12'); p.add_argument('--scen', default='tabs,hud,map,failure'); p.add_argument('--scratch', default='/tmp/microfish-app-tests/leak')
 a = p.parse_args(); src = Path(a.src); scratch = Path(a.scratch); shutil.rmtree(scratch, ignore_errors=True); scratch.mkdir(parents=True)
-OTHERS = [l.strip() for l in (src/'SOURCES').read_text().splitlines() if l.strip() and l.strip() != 'main.swift']
+OTHERS = [l.strip() for l in (src/'SOURCES').read_text().splitlines() if l.strip() and l.strip() not in ('main.swift', 'Updates.swift')]
 main = (src/'main.swift').read_text()
 if 'var ordersPanel' not in main:   # old tree: add the test hook that keeps Navigator.render from ordering its panel
     main = main.replace(' var pressingCard = false\n', ' var pressingCard = false\n var ordersPanel = true\n', 1)
