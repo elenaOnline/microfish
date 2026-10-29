@@ -3,7 +3,7 @@
 #
 #   app/Scripts/build-app.sh [--version vX.Y.Z[-beta.N]|dev] [--sign IDENTITY] [--out DIR]
 #                            [--skip-engine-build | --engine PATH] [--sparkle DIR] [--package]
-#                            [--strict] [--allow-placeholder-key] [--keychain PATH]
+#                            [--strict] [--allow-placeholder-key] [--allow-adhoc] [--keychain PATH]
 #   app/Scripts/build-app.sh --probe-min-macos
 #
 # Runs on a developer Mac and on a GitHub macOS runner. It never launches what it builds.
@@ -12,10 +12,13 @@
 #   --sign       signing identity: a name, a hash, or "-" for ad-hoc. Default: $MICROFISH_SIGN_IDENTITY, else "-".
 #   --out        output directory (default: <repo>/build). The app is <out>/Microfish.app.
 #   --engine     use this prebuilt `paneru` (its sibling `paneru-navigator-command` is the bridge)
-#   --skip-engine-build   use <cargo target dir>/release/ as it is
+#   --skip-engine-build   use <cargo target dir>/release/ as it is (the release workflow builds the engine
+#                         first with build-engine.sh, before the signing certificate is imported)
 #   --sparkle    directory holding Sparkle.framework (default: $SPARKLE_DIR, else app/Vendor/Sparkle)
 #   --package    also zip the app (package.sh)
 #   --strict     fail on anything a release must not lack (always on for a version other than "dev")
+#   --allow-adhoc  let a strict (versioned) build be signed ad hoc; without it a versioned build needs a real
+#                same-team identity. Only the release workflow's dry run passes it.
 #   --keychain   keychain to look the identity up in (default: the search list)
 set -euo pipefail
 
@@ -38,7 +41,7 @@ PLACEHOLDER_KEY="PLACEHOLDER-SPARKLE-PUBLIC-KEY-NOT-FOR-RELEASE"
 DEFAULT_SOURCES="main.swift TabBars.swift Settings.swift ShortcutRecorder.swift SpatialOverview.swift LiveSignals.swift Paths.swift"
 
 VERSION="dev"; SIGN="${MICROFISH_SIGN_IDENTITY:--}"; OUT="$REPO/build"
-ENGINE_BIN=""; SKIP_ENGINE=0; SPARKLE_ARG=""; DO_PACKAGE=0; STRICT=0; ALLOW_PLACEHOLDER=0
+ENGINE_BIN=""; SKIP_ENGINE=0; SPARKLE_ARG=""; DO_PACKAGE=0; STRICT=0; ALLOW_PLACEHOLDER=0; ALLOW_ADHOC=0
 KEYCHAIN="${MICROFISH_KEYCHAIN:-}"; PROBE=0
 
 say() { printf '==> %s\n' "$*"; }
@@ -57,6 +60,7 @@ while [ $# -gt 0 ]; do
     --package) DO_PACKAGE=1; shift ;;
     --strict) STRICT=1; shift ;;
     --allow-placeholder-key) ALLOW_PLACEHOLDER=1; shift ;;
+    --allow-adhoc) ALLOW_ADHOC=1; shift ;;
     --keychain) KEYCHAIN="${2:?--keychain needs a path}"; shift 2 ;;
     --probe-min-macos) PROBE=1; shift ;;
     -h|--help) usage 0 ;;
@@ -110,10 +114,13 @@ fi
 VERSION_FIELDS="$(python3 -I "$SCRIPTS/version.py" "$VERSION" --env)" || die "bad --version '$VERSION'"
 eval "$VERSION_FIELDS"
 SHORT_VERSION="$SHORT"; BUILD_VERSION="$BUILD"
-say "Microfish $SHORT_VERSION (build $BUILD_VERSION, $CHANNEL), macOS $MIN_MACOS+, identity: $([ "$SIGN" = - ] && echo ad-hoc || echo "$SIGN")"
+say "Microfish $SHORT_VERSION (build $BUILD_VERSION, $CHANNEL), macOS $MIN_MACOS+, signing: $([ "$SIGN" = - ] && echo ad-hoc || echo 'Developer ID (identity not printed)')"
 
 # ---- the signing identity -----------------------------------------------------------------------------
 ADHOC=0; [ "$SIGN" = - ] && ADHOC=1
+if [ "$ADHOC" = 1 ] && [ "$STRICT" = 1 ] && [ "$ALLOW_ADHOC" = 0 ]; then
+  die "a versioned/strict build must be signed with a Developer ID identity, not ad hoc ('-'). Set MICROFISH_SIGN_IDENTITY or --sign, or pass --allow-adhoc for a dry run (the result is not releasable)"
+fi
 KC_ARGS=(); [ -n "$KEYCHAIN" ] && KC_ARGS=(--keychain "$KEYCHAIN")
 resolve_identity() {
   # A name that matches several certificates makes codesign refuse ("ambiguous"). Resolve it to the
@@ -138,23 +145,15 @@ export MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS"   # so the Rust and LuaJIT objects 
 TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}"
 if [ -z "$ENGINE_BIN" ]; then
   if [ "$SKIP_ENGINE" = 0 ]; then
-    say "cargo build --release (paneru, paneru-navigator-command)"
-    # Build paths stay out of the binaries: panic locations would otherwise carry the builder's home directory.
-    REMAP="--remap-path-prefix=$REPO=/microfish"
-    [ -d "${CARGO_HOME:-$HOME/.cargo}" ] && REMAP="$REMAP --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
-    [ -d "${RUSTUP_HOME:-$HOME/.rustup}" ] && REMAP="$REMAP --remap-path-prefix=${RUSTUP_HOME:-$HOME/.rustup}=/rustup"
-    REMAP="$REMAP --remap-path-prefix=$HOME=/home"
-    JOBS=(); [ -z "${CI:-}" ] && JOBS=(-j "${MICROFISH_CARGO_JOBS:-2}")
-    # The engine's own identity (embedded Info.plist), when the crate has the feature.
-    FEATURES=(); grep -Eq '^microfish[[:space:]]*=' "$REPO/Cargo.toml" && FEATURES=(--features microfish)
-    ( cd "$REPO" && RUSTFLAGS="${RUSTFLAGS:-} $REMAP" CARGO_TARGET_DIR="$TARGET_DIR" \
-        nice -n 10 cargo build --release --locked "${JOBS[@]+"${JOBS[@]}"}" "${FEATURES[@]+"${FEATURES[@]}"}" --bin paneru --bin paneru-navigator-command )
+    CARGO_TARGET_DIR="$TARGET_DIR" "$SCRIPTS/build-engine.sh"
   fi
   ENGINE_BIN="$TARGET_DIR/release/paneru"
 fi
 BRIDGE_BIN="$(dirname "$ENGINE_BIN")/paneru-navigator-command"
 [ -x "$ENGINE_BIN" ] || die "engine binary not found: $ENGINE_BIN"
 [ -x "$BRIDGE_BIN" ] || die "bridge binary not found: $BRIDGE_BIN"
+# Whatever built it (build-engine.sh, a prebuilt --engine, --skip-engine-build): it must carry the Microfish identity.
+"$SCRIPTS/check-engine-identity.sh" "$ENGINE_BIN" "$ENGINE_ID" || die "the engine binary does not carry the Microfish identity (build it with --features microfish)"
 
 # ---- output tree ------------------------------------------------------------------------------------
 mkdir -p "$OUT"; OUT="$(cd "$OUT" && pwd)"
@@ -343,6 +342,9 @@ for pair in "$APP:$APP_ID" "$ENGINE_APP:$ENGINE_ID" "$C/MacOS/microfish-command:
     echo "$dr" | grep -Fq "identifier \"$id\"" || bad "$name: designated requirement lacks identifier $id"
     echo "$dr" | grep -Fq 'anchor apple generic' || bad "$name: designated requirement lacks 'anchor apple generic'"
     echo "$dr" | grep -Fq 'certificate leaf[subject.OU]' || bad "$name: designated requirement lacks the team (leaf[subject.OU])"
+    # 1.2.840.113635.100.6.1.13 is the "Developer ID Application" certificate extension: it keeps a Mac App Distribution
+    # or Apple Development certificate of the same team from satisfying the requirement.
+    echo "$dr" | grep -Fq 'certificate leaf[field.1.2.840.113635.100.6.1.13]' || bad "$name: designated requirement lacks the Developer ID Application leaf extension (1.2.840.113635.100.6.1.13)"
     echo "$dr" | grep -Fq cdhash && bad "$name: designated requirement is a cdhash"
   fi
   echo "  $name: $id; DR: $([ "$ADHOC" = 1 ] && echo '(ad-hoc: cdhash)' || echo "$dr" | sed 's/certificate 1\[[^]]*\] \/\* exists \*\/ and //;s/certificate leaf\[field[^]]*\] \/\* exists \*\/ and //;s/(\(leaf\[subject.OU\] = \)[A-Z0-9]*/\1<team>/;s/leaf\[subject.OU\] = [A-Z0-9]*/leaf[subject.OU] = <team>/')"
@@ -373,6 +375,7 @@ for b in "$C/MacOS/Microfish" "$C/MacOS/microfish-command" "$ENGINE_APP/Contents
   [ "$(printf '%s\n%s\n' "$minos" "$MIN_MACOS" | sort -V | tail -n 1)" = "$MIN_MACOS" ] || bad "${b#$OUT/}: minos $minos is above $MIN_MACOS"
   echo "  ${b#$OUT/}: arm64, minos $minos, no /Users/ strings"
 done
+"$SCRIPTS/check-engine-identity.sh" "$ENGINE_APP/Contents/MacOS/$ENGINE_APP_NAME" "$ENGINE_ID" || bad "the packaged engine does not carry the Microfish identity"
 if [ "$STRICT" = 1 ]; then
   grep -q "$PLACEHOLDER_KEY" "$C/Info.plist" && [ "$ALLOW_PLACEHOLDER" = 0 ] && bad "SUPublicEDKey is the placeholder"
   [ -d "$C/Frameworks/Sparkle.framework" ] || bad "Sparkle.framework is not in the bundle"

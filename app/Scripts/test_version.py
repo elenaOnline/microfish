@@ -91,6 +91,16 @@ class Cli(unittest.TestCase):
         self.assertEqual(self.run_cli("has-beta", "v1.0.0", stdin="v0.1.0\n")[0], 1)
         self.assertEqual(self.run_cli("has-beta", "v1.0.0", stdin="")[0], 1)
 
+    def test_is_latest(self):
+        # a hotfix to an older minor is not Latest while a newer stable is published
+        self.assertEqual(self.run_cli("is-latest", "v0.1.1", stdin="v0.2.0\nv0.1.0\n")[0], 1)
+        self.assertEqual(self.run_cli("is-latest", "v0.2.0", stdin="v0.2.0\nv0.1.1\nv0.1.0\n")[0], 0)
+        self.assertEqual(self.run_cli("is-latest", "v0.1.0", stdin="")[0], 0)           # the first stable
+        self.assertEqual(self.run_cli("is-latest", "v0.1.0", stdin="v0.1.0\n")[0], 0)  # a re-run: itself is ignored
+        self.assertEqual(self.run_cli("is-latest", "v1.0.0", stdin="v0.9.9\nnot-a-tag\n")[0], 0)
+        self.assertEqual(self.run_cli("is-latest", "v0.1.0-beta.2", stdin="")[0], 1)    # a beta is never Latest
+        self.assertEqual(self.run_cli("is-latest", "v0.3.0", stdin="v0.3.0-beta.1\nv0.2.5\n")[0], 0)  # betas do not count
+
 
 if __name__ == "__main__":
     unittest.main()

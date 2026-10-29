@@ -14,6 +14,9 @@ Rules (see RELEASING.md):
 Output is JSON, or one field with --field, or shell assignments with --env.
 Subcommand:  version.py has-beta vX.Y.Z   reads tag names on stdin, exits 0 if any
              vX.Y.Z-beta.N (N 1-98) exists among them (the promotion rule).
+             version.py is-latest vX.Y.Z   reads the tags of the already published stable releases on stdin and
+             exits 0 only if no other one of them is newer: a hotfix to an older minor must not take GitHub's
+             "Latest" badge from the highest stable. A beta is never Latest (exit 1).
 """
 import argparse
 import json
@@ -74,9 +77,24 @@ def has_beta(base_tag, tags):
     return False
 
 
+def is_latest(tag, published):
+    """True if `tag` (a stable) is at least as new as every other stable tag in `published`."""
+    v = parse(tag)
+    if v["channel"] != "stable":
+        return False
+    for t in published:
+        try:
+            o = parse(t.strip())
+        except BadTag:
+            continue
+        if o["channel"] == "stable" and o["tag"] != v["tag"] and int(o["build"]) > int(v["build"]):
+            return False
+    return True
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("tag", help="vX.Y.Z, vX.Y.Z-beta.N, dev, or the word has-beta followed by a stable tag")
+    p.add_argument("tag", help="vX.Y.Z, vX.Y.Z-beta.N, dev, or has-beta / is-latest followed by a tag")
     p.add_argument("stable", nargs="?", help=argparse.SUPPRESS)
     p.add_argument("--field", choices=["tag", "short", "base", "build", "channel", "prerelease", "beta"],
                    help="print only this field")
@@ -87,6 +105,10 @@ def main(argv=None):
             if not a.stable:
                 p.error("has-beta needs a stable tag")
             return 0 if has_beta(a.stable, sys.stdin.read().split()) else 1
+        if a.tag == "is-latest":
+            if not a.stable:
+                p.error("is-latest needs a tag")
+            return 0 if is_latest(a.stable, sys.stdin.read().split()) else 1
         v = dev() if a.tag == "dev" else parse(a.tag)
     except BadTag as e:
         print(f"version.py: {e}", file=sys.stderr)

@@ -56,11 +56,13 @@ final class HeadlessDriver: NSObject, SPUUserDriver {
     }
     func showUserInitiatedUpdateCheck(cancellation: @escaping () -> Void) { mark("driver:check-started") }
     func showUpdateFound(with appcastItem: SUAppcastItem, state: SPUUserUpdateState, reply: @escaping (SPUUserUpdateChoice) -> Void) {
-        mark("driver:update-found", ["found": appcastItem.displayVersionString, "foundBuild": appcastItem.versionString, "channel": appcastItem.channel ?? "", "userInitiated": state.userInitiated])
+        mark("driver:update-found", ["found": appcastItem.displayVersionString, "foundBuild": appcastItem.versionString, "channel": appcastItem.channel ?? "", "userInitiated": state.userInitiated,
+              "signing": appcastItem.signingValidationStatus.rawValue, "notesURL": appcastItem.releaseNotesURL?.absoluteString ?? "",
+              "hasDescription": appcastItem.itemDescription != nil])
         reply(.install)
     }
-    func showUpdateReleaseNotes(with downloadData: SPUDownloadData) {}
-    func showUpdateReleaseNotesFailedToDownloadWithError(_ error: Error) {}
+    func showUpdateReleaseNotes(with downloadData: SPUDownloadData) { mark("driver:release-notes", ["bytes": downloadData.data.count]) }
+    func showUpdateReleaseNotesFailedToDownloadWithError(_ error: Error) { mark("driver:release-notes-failed", ["error": (error as NSError).localizedDescription]) }
     func showUpdateNotFoundWithError(_ error: Error, acknowledgement: @escaping () -> Void) {
         mark("driver:no-update", ["error": (error as NSError).localizedDescription, "code": (error as NSError).code]); acknowledgement()
     }

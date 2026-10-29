@@ -22,7 +22,8 @@ The name is a play on microfiche.
 
 1. Download `Microfish-<version>.zip` from the latest
    [release](https://github.com/elenaOnline/microfish/releases/latest), unzip it, and drag
-   **Microfish** into **Applications**.
+   **Microfish** into **Applications**. (If that page says "not found", no stable version has been
+   published yet; the [full list](https://github.com/elenaOnline/microfish/releases) has the beta builds.)
 2. Open Microfish. A fish appears in the menu bar.
 3. Give Microfish the access it asks for (next section). Windows start tiling once the engine has it.
 

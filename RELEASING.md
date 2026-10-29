@@ -19,7 +19,9 @@ Sparkle compares build numbers only: **a build number is never reused and never 
 
 ## Branches
 
-- **`main`** is where work lands. Betas are tagged on `main`.
+- **`main`** is where work lands. Betas are tagged on `main` (or on a `release/X.Y` hotfix branch). The
+  gate refuses a beta whose commit is on neither, so a tag on a stray branch or an unmerged pull request
+  cannot release.
 - **A stable is promoted from a soaked beta.** Once a beta has been used for a while, tag the same
   commit `vX.Y.Z` (no new code between the last beta and the stable). The pipeline refuses a stable tag
   if no `vX.Y.Z-beta.N` exists, and says so when the stable's commit differs from the newest beta's.
@@ -30,10 +32,10 @@ Sparkle compares build numbers only: **a build number is never reused and never 
 
 ## Cutting a beta
 
-1. `main` is green on CI (cargo tests, helper tests, ad-hoc build).
+1. `main` is green on CI (cargo tests, helper tests, ad-hoc build, signature-tooling tests).
 2. Optional but cheap: Actions, Release, "Run workflow", leave `dry_run` ticked, enter the tag you are
    about to push. It builds with an ad-hoc signature, skips notarization and publishing, and uploads
-   the zip as an artifact.
+   the zip as an artifact. It runs in the secret-less environment `release-dry-run`.
 3. Tag and push:
    ```sh
    git switch main && git pull
@@ -42,6 +44,9 @@ Sparkle compares build numbers only: **a build number is never reused and never 
    ```
    Push one tag at a time and wait for the run to finish: runs publish one by one, and a run that is
    waiting behind another is replaced if a third arrives (re-run it from the Actions tab).
+   If the `release` environment has a required reviewer (below), the **build** job and the **publish**
+   job each wait for your approval: Actions, the run, **Review deployments**, tick `release`, **Approve
+   and deploy**. Check that the run is for the tag you pushed before approving.
 4. Watch Actions, Release. When it is green: the GitHub release `Microfish 0.1.0-beta.1` is a
    pre-release with `Microfish-0.1.0-beta.1.zip`, and `appcast.xml` on the `appcast` branch has the item.
    People with "Get beta updates" on are offered it.
@@ -56,30 +61,62 @@ git push origin v0.1.0
 The release is built again from that commit (the zip is not the beta's zip: a stable has its own
 version fields), published as the repository's **Latest** release, and added to the appcast without a
 channel, so everyone gets it. `allow_unsoaked_stable` in the manual workflow run overrides the
-promotion rule once; use it only for a tag that already exists and you have a reason for.
+promotion rule once; use it only for a tag that already exists and you have a reason for. A real manual
+run must be started from the tag itself: Actions, Release, Run workflow, **Use workflow from: Tags**,
+the tag, `dry_run` unticked (the environment's tag rule would refuse a branch anyway).
+
+**"Latest" is only ever the highest stable.** A stable hotfix on an older minor (say `v0.1.2` when
+`v0.2.0` is out) is published with `--latest=false`, so it does not take the badge or the README's
+`releases/latest` link from `v0.2.0`; a beta never is Latest. The publish job decides this from the
+published stables (`version.py is-latest`).
+
+**The first public release should be a stable promoted from a beta.** `releases/latest` is a 404 until a
+stable exists, and the README's install link points there. Soak `v0.1.0-beta.N` privately (or as a
+pre-release), then tag `v0.1.0` on the same commit before telling anyone the repository exists. If a beta
+must go out first, the README says where to look (the full releases list).
 
 ## What the pipeline does
 
-`release.yml`, three jobs:
+`release.yml`, three jobs. The tag is resolved to one commit SHA by the first, and the others work on that
+SHA only.
 
-1. **gate** (Ubuntu): the tag is well-formed (`version.py`), exists, a stable is on `main` or its
-   `release/X.Y`, and has an earlier beta (`app/Scripts/release-gate.sh`).
+1. **gate** (Ubuntu): the tag is well-formed (`version.py`), exists, was not moved since the push that
+   started the run, a beta or stable is on `main` (or a `release/*` branch; a stable: its own `release/X.Y`),
+   and a stable has an earlier beta (`app/Scripts/release-gate.sh`). It outputs the **commit SHA**. The
+   checkout is `fetch-depth: 0`, so every branch and tag is already local (no later `git fetch`, which
+   would need credentials on a private repository).
 2. **build** (`macos-26`, Apple silicon, the newest generally available image; Xcode is chosen by
-   `app/Scripts/select-xcode.sh`, newest installed): fetch the pinned Sparkle (SHA-256 checked); import
-   the Developer ID certificate into a temporary keychain; `app/Scripts/build-app.sh`
-   (release build of the engine and bridge, the helper with `swiftc`, assemble, sign inside-out with the
-   hardened runtime and a secure timestamp, then verify); `notarytool submit --wait` and fail with the log
-   unless the result is `Accepted`; `stapler staple` and `validate`; `spctl -a -vv -t exec`; zip with
-   `ditto`; sign the zip for Sparkle (`sign_update`, key on stdin); upload the zip, the signature and
-   the minimum macOS version as an artifact. An `always()` step deletes the keychain and key files.
-3. **publish** (Ubuntu, the only job with write access): create the GitHub release with the zip
-   (pre-release and never "Latest" for a beta; Latest for a stable), **then** add the item to
-   `appcast.xml` on branch `appcast` (created on first use). The order matters: nobody is offered an
-   update whose file is not there yet. A re-run after the release exists compares the zip with the
-   published one and stops if they differ.
+   `app/Scripts/select-xcode.sh`, newest installed; environment `release`): check out that SHA and verify
+   the tag still points at it (`verify-tag.sh`, through the GitHub API); install the pinned Rust toolchain
+   (`RUST_VERSION` in the workflow, not "stable", so a stable promoted weeks after its beta is built by the
+   same compiler); fetch the pinned Sparkle (SHA-256 checked);
+   **build the engine and bridge (`build-engine.sh`, the only step that runs dependency code) before any key
+   exists**; then import the Developer ID certificate into a temporary keychain; `app/Scripts/build-app.sh
+   --skip-engine-build` (the helper with `swiftc`, assemble, sign inside-out with the hardened runtime and
+   a secure timestamp, verify); `notarytool submit --wait` and fail with the log unless the result is
+   `Accepted`; `stapler staple` and `validate`; `spctl -a -vv -t exec` (only the accepted/notarized lines
+   are logged: the full output names the signing identity); zip with `ditto`; sign the zip for Sparkle
+   (`sign_update`, key on stdin) and **verify that signature against the `SUPublicEDKey` inside the zip's
+   own Info.plist** (`verify-ed-signature.swift`; a wrong secret fails the release here); upload the zip,
+   the signature and the minimum macOS version as an artifact. An `always()` step deletes the keychain and
+   key files.
+3. **publish** (`macos-26`, because `sign_update` is a macOS tool; environment `release`; the only job with
+   write access): check out the SHA, re-verify the artifact (version, public key, signature) and the tag,
+   create the GitHub release with the zip (pre-release and never "Latest" for a beta; "Latest" only for
+   the highest stable), **then** add the item to `appcast.xml` on branch `appcast` (created on first
+   use), **sign the appcast** with the Sparkle key, verify that signature against `SUPublicEDKey`, and
+   push. The order matters: nobody is offered an update whose file is not there yet. A re-run after the
+   release exists compares the zip with the published one and stops if they differ.
+
+What the build refuses (`build-app.sh`, `build-engine.sh`): an engine that does not carry
+`net.webreceptor.microfish.engine` in its embedded Info.plist (no `microfish` cargo feature); a
+versioned build signed ad hoc (only the dry run passes `--allow-adhoc`); a designated requirement that
+lacks `certificate leaf[field.1.2.840.113635.100.6.1.13]` (the Developer ID Application marker, so a
+different certificate type from the same team cannot satisfy it).
 
 A dry run (`dry_run`, the default for a manual run) runs only the gate and build jobs, signs ad-hoc and
-uploads the zip as a 7-day artifact; it needs no secrets.
+uploads the zip as a 7-day artifact; it needs no secrets (its jobs use the environment `release-dry-run`,
+which has none) and also runs the signature self-test with a throwaway key.
 
 `build-app.sh` also runs on a Mac: `app/Scripts/build-app.sh --sign - --out /tmp/microfish-build` for an
 ad-hoc build, or `MICROFISH_SIGN_IDENTITY="Developer ID Application" app/Scripts/build-app.sh ...` with
@@ -99,10 +136,26 @@ file on a branch of its own, not a release asset, because:
   re-upload.
 
 Each item has `sparkle:version` (build number), `sparkle:shortVersionString`,
-`sparkle:minimumSystemVersion`, `sparkle:hardwareRequirements` (`arm64`), a release-notes link to the
-GitHub release, and an enclosure that points at the release asset with its `sparkle:edSignature`. Betas
-carry `<sparkle:channel>beta</sparkle:channel>`. `app/Scripts/appcast.py` adds an item idempotently,
-keeps newest first, and never drops an existing item.
+`sparkle:minimumSystemVersion`, `sparkle:hardwareRequirements` (`arm64`), a short `<description>` that
+links to the GitHub release, and an enclosure that points at the release asset with its
+`sparkle:edSignature`. Betas carry `<sparkle:channel>beta</sparkle:channel>`. `app/Scripts/appcast.py`
+adds an item idempotently, keeps newest first, and never drops an existing item.
+
+**The feed is signed.** After the item is added, the publish job runs `sign_update` on `appcast.xml`
+with the same EdDSA key as the archives: Sparkle rewrites the file (one line) and appends
+`<!-- sparkle-signatures: edSignature: ... length: N -->`; the signature covers everything before that
+comment. Microfish's Info.plist sets `SURequireSignedFeed` and `SUVerifyUpdateBeforeExtraction`, so an
+installed copy refuses a feed whose signature does not verify against its `SUPublicEDKey`: someone who
+can push to the `appcast` branch (or serve a copy of the file) can no longer offer an update without
+the private key. Verified with Sparkle 2.10.1 in `app/Tests/update-e2e/run.sh --signed-feed`: a signed
+feed updates normally; a feed edited after signing is refused ("The update feed is improperly signed");
+see `notes/packaging.md` for the unsigned and wrong-key cases. Consequences:
+
+- **Every change to `appcast.xml` must be signed again**, or every installed copy stops seeing updates.
+  The workflow does it; a manual edit (rollback below) needs the command shown there.
+- Release notes sit inside the feed (`--notes embedded`), because a signed feed cannot vouch for a link
+  to a GitHub page.
+- Rotating the EdDSA key re-signs the feed with the new key; see Key rotation.
 
 ## Rolling back a bad release
 
@@ -113,6 +166,11 @@ Sparkle never downgrades. Rolling back means two things:
    git fetch origin appcast
    git worktree add -B appcast ../microfish-appcast origin/appcast
    python3 app/Scripts/appcast.py remove --appcast ../microfish-appcast/appcast.xml --tag v0.1.0
+   # sign the feed again with the key in your login keychain (a feed without a valid signature is refused by every installed copy)
+   app/Vendor/Sparkle/bin/sign_update --account microfish ../microfish-appcast/appcast.xml
+   pub="$(app/Vendor/Sparkle/bin/generate_keys --account microfish -p)"
+   swiftc -O app/Scripts/verify-ed-signature.swift -o /tmp/verify-ed-signature
+   /tmp/verify-ed-signature feed ../microfish-appcast/appcast.xml --public-key "$pub"
    git -C ../microfish-appcast commit -am "appcast: pull 0.1.0"
    git -C ../microfish-appcast push origin appcast
    ```
@@ -124,9 +182,39 @@ Sparkle never downgrades. Rolling back means two things:
    something newer is offered: tag `vX.Y.(Z+1)` (through a beta if there is time). A stable `0.1.1` has a
    higher build than `0.1.0` and its betas. Never retag or republish an existing version.
 
-## Required secrets (names only)
+## GitHub setup (once): the `release` environment, the tag ruleset, the secrets
 
-Repository, Settings, Secrets and variables, Actions, New repository secret:
+**Why an environment, not repository secrets.** A repository secret is readable by any workflow run in the
+repository, including one from a branch or tag whose workflow file somebody just changed. An environment
+secret is handed only to a job that names the environment, and only if the run passes the environment's
+rules: here, the run's ref must be a `v*` **tag**, and optionally you must approve it. So a modified
+workflow on a branch gets nothing, and a leaked write token alone cannot ship a signed build. The cost for
+a solo maintainer is one extra click per job (two per release) if you turn on the reviewer. Dry runs use
+`release-dry-run`, which GitHub creates empty on first use.
+
+Note: environment protection rules (required reviewers, deployment branch and tag rules) on a **private**
+repository need GitHub Pro, Team or Enterprise; on a public repository they are free. Environment secrets
+themselves work either way. If the private repository's plan lacks the rules, add them when the repository
+goes public and, until then, treat the tag ruleset (below) as the gate.
+
+1. **Tag ruleset** (stops anyone but you creating, moving or deleting a release tag).
+   https://github.com/elenaOnline/microfish/settings/rules, **New ruleset**, **New tag ruleset**.
+   Ruleset Name `Release tags`; Enforcement status **Active**; under **Bypass list**, **Add bypass**,
+   **Repository admin**, mode **Always allow**; under **Target tags**, **Add target**, **Include by
+   pattern**, type `v*`, **Add**; under **Rules** tick **Restrict creations**, **Restrict updates** and
+   **Restrict deletions**; **Create**. (As admin you bypass it, and you can still tag; a collaborator's or
+   a stolen non-admin token cannot.)
+2. **Environment.** https://github.com/elenaOnline/microfish/settings/environments, **New environment**,
+   Name `release`, **Configure environment**. Under **Deployment branches and tags** choose **Selected
+   branches and tags**, **Add deployment branch or tag rule**, Ref type **Tag**, Name pattern `v*`,
+   **Add rule**. Under **Deployment protection rules** tick **Required reviewers**, add `elenaOnline`,
+   **Save protection rules** (leave "Prevent self-review" off: you are the only maintainer). Leave the wait
+   timer off. Optional but recommended: the reviewer rule; without it the tag rule and ruleset still hold.
+3. **Secrets, in that environment.** On the same page, under **Environment secrets**, **Add environment
+   secret** for each name in the table. Not under Secrets and variables, Actions, Repository secrets.
+   If you already added repository secrets, delete them there afterwards.
+
+Secrets (names only):
 
 | Name | What it is |
 |---|---|
@@ -135,7 +223,7 @@ Repository, Settings, Secrets and variables, Actions, New repository secret:
 | `APPSTORE_CONNECT_API_KEY_P8` | contents of the App Store Connect API key file `AuthKey_<id>.p8` |
 | `APPSTORE_CONNECT_API_KEY_ID` | that key's Key ID |
 | `APPSTORE_CONNECT_API_ISSUER_ID` | the Issuer ID shown above the key list |
-| `SPARKLE_ED_PRIVATE_KEY` | the Sparkle EdDSA private key (base64 text) |
+| `SPARKLE_ED_PRIVATE_KEY` | the Sparkle EdDSA private key (base64 text); signs the archives and the appcast |
 
 Where each comes from:
 
@@ -153,8 +241,8 @@ Where each comes from:
 
 Nothing in the repository, the logs or the artifacts carries a key, a team ID or an identity hash: the
 identity is looked up in the temporary keychain at build time and masked in the log.
-Optional hardening: move the secrets into a GitHub Environment named `release` with required reviewers
-and add `environment: release` to the `build` job.
+The build and publish jobs of a real release declare `environment: release`; no other job and no dry run
+sees these secrets, and a step only gets the ones it lists under `env:` (the engine build step gets none).
 
 ## Key rotation
 
@@ -163,7 +251,10 @@ and add `environment: release` to the `build` job.
   certificate, so a renewed certificate from the same team keeps the app's identity, its permission
   grants and Sparkle's check on the installed app.
 - **App Store Connect key**: create a new one, update the three `APPSTORE_CONNECT_*` secrets, revoke the old.
-- **Sparkle EdDSA key**: rotate only deliberately, and test it first. Installed copies verify updates
+- **Sparkle EdDSA key**: rotate only deliberately, and test it first. The key signs the appcast as well
+  as the archives, and the app verifies the feed against its installed `SUPublicEDKey`: during a rotation
+  the feed must be signed with the key the installed copies trust until the first update that carries the
+  new key has been installed everywhere that matters. Installed copies verify updates
   against the `SUPublicEDKey` they already carry; Sparkle accepts a changed key only when the new app
   keeps the same Developer ID signature (as Sparkle's "Publishing an update" documents; not tested
   here). Do it
@@ -174,6 +265,8 @@ and add `environment: release` to the `build` job.
 
 ## Limits of this setup
 
+- Environment rules, the tag ruleset and `verify-tag.sh` against the real GitHub API have not been exercised
+  (no push was possible): `verify-tag.sh` ran against a stand-in `gh`.
 - The workflows have not run on GitHub yet: they were validated with `actionlint` (and `shellcheck`),
   by running the shell steps locally against stand-in inputs, and by building the app with the same
   script. The first dry run is the real test.

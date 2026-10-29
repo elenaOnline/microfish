@@ -3,13 +3,19 @@ name: Release
 # Push a tag vX.Y.Z or vX.Y.Z-beta.N (see RELEASING.md) and this builds, notarizes, publishes the
 # GitHub release and adds the item to the appcast. "Run workflow" with dry_run (the default) builds an
 # ad-hoc signed app, skips notarization and publishing, and uploads the zip as an artifact.
+#
+# Secrets live in the GitHub environment `release` (deployment rule: v* tags only), and only the build and
+# publish jobs of a real release enter it. A dry run uses the secret-less environment `release-dry-run`.
+# The gate resolves the tag to a commit once; every later job checks out that commit, not the tag name, and
+# re-checks that the tag still points at it. A real release runs from the tag itself: by pushing it, or by
+# "Run workflow" with the tag chosen as the ref (needed for allow_unsoaked_stable).
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (vX.Y.Z or vX.Y.Z-beta.N). Empty with dry_run: build the selected branch as a dev version."
+        description: "Dry run only: the tag to build (vX.Y.Z or vX.Y.Z-beta.N); empty builds the selected branch as a dev version. A real run ignores this and releases the tag chosen as the ref."
         required: false
         type: string
       dry_run:
@@ -35,6 +41,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The Rust toolchain every release is built with. rust-toolchain.toml says "stable", which moves: a stable
+  # promoted weeks after its beta would be compiled by a different compiler than the build people tested.
+  # Bump it here, on purpose, in a commit (RUSTUP_TOOLCHAIN below overrides the file).
+  RUST_VERSION: "1.98.1"
 
 jobs:
   gate:
@@ -49,17 +59,18 @@ jobs:
       channel: ${{ steps.gate.outputs.channel }}
       prerelease: ${{ steps.gate.outputs.prerelease }}
       dry_run: ${{ steps.gate.outputs.dry_run }}
-      ref: ${{ steps.gate.outputs.ref }}
+      sha: ${{ steps.gate.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # every branch and tag: the gate needs origin/main, origin/release/* and the tags
           fetch-tags: true
           persist-credentials: false
       - name: Validate the tag and the promotion rule
         id: gate
         env:
           EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
           PUSHED_REF_NAME: ${{ github.ref_name }}
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
@@ -71,15 +82,26 @@ jobs:
             tag="$PUSHED_REF_NAME"; dry_run=false
           else
             tag="$INPUT_TAG"; dry_run="$INPUT_DRY_RUN"
+            if [ "$dry_run" != true ]; then
+              # A real release is bound to the tag it runs from: the environment's tag rule and the code that
+              # runs both come from that tag, never from a branch.
+              [ "$REF_TYPE" = tag ] || { echo "::error::A real release runs from its tag: push the tag, or choose the tag (not a branch) under 'Use workflow from'."; exit 1; }
+              [ -z "$tag" ] || [ "$tag" = "$PUSHED_REF_NAME" ] || { echo "::error::The tag input ($tag) differs from the tag the workflow runs from ($PUSHED_REF_NAME)."; exit 1; }
+              tag="$PUSHED_REF_NAME"
+            fi
           fi
           if [ -z "$tag" ]; then
             [ "$dry_run" = true ] || { echo "::error::A real release needs a tag."; exit 1; }
-            tag=dev; ref="$GITHUB_SHA"
+            tag=dev; sha="$(git rev-parse "$GITHUB_SHA^{commit}")"
           else
-            ref="refs/tags/$tag"
-            git fetch --no-tags origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
-            git fetch --no-tags origin '+refs/heads/release/*:refs/remotes/origin/release/*' || true
             git rev-parse -q --verify "refs/tags/$tag" >/dev/null || { echo "::error::Tag $tag does not exist."; exit 1; }
+            git rev-parse -q --verify "refs/remotes/origin/${DEFAULT_BRANCH}" >/dev/null || { echo "::error::origin/${DEFAULT_BRANCH} was not fetched."; exit 1; }
+            # The one commit this whole run builds and publishes. Later jobs check out this SHA, never the tag name.
+            sha="$(git rev-parse "refs/tags/$tag^{commit}")"
+            if [ "$EVENT" = push ]; then
+              pushed="$(git rev-parse "$GITHUB_SHA^{commit}")"
+              [ "$pushed" = "$sha" ] || { echo "::error::Tag $tag points at ${sha:0:12} but the push that started this run was ${pushed:0:12}: the tag moved after it was pushed."; exit 1; }
+            fi
             flags=()
             [ "$INPUT_ALLOW_UNSOAKED" = true ] && flags+=(--allow-unsoaked)
             app/Scripts/release-gate.sh "$tag" --main-ref "origin/${DEFAULT_BRANCH}" "${flags[@]+"${flags[@]}"}"
@@ -92,27 +114,38 @@ jobs:
             echo "channel=$CHANNEL"
             echo "prerelease=$PRERELEASE"
             echo "dry_run=$dry_run"
-            echo "ref=$ref"
+            echo "sha=$sha"
           } >> "$GITHUB_OUTPUT"
-          echo "### $tag ($CHANNEL)$([ "$dry_run" = true ] && echo ', dry run')" >> "$GITHUB_STEP_SUMMARY"
+          echo "### $tag ($CHANNEL), commit ${sha}$([ "$dry_run" = true ] && echo ', dry run')" >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: Build, notarize, sign the update
     needs: gate
     runs-on: macos-26 # newest GA arm64 image (macos-latest is the same today); Xcode comes from select-xcode.sh
     timeout-minutes: 90
+    # Real release: the `release` environment (secrets, tag rule, optional reviewer). Dry run: an empty one.
+    environment: ${{ needs.gate.outputs.dry_run == 'true' && 'release-dry-run' || 'release' }}
     permissions:
       contents: read
     env:
       TAG: ${{ needs.gate.outputs.tag }}
+      SHA: ${{ needs.gate.outputs.sha }}
       DRY_RUN: ${{ needs.gate.outputs.dry_run }}
+      REPO: ${{ github.repository }}
     steps:
       - name: Where the temporary keychain goes
         run: echo "KEYCHAIN_PATH=$RUNNER_TEMP/microfish-build.keychain-db" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.gate.outputs.ref }}
+          ref: ${{ needs.gate.outputs.sha }} # the commit the gate approved, not the tag name
           persist-credentials: false
+      - name: Check this is the approved commit and the tag has not moved
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$SHA" ] || { echo "::error::The checkout is not the commit the gate approved."; exit 1; }
+          if [ "$TAG" != dev ]; then app/Scripts/verify-tag.sh "$TAG" "$SHA" "$REPO"; fi
       - name: Check the secrets are there
         if: ${{ needs.gate.outputs.dry_run != 'true' }}
         env:
@@ -126,18 +159,30 @@ jobs:
           missing=0
           for name in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD APPSTORE_CONNECT_API_KEY_P8 \
                       APPSTORE_CONNECT_API_KEY_ID APPSTORE_CONNECT_API_ISSUER_ID SPARKLE_ED_PRIVATE_KEY; do
-            if [ -z "${!name}" ]; then echo "::error::Secret $name is not set."; missing=1; fi
+            if [ -z "${!name}" ]; then echo "::error::Secret $name is not set in the release environment."; missing=1; fi
           done
           exit "$missing"
       - name: Select Xcode
         run: app/Scripts/select-xcode.sh
-      - name: Rust toolchain
+      - name: Rust toolchain (pinned)
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
-          rustc --version
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$RUST_VERSION" >> "$GITHUB_ENV" # overrides rust-toolchain.toml's "stable"
+          RUSTUP_TOOLCHAIN="$RUST_VERSION" rustc --version
       - name: Fetch Sparkle (pinned, checksum-verified)
         run: app/Scripts/fetch-sparkle.sh
+      - name: Build the signature checker
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tools"
+          swiftc -O app/Scripts/verify-ed-signature.swift -o "$RUNNER_TEMP/tools/verify-ed-signature"
+
+      # Everything that runs dependency code (cargo build scripts, proc macros) happens HERE, before the
+      # Developer ID certificate is imported or any key is unlocked. The steps after this one run only
+      # swiftc and our own scripts.
+      - name: Build the engine and the bridge (no signing key exists yet)
+        run: app/Scripts/build-engine.sh
 
       - name: Import the Developer ID certificate into a temporary keychain
         if: ${{ needs.gate.outputs.dry_run != 'true' }}
@@ -173,12 +218,12 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "Developer ID Application identity found in the temporary keychain."
 
-      - name: Build, sign and verify Microfish.app
+      - name: Assemble, sign and verify Microfish.app
         run: |
           set -euo pipefail
-          sign=(); [ "$DRY_RUN" = true ] && sign=(--sign -)
-          version="$TAG"
-          app/Scripts/build-app.sh --version "$version" "${sign[@]+"${sign[@]}"}" --out "$RUNNER_TEMP/out"
+          # A real release has no --allow-adhoc: build-app.sh refuses an ad-hoc versioned build. A dry run signs ad hoc.
+          sign=(); [ "$DRY_RUN" = true ] && sign=(--sign - --allow-adhoc)
+          app/Scripts/build-app.sh --version "$TAG" --skip-engine-build "${sign[@]+"${sign[@]}"}" --out "$RUNNER_TEMP/out"
 
       - name: Notarize
         if: ${{ needs.gate.outputs.dry_run != 'true' }}
@@ -212,7 +257,10 @@ jobs:
           rm -f "$key" "$RUNNER_TEMP/notarize-upload.zip"
           xcrun stapler staple "$app"
           xcrun stapler validate "$app"
-          spctl -a -vv -t exec "$app"
+          # spctl -vv also prints "origin=Developer ID Application: <name> (<team>)": keep that out of the public log.
+          verdict="$(spctl -a -vv -t exec "$app" 2>&1)" || { echo "::error::Gatekeeper rejected the app."; exit 1; }
+          printf '%s\n' "$verdict" | grep -E ': accepted$|^source=' | sed 's|^.*Microfish.app|Microfish.app|'
+          printf '%s\n' "$verdict" | grep -q '^source=Notarized Developer ID$' || { echo "::error::Gatekeeper does not see a notarized Developer ID app."; exit 1; }
 
       - name: Zip
         id: zip
@@ -235,6 +283,15 @@ jobs:
           printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | app/Vendor/Sparkle/bin/sign_update --ed-key-file - "$ZIP" > "$RUNNER_TEMP/release/signature.txt"
           grep -q 'sparkle:edSignature=' "$RUNNER_TEMP/release/signature.txt"
           cat "$RUNNER_TEMP/release/signature.txt"
+          # Would an installed copy accept this? Check the signature against the SUPublicEDKey that is inside the
+          # zip we are about to publish. A wrong or rotated-by-accident secret fails the release here, not in the field.
+          unzip -p "$ZIP" Microfish.app/Contents/Info.plist > "$RUNNER_TEMP/zip-Info.plist"
+          pub="$(plutil -extract SUPublicEDKey raw "$RUNNER_TEMP/zip-Info.plist")"
+          "$RUNNER_TEMP/tools/verify-ed-signature" zip "$ZIP" --public-key "$pub" --signature-output "$RUNNER_TEMP/release/signature.txt"
+
+      - name: Self-test of the signature tooling (dry run, throwaway key)
+        if: ${{ needs.gate.outputs.dry_run == 'true' }}
+        run: app/Scripts/test-signing.sh "$RUNNER_TEMP/tools/verify-ed-signature"
 
       - name: Upload the release files
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -257,31 +314,52 @@ jobs:
     name: Publish the release and the appcast item
     needs: [gate, build]
     if: ${{ needs.gate.outputs.dry_run != 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # macOS because Sparkle's sign_update (which signs the appcast) is a macOS tool. This job builds nothing
+    # and runs only scripts from the approved commit; it holds the write token and the Sparkle key.
+    runs-on: macos-26
+    timeout-minutes: 20
+    environment: release
     permissions:
       contents: write # create the release, push the appcast branch
     env:
       TAG: ${{ needs.gate.outputs.tag }}
       SHORT: ${{ needs.gate.outputs.short }}
+      SHA: ${{ needs.gate.outputs.sha }}
       PRERELEASE: ${{ needs.gate.outputs.prerelease }}
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.gate.outputs.ref }}
-          fetch-depth: 0
+          ref: ${{ needs.gate.outputs.sha }}
           persist-credentials: true # the appcast push below uses it; nothing from the build runs in this job
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: Microfish-release
           path: release
+      - name: Fetch Sparkle (pinned) and build the signature checker
+        run: |
+          set -euo pipefail
+          app/Scripts/fetch-sparkle.sh
+          mkdir -p "$RUNNER_TEMP/tools"
+          swiftc -O app/Scripts/verify-ed-signature.swift -o "$RUNNER_TEMP/tools/verify-ed-signature"
+      - name: Check the artifact once more before anything is published
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$SHA" ] || { echo "::error::The checkout is not the commit the gate approved."; exit 1; }
+          zip="release/Microfish-${SHORT}.zip"
+          [ -f "$zip" ] || { echo "::error::$zip is missing from the build artifact."; exit 1; }
+          unzip -p "$zip" Microfish.app/Contents/Info.plist > "$RUNNER_TEMP/zip-Info.plist"
+          pub="$(plutil -extract SUPublicEDKey raw "$RUNNER_TEMP/zip-Info.plist")"
+          [ "$pub" = "$(tr -d '[:space:]' < app/Packaging/sparkle-public-key.txt)" ] || { echo "::error::The zip carries a different SUPublicEDKey than the repository."; exit 1; }
+          [ "$(plutil -extract CFBundleShortVersionString raw "$RUNNER_TEMP/zip-Info.plist")" = "$SHORT" ] || { echo "::error::The zip is not version $SHORT."; exit 1; }
+          "$RUNNER_TEMP/tools/verify-ed-signature" zip "$zip" --public-key "$pub" --signature-output release/signature.txt
+          echo "SPARKLE_PUBLIC_KEY=$pub" >> "$GITHUB_ENV"
       - name: Create the GitHub release (first publishing step; existing assets are never changed)
         run: |
           set -euo pipefail
+          app/Scripts/verify-tag.sh "$TAG" "$SHA" "$REPO"
           zip="release/Microfish-${SHORT}.zip"
-          [ -f "$zip" ] || { echo "::error::$zip is missing from the build artifact."; exit 1; }
           if gh release view "$TAG" >/dev/null 2>&1; then
             # A re-run after the release was created: it must be the very same build, or stop.
             published="$(mktemp -d)"
@@ -292,38 +370,53 @@ jobs:
             fi
             echo "Release $TAG already exists with this exact build; continuing to the appcast."
           else
-            if [ "$PRERELEASE" = true ]; then flags=(--prerelease --latest=false); else flags=(--latest); fi
+            if [ "$PRERELEASE" = true ]; then
+              flags=(--prerelease --latest=false)
+            else
+              # "Latest" belongs to the highest stable only: a hotfix to an older minor must not take it.
+              stables="$(gh release list --limit 300 --exclude-drafts --exclude-pre-releases --json tagName --jq '.[].tagName')"
+              if printf '%s\n' "$stables" | python3 -I app/Scripts/version.py is-latest "$TAG"; then flags=(--latest); else flags=(--latest=false); fi
+            fi
+            echo "gh release create flags: ${flags[*]}"
             gh release create "$TAG" "$zip" --verify-tag --title "Microfish ${SHORT}" --generate-notes "${flags[@]}"
           fi
-      - name: Add the appcast item on the appcast branch
+      - name: Add the item to the appcast, sign the appcast, push the appcast branch
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          wt="$RUNNER_TEMP/appcast-worktree"
           if git ls-remote --exit-code --heads origin appcast >/dev/null 2>&1; then
             git fetch --no-tags origin appcast
-            git worktree add ../appcast-worktree -B appcast origin/appcast
+            git worktree add "$wt" -B appcast origin/appcast
           else
-            git worktree add --orphan -b appcast ../appcast-worktree
+            git worktree add --orphan -b appcast "$wt"
           fi
-          python3 -I app/Scripts/appcast.py add \
-            --appcast ../appcast-worktree/appcast.xml \
-            --tag "$TAG" \
-            --zip "release/Microfish-${SHORT}.zip" \
-            --signing-output "$(cat release/signature.txt)" \
-            --min-system "$(cat release/min-macos.txt)" \
-            --repo "$REPO"
-          python3 -I app/Scripts/appcast.py check ../appcast-worktree/appcast.xml
-          cd ../appcast-worktree
-          git add appcast.xml
-          if git diff --cached --quiet; then
-            echo "The appcast already has this item."
-          else
-            git commit -m "appcast: ${SHORT}"
-            for attempt in 1 2 3; do
-              if git push origin appcast; then break; fi
-              [ "$attempt" = 3 ] && { echo "::error::Could not push the appcast branch."; exit 1; }
-              git pull --rebase origin appcast
-            done
-          fi
+          for attempt in 1 2 3; do
+            python3 -I app/Scripts/appcast.py add \
+              --appcast "$wt/appcast.xml" \
+              --tag "$TAG" \
+              --zip "release/Microfish-${SHORT}.zip" \
+              --signing-output "$(cat release/signature.txt)" \
+              --min-system "$(cat release/min-macos.txt)" \
+              --notes embedded \
+              --repo "$REPO"
+            python3 -I app/Scripts/appcast.py check "$wt/appcast.xml"
+            # Sign the feed itself (the app requires it: SURequireSignedFeed). The key goes in on stdin.
+            printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | app/Vendor/Sparkle/bin/sign_update --ed-key-file - "$wt/appcast.xml" >/dev/null
+            "$RUNNER_TEMP/tools/verify-ed-signature" feed "$wt/appcast.xml" --public-key "$SPARKLE_PUBLIC_KEY"
+            python3 -I app/Scripts/appcast.py check "$wt/appcast.xml"
+            git -C "$wt" add appcast.xml
+            if git -C "$wt" diff --cached --quiet; then
+              echo "The appcast already has this item."; break
+            fi
+            git -C "$wt" commit -m "appcast: ${SHORT}"
+            if git -C "$wt" push origin appcast; then break; fi
+            [ "$attempt" = 3 ] && { echo "::error::Could not push the appcast branch."; exit 1; }
+            # Someone else pushed first: start again from their file (a signed one-line file does not rebase).
+            git -C "$wt" fetch --no-tags origin appcast
+            git -C "$wt" reset --hard origin/appcast
+          done
           echo "Appcast: https://raw.githubusercontent.com/${REPO}/appcast/appcast.xml" >> "$GITHUB_STEP_SUMMARY"

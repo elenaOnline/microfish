@@ -43,5 +43,12 @@
 	     Automatic download and install stays off until the user turns it on. -->
 	<key>SUEnableAutomaticChecks</key>
 	<true/>
+	<!-- The appcast is signed with the same EdDSA key as the archives (release workflow, publish job), and the
+	     app refuses a feed whose signature does not verify against SUPublicEDKey. The release notes live inside
+	     the feed (a signed feed cannot vouch for a link). SURequireSignedFeed needs SUVerifyUpdateBeforeExtraction. -->
+	<key>SURequireSignedFeed</key>
+	<true/>
+	<key>SUVerifyUpdateBeforeExtraction</key>
+	<true/>
 </dict>
 </plist>

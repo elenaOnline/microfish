@@ -32,9 +32,12 @@ jobs:
           python3 -I app/Scripts/test_appcast.py
       - name: Release gate tests
         run: app/Scripts/test-release-gate.sh
-      - name: Shell syntax
+      - name: Shell syntax and shellcheck (the bash scripts; fetch-sparkle.sh and sign-sparkle.sh are zsh)
         run: |
-          for f in app/Scripts/*.sh; do bash -n "$f"; done
+          for f in app/Scripts/*.sh; do
+            bash -n "$f"
+            if head -n 1 "$f" | grep -q bash; then shellcheck -S warning -x "$f"; fi
+          done
       - name: Lint workflows (actionlint, pinned and checksum-verified)
         env:
           ACTIONLINT_VERSION: "1.7.12"
@@ -82,6 +85,8 @@ jobs:
       - name: Helper tests (headless)
         run: |
           python3 app/Tests/run.py --src app/Sources --scratch "$RUNNER_TEMP/helper-tests" live press tabfix queue hudfix
+      - name: Signature tooling (throwaway keys)
+        run: app/Scripts/test-signing.sh
       - name: Build, sign (ad-hoc) and verify the app
         run: app/Scripts/build-app.sh --version dev --sign - --out "$RUNNER_TEMP/out" --package
       - name: Upload the ad-hoc build
