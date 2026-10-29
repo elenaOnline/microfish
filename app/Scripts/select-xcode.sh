@@ -36,7 +36,8 @@ pick() {   # newest SDK among the given developer directories that links SkyLigh
 xcodes=()
 for app in /Applications/Xcode*.app; do [ -d "$app/Contents/Developer" ] && xcodes+=("$(cd "$app/Contents/Developer" && pwd -P)"); done
 best=""; best_sdk="0"
-[ "${#xcodes[@]}" -gt 0 ] && pick $(printf '%s\n' "${xcodes[@]}" | sort -u)
+unique=(); while IFS= read -r d; do unique+=("$d"); done < <(printf '%s\n' "${xcodes[@]+"${xcodes[@]}"}" | sed '/^$/d' | sort -u)
+[ "${#unique[@]}" -gt 0 ] && pick "${unique[@]}"
 if [ -z "$best" ] && [ -d /Library/Developer/CommandLineTools/usr/bin ]; then
   echo "::warning::No Xcode links SkyLight; falling back to the Command Line Tools (no SwiftUI macro plugins)."
   pick /Library/Developer/CommandLineTools
