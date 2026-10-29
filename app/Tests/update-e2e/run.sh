@@ -1,7 +1,11 @@
 #!/bin/zsh
 # Local end-to-end proof that Sparkle updates Microfish the way CONTRACT.md says, without any UI.
 #
-#   app/Tests/update-e2e/run.sh [--evidence DIR]
+#   app/Tests/update-e2e/run.sh [--evidence DIR] [--signed-feed]
+#
+# --signed-feed: the probe requires a signed feed like Microfish does (SURequireSignedFeed +
+# SUVerifyUpdateBeforeExtraction), the feed is signed with sign_update before it is served, and scenario J
+# serves a modified, an unsigned and a wrong-key feed to see what Sparkle does with each.
 #
 # Builds a probe app (net.webreceptor.microfish.updateprobe, LSUIElement: no Dock icon, no window, no sound,
 # no notification) that compiles the app's real app/Sources/Updates.swift + UpdateModel.swift and drives them
@@ -26,8 +30,14 @@ set -u
 here=${0:A:h}
 app=${here:h:h}
 sparkle=$app/Vendor/Sparkle
-evidence=""
-[[ "${1:-}" == --evidence ]] && evidence=${2:?}
+evidence=""; signed_feed=0
+while (( $# )); do
+  case $1 in
+    --evidence) evidence=${2:?}; shift 2 ;;
+    --signed-feed) signed_feed=1; shift ;;
+    *) print -u2 "unknown option $1"; exit 64 ;;
+  esac
+done
 
 S=$(mktemp -d /tmp/mf-update-e2e-XXXXXX)
 S=$(cd $S && pwd -P)   # /private/tmp/...: what ps and proc_pidpath report for relaunched copies
@@ -127,6 +137,9 @@ swiftc -O -o $S/build/watcher $here/watcher.swift || { note "watcher build faile
 
 make_app() {   # make_app <dir> <short> <build> [feed url] [auto-checks YES|NO]
   local dir=$1 short=$2 bld=$3 feedurl=${4:-$feed/appcast.xml} autochk=${5:-false}
+  local reqsigned=""
+  (( signed_feed )) && reqsigned=' <key>SURequireSignedFeed</key><true/>
+ <key>SUVerifyUpdateBeforeExtraction</key><true/>'
   local a=$dir/MicrofishUpdateProbe.app
   rm -rf $dir; mkdir -p $a/Contents/MacOS $a/Contents/Frameworks
   cp $S/build/MicrofishUpdateProbe $a/Contents/MacOS/
@@ -148,6 +161,7 @@ make_app() {   # make_app <dir> <short> <build> [feed url] [auto-checks YES|NO]
  <key>SUFeedURL</key><string>$feedurl</string>
  <key>SUPublicEDKey</key><string>$pubkey</string>
  <key>SUEnableAutomaticChecks</key><$autochk/>
+$reqsigned
 </dict></plist>
 EOF
   $app/Scripts/sign-sparkle.sh $a/Contents/Frameworks/Sparkle.framework $identity >$dir/sign.log 2>&1 || { note "sign-sparkle failed"; cat $dir/sign.log; exit 2; }
@@ -175,11 +189,16 @@ item() {   # item <title> <short> <build> <zipname> <signature-attrs> [channel]
    <sparkle:shortVersionString>$2</sparkle:shortVersionString>
    <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
    $chan
+   ${7:-}
    <enclosure url="$feed/$4" $5 type="application/octet-stream"/>
   </item>
 EOF
 }
-appcast() { { echo '<?xml version="1.0" encoding="utf-8"?><rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><title>Microfish probe</title>'; cat; echo '</channel></rss>'; } > $S/feed/appcast.xml; }
+appcast() {   # appcast [signing key account]: write the feed from the items on stdin; signed when --signed-feed
+  { echo '<?xml version="1.0" encoding="utf-8"?><rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><title>Microfish probe</title>'; cat; echo '</channel></rss>'; } > $S/feed/appcast.xml
+  (( signed_feed )) && $sparkle/bin/sign_update --ed-key-file $S/keys/${1:-microfish-test}.key $S/feed/appcast.xml >/dev/null
+  return 0
+}
 sig_v2=$(sign $S/feed/Probe-1.1.0.zip microfish-test)
 sig_v3=$(sign $S/feed/Probe-1.2.0-beta.1.zip microfish-test)
 { item "1.1.0" 1.1.0 1010099 Probe-1.1.0.zip "$sig_v2"; item "1.2.0-beta.1" 1.2.0-beta.1 1020001 Probe-1.2.0-beta.1.zip "$sig_v3" beta; } | appcast
@@ -357,6 +376,31 @@ check "I: 'check' + 'download and install' on reach Sparkle" 'ev event=roundtrip
 check "I: beta on persists in defaults and selects the beta channel" 'ev event=roundtrip-beta-on beta=True persisted=1 channels=beta'
 check "I: beta off returns to no channel" 'ev event=roundtrip-beta-off beta=False channels='
 finish I
+
+# ============================ J: signed-feed behaviour ===================================================
+if (( signed_feed )); then
+  note ""; note "== J: what Sparkle does with a feed that is signed, modified, unsigned, wrong-key, with notes"
+  echo '<html><body><p>notes</p></body></html>' > $S/feed/notes.html
+  j_main() { item "1.1.0" 1.1.0 1010099 Probe-1.1.0.zip "$sig_v2"; }
+  j_run() {   # j_run <name> <ok | refused | notes-failed>
+    fresh v1 '{"check":true,"beta":false,"prepare":"ok","prepareDelay":0.5}'
+    wait_ev 40 event=driver:update-found || wait_ev 5 event=driver:updater-error || true
+    sleep 6
+    note "   J($1): found=$(evget found event=driver:update-found) signing=$(evget signing event=driver:update-found) notesURL=$(evget notesURL event=driver:update-found) description=$(evget hasDescription event=driver:update-found) notes-event=$(ev event=driver:release-notes && echo yes || { ev event=driver:release-notes-failed && echo failed || echo none; }) error=$(evget error event=driver:updater-error | cut -c1-110) installed=$(installed_version)"
+    case $2 in
+      ok)           check "J($1): the update was offered, the feed validated (signing status 1) and 1.1.0 installed" 'ev event=driver:update-found found=1.1.0 signing=1 && test "$(installed_version)" = 1.1.0' ;;
+      notes-failed) check "J($1): the update was offered but the unsigned release-notes link was not accepted" 'ev event=driver:update-found found=1.1.0 signing=1 && ev event=driver:release-notes-failed' ;;
+      refused)      check "J($1): Sparkle refused the feed (improperly signed), offered nothing, installed nothing" '! ev event=driver:update-found && ev event=driver:updater-error code=1000 && test "$(installed_version)" = 1.0.0' ;;
+    esac
+    finish J-$1
+  }
+  j_main > $S/feed/j.item; cat $S/feed/j.item | appcast; j_run signed-plain ok
+  cat $S/feed/j.item | appcast; sed -i '' 's|<title>1.1.0</title>|<title>1.1.0 (edited)</title>|' $S/feed/appcast.xml; j_run modified-after-signing refused
+  signed_feed=0; cat $S/feed/j.item | appcast; signed_feed=1; j_run unsigned refused
+  cat $S/feed/j.item | appcast microfish-test-other; j_run signed-with-other-key refused
+  item "1.1.0" 1.1.0 1010099 Probe-1.1.0.zip "$sig_v2" "" "<sparkle:releaseNotesLink>$feed/notes.html</sparkle:releaseNotesLink>" | appcast; j_run unsigned-notes-link notes-failed
+  item "1.1.0" 1.1.0 1010099 Probe-1.1.0.zip "$sig_v2" "" "<description><![CDATA[<p>Embedded notes</p>]]></description>" | appcast; j_run embedded-description ok
+fi
 
 # ============================ windows ====================================================================
 note ""; note "== windows seen during every scenario (read-only watcher)"

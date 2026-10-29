@@ -9,7 +9,8 @@
 
 `add` writes one <item> per release: title, pubDate, sparkle:version (the build number from
 version.py), sparkle:shortVersionString, sparkle:minimumSystemVersion, sparkle:hardwareRequirements,
-sparkle:channel (betas only), a release-notes link to the GitHub release, and the enclosure (URL of
+sparkle:channel (betas only), a release-notes link to the GitHub release (or, with --notes embedded, a
+<description> that points to it), and the enclosure (URL of
 the release asset, length, type, sparkle:edSignature as printed by Sparkle's sign_update).
 
 Properties the release pipeline relies on:
@@ -102,7 +103,15 @@ def build_item(v, repo, signature, length, min_system, hardware, date, notes_kin
     if v["channel"] == "beta":
         ET.SubElement(item, S + "channel").text = "beta"
     notes = f"https://github.com/{repo}/releases/tag/{v['tag']}"
-    ET.SubElement(item, S + ("fullReleaseNotesLink" if notes_kind == "full" else "releaseNotesLink")).text = notes
+    if notes_kind == "embedded":
+        # A signed feed covers its own <description>; a link to a GitHub release page cannot carry a signature,
+        # and an app that requires a signed feed (SURequireSignedFeed) wants release notes signed too.
+        kind = "beta (pre-release)" if v["channel"] == "beta" else "release"
+        ET.SubElement(item, "description").text = (
+            f'<p>Microfish {v["short"]} is a {kind}. Its notes are on '
+            f'<a href="{notes}">the GitHub release page</a>.</p>')
+    else:
+        ET.SubElement(item, S + ("fullReleaseNotesLink" if notes_kind == "full" else "releaseNotesLink")).text = notes
     ET.SubElement(item, "enclosure", {
         "url": f"https://github.com/{repo}/releases/download/{v['tag']}/Microfish-{v['short']}.zip",
         "length": str(length),
@@ -216,8 +225,9 @@ def main(argv=None):
     a.add_argument("--min-system", default=DEFAULT_MIN_SYSTEM)
     a.add_argument("--hardware", default="arm64", help="sparkle:hardwareRequirements ('' to omit)")
     a.add_argument("--date", help="pubDate (RFC 822); default now, or the existing item's")
-    a.add_argument("--notes", choices=["release", "full"], default="release",
-                   help="release: sparkle:releaseNotesLink; full: sparkle:fullReleaseNotesLink (a Version History link)")
+    a.add_argument("--notes", choices=["release", "full", "embedded"], default="release",
+                   help="release: sparkle:releaseNotesLink; full: sparkle:fullReleaseNotesLink (a Version History link); "
+                        "embedded: a <description> inside the feed (what a signed feed needs)")
     r = sub.add_parser("remove", help="delete the item for one release (rollback)")
     r.add_argument("--appcast", required=True)
     r.add_argument("--tag", required=True)

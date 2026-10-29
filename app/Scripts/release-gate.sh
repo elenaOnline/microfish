@@ -5,6 +5,8 @@
 #   release-gate.sh vX.Y.Z[-beta.N] [--allow-unsoaked] [--main-ref origin/main]
 #
 #   - the tag must be well-formed (version.py)
+#   - beta: its commit must be reachable from main or from some release/* branch (a tag on a stray branch
+#     or an unmerged pull request is refused)
 #   - stable: its commit must be reachable from main, or from the hotfix branch release/X.Y of its own
 #     minor version (a hotfix is cut there and may not be merged back yet)
 #   - stable: a beta tag of the same X.Y.Z must already exist (the promotion rule), unless
@@ -27,10 +29,20 @@ eval "$FIELDS"
 COMMIT="$(git rev-parse -q --verify "refs/tags/$TAG^{commit}")" || refuse "tag $TAG is not in this clone"
 echo "release-gate: $TAG -> $SHORT ($CHANNEL), build $BUILD, commit ${COMMIT:0:12}"
 
-[ "$CHANNEL" = stable ] || { echo "release-gate: beta: OK"; exit 0; }
+on_main=0; git merge-base --is-ancestor "$COMMIT" "$MAIN_REF" 2>/dev/null && on_main=1
+
+if [ "$CHANNEL" != stable ]; then
+  on_release=0
+  if [ "$on_main" = 0 ]; then
+    while IFS= read -r rb; do
+      [ -n "$rb" ] && git merge-base --is-ancestor "$COMMIT" "$rb" 2>/dev/null && { on_release=1; break; }
+    done < <(git for-each-ref --format='%(refname)' "refs/remotes/${MAIN_REF%/*}/release/")
+  fi
+  [ "$on_main" = 1 ] || [ "$on_release" = 1 ] || refuse "beta $TAG is on neither $MAIN_REF nor a release/* branch; releases are tagged on main or a hotfix branch"
+  echo "release-gate: beta: OK"; exit 0
+fi
 
 minor="${BASE%.*}"
-on_main=0; git merge-base --is-ancestor "$COMMIT" "$MAIN_REF" 2>/dev/null && on_main=1
 on_branch=0
 if [ "$on_main" = 0 ]; then
   rb="${MAIN_REF%/*}/release/$minor"

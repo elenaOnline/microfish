@@ -62,6 +62,25 @@ class AppcastTests(unittest.TestCase):
         self.assertEqual((enc.get("length"), enc.get("type"), enc.get(S + "edSignature")),
                          ("4242", "application/octet-stream", SIG))
 
+    def test_embedded_notes_for_a_signed_feed(self):
+        self.add("v0.1.0-beta.2", notes_kind="embedded")
+        (item,) = self.items()
+        self.assertIsNone(item.find(S + "releaseNotesLink"))
+        self.assertIsNone(item.find(S + "fullReleaseNotesLink"))
+        text = item.find("description").text
+        self.assertIn("https://github.com/elenaOnline/microfish/releases/tag/v0.1.0-beta.2", text)
+        self.assertIn("Microfish 0.1.0-beta.2", text)
+        self.assertEqual(appcast.check(self.path), [])
+
+    def test_a_signed_feed_can_be_updated(self):
+        # sign_update appends comments and rewrites the file; the next release must still be able to add to it
+        self.add("v0.1.0-beta.1")
+        with open(self.path, "a") as f:
+            f.write('<!-- sparkle-signatures:\nedSignature: AAAA\nlength: 1\n-->\n')
+        self.add("v0.1.0-beta.2")
+        self.assertEqual([i.find(S + "shortVersionString").text for i in self.items()], ["0.1.0-beta.2", "0.1.0-beta.1"])
+        self.assertNotIn("sparkle-signatures", self.read("r"))   # the old signature is dropped; the feed is signed again
+
     def test_stable_has_no_channel(self):
         self.add("v0.1.0")
         self.assertIsNone(self.items()[0].find(S + "channel"))
