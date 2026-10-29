@@ -8,3 +8,6 @@ CLAUDE.md
 .direnv
 **/.DS_Store
 flamegraph.svg
+
+# Sparkle, fetched by app/Scripts/fetch-sparkle.sh (pinned in app/Vendor/sparkle.lock)
+/app/Vendor/Sparkle/
