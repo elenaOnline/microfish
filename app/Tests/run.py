@@ -10,7 +10,7 @@ p = argparse.ArgumentParser(); p.add_argument('--scratch', default='/tmp/mfperf/
 a = p.parse_args(); src = Path(a.src); scratch = Path(a.scratch); (scratch/'work/spatial-tests').mkdir(parents=True, exist_ok=True)
 if (root/'work/navigator.tsv').exists(): shutil.copy2(root/'work/navigator.tsv', scratch/'work/navigator.tsv')
 FW = ['-framework', 'AppKit', '-framework', 'QuartzCore']
-OTHERS = [f for f in ['TabBars.swift', 'Settings.swift', 'ShortcutRecorder.swift', 'SpatialOverview.swift', 'LiveSignals.swift'] if (src/f).exists()]
+OTHERS = [f for f in ['TabBars.swift', 'Settings.swift', 'UpdateModel.swift', 'UpdatesPane.swift', 'ShortcutRecorder.swift', 'SpatialOverview.swift', 'LiveSignals.swift'] if (src/f).exists()]
 def build(name, text, others=OTHERS, defines=('NAVIGATOR_TESTS',)):
     d = scratch/name; d.mkdir(exist_ok=True); (d/'main.swift').write_text(text)
     subprocess.run(['swiftc', '-suppress-warnings', *sum([['-D', x] for x in defines], []), *[str(src/f) for f in others], str(d/'main.swift'), '-o', str(d/'tests'), *FW], check=True)
@@ -38,13 +38,14 @@ def suite_team():
     return build('team', (src/'main.swift').read_text()+'\n'+prelude+body+'\nprint("Minimap team checks passed:", teamChecks)\n')
 def suite_press(): return build('press', (src/'main.swift').read_text()+'\n'+(here/'press-tests.swift').read_text())
 def suite_tabfix(): return build('tabfix', (src/'main.swift').read_text()+'\n'+(here/'tab-fixes-tests.swift').read_text())
+def suite_updatestop(): return build('updatestop', (src/'main.swift').read_text()+'\n'+(here/'update-stop-tests.swift').read_text())
 def suite_hudfix(): return build('hudfix', (src/'main.swift').read_text()+'\n'+(here/'hud-final-tests.swift').read_text())
 def suite_queue(): return build('queue', (src/'main.swift').read_text()+'\n'+(here/'queue-tests.swift').read_text())
 def suite_leak():
     # Flat NSKeyValueDependency count over view-rebuild churn (tests/leak-churn.py); a stand-in "binary" for the loop below.
     return here/'leak-churn.py'
 def suite_pixel(): return here/'pixel-diff.py'
-SUITES = {'hud': suite_hud, 'drag': suite_drag, 'spatial': suite_spatial, 'team': suite_team, 'live': suite_live, 'press': suite_press, 'tabfix': suite_tabfix, 'queue': suite_queue, 'hudfix': suite_hudfix, 'leak': suite_leak, 'pixel': suite_pixel}
+SUITES = {'hud': suite_hud, 'drag': suite_drag, 'spatial': suite_spatial, 'team': suite_team, 'live': suite_live, 'press': suite_press, 'tabfix': suite_tabfix, 'queue': suite_queue, 'hudfix': suite_hudfix, 'updatestop': suite_updatestop, 'leak': suite_leak, 'pixel': suite_pixel}
 for n in (a.suites or list(SUITES)):
     exe = SUITES[n]()
     cmd = [sys.executable, str(exe), '--src', str(src)] if n in ('leak', 'pixel') else [str(exe)]

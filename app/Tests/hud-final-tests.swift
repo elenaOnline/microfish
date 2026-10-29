@@ -148,7 +148,9 @@ do {
  let nav=Navigator(path:"/tmp/none/navigator.tsv")
  let menu=nav.makeStatusMenu()
  let titles=menu.items.map { $0.isSeparatorItem ? "-" : $0.title }
- fcheck(titles == ["Settings…","-","Quit Microfish"],"status menu has no header row: \(titles)")
+ fcheck(titles == ["Settings…","Check for Updates…","-","Quit Microfish"],"status menu has no header row: \(titles)")
+ fcheck(menu.items[1].action == #selector(Navigator.checkForUpdates(_:)) && menu.items[1].target === nav,"Check for Updates… sits right after Settings…")
+ fcheck(!nav.validateMenuItem(menu.items[1]),"Check for Updates… is disabled without an updater")
  fcheck(menu.items[0].keyEquivalent == "," && menu.items[0].keyEquivalentModifierMask == .command,"Settings… is ⌘,")
  if #available(macOS 27.0, *) { fcheck(menu.items.filter { !$0.isSeparatorItem }.allSatisfy { $0.preferredImageVisibility == .hidden },"no row carries an image") }
 }
