@@ -52,6 +52,10 @@ lua52 = ["mlua/lua52"]
 lua53 = ["mlua/lua53"]
 lua54 = ["mlua/lua54"]
 
+# Microfish: embeds the Microfish identity (app/Packaging/Engine-Embedded-Info.plist)
+# in the binary instead of upstream's. Off by default.
+microfish = []
+
 [profile.fast-release]
 inherits = "release"
 codegen-units = 256

@@ -10,6 +10,7 @@ use tracing::{error, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod accessibility_prompt;
+mod bundled;
 mod client;
 mod commands;
 mod config;
@@ -32,7 +33,12 @@ pub use paneru::types;
 #[cfg(test)]
 mod tests;
 
+// The bundled engine (`--features microfish`) carries the Microfish identity; the default
+// build keeps upstream's.
+#[cfg(not(feature = "microfish"))]
 embed_plist::embed_info_plist!("../assets/Info.plist");
+#[cfg(feature = "microfish")]
+embed_plist::embed_info_plist!("../app/Packaging/Engine-Embedded-Info.plist");
 
 use events::{Event, EventSender};
 
@@ -135,6 +141,23 @@ pub enum SubCmd {
     },
 }
 
+impl SubCmd {
+    /// The subcommands that install, remove or drive the engine as a launchd service.
+    fn manages_service(&self) -> bool {
+        matches!(
+            self,
+            SubCmd::Install
+                | SubCmd::Uninstall
+                | SubCmd::Reinstall
+                | SubCmd::InstallApp
+                | SubCmd::UninstallApp
+                | SubCmd::Start
+                | SubCmd::Stop
+                | SubCmd::Restart
+        )
+    }
+}
+
 #[derive(Clone, Debug, Subcommand)]
 pub enum StateCmd {
     /// Prints the value stored under a key, or `null`.
@@ -184,6 +207,20 @@ pub enum QueryCmd {
 ///
 /// `Ok(())` if the application runs successfully, otherwise `Err(Error)`.
 fn main() -> Result<()> {
+    let subcmd = Paneru::parse().subcmd.unwrap_or_default();
+    // Bundled mode (`MICROFISH_BUNDLED=1`, set by the app's launch agent): the app owns the
+    // engine's lifecycle, and the engine sets up its own paths and log. This must come
+    // before any thread starts.
+    if bundled::is_bundled() {
+        if subcmd.manages_service() {
+            eprintln!("{}", bundled::REFUSAL);
+            std::process::exit(1);
+        }
+        if matches!(subcmd, SubCmd::Launch) {
+            bundled::prepare();
+        }
+    }
+
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(
@@ -200,7 +237,6 @@ fn main() -> Result<()> {
 
     let service = || service::Service::try_new(service::ID);
 
-    let subcmd = Paneru::parse().subcmd.unwrap_or_default();
     maybe_warn_deprecated_options_for_service(&subcmd);
 
     match subcmd {
@@ -221,6 +257,10 @@ fn main() -> Result<()> {
                     app.run();
                 }
                 Err(err) => {
+                    if bundled::is_bundled() {
+                        error!("Error launching Microfish: {err}.");
+                        std::process::exit(1);
+                    }
                     error!(
                         "Error launching Paneru: {err}.\nStopping the service for now. You can restart it again with 'paneru restart'."
                     );
@@ -256,7 +296,8 @@ fn wait_for_accessibility(sender: EventSender, receiver: &Receiver<Event>) -> bo
     }
 
     warn!(
-        "Accessibility access is required. Paneru will remain in the menu bar and start automatically once access is granted."
+        "Accessibility access is required. {} will remain in the menu bar and start automatically once access is granted.",
+        bundled::product_name()
     );
 
     loop {

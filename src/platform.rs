@@ -327,9 +327,12 @@ impl PlatformCallbacks {
     ///   `NSWorkspace` observers, and Carbon process event handlers.
     pub fn setup_handlers(&mut self) -> Result<()> {
         if !check_ax_privilege() {
-            return Err(Error::PermissionDenied(
-                "Accessibility permissions are required. Please enable them in System Preferences -> Security & Privacy -> Privacy -> Accessibility.".to_string(),
-            ));
+            let how = if crate::bundled::is_bundled() {
+                "Microfish needs Accessibility access. Turn it on in System Settings > Privacy & Security > Device Control and Data Access."
+            } else {
+                "Accessibility permissions are required. Please enable them in System Preferences -> Security & Privacy -> Privacy -> Accessibility."
+            };
+            return Err(Error::PermissionDenied(how.to_string()));
         }
 
         if !check_separate_spaces() {
