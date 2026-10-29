@@ -1,0 +1,329 @@
+name: Release
+
+# Push a tag vX.Y.Z or vX.Y.Z-beta.N (see RELEASING.md) and this builds, notarizes, publishes the
+# GitHub release and adds the item to the appcast. "Run workflow" with dry_run (the default) builds an
+# ad-hoc signed app, skips notarization and publishing, and uploads the zip as an artifact.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (vX.Y.Z or vX.Y.Z-beta.N). Empty with dry_run: build the selected branch as a dev version."
+        required: false
+        type: string
+      dry_run:
+        description: "Dry run: ad-hoc signature, no notarization, nothing published"
+        required: true
+        type: boolean
+        default: true
+      allow_unsoaked_stable:
+        description: "Allow a stable tag that has no earlier beta of the same X.Y.Z (the promotion rule)"
+        required: false
+        type: boolean
+        default: false
+
+# No job gets more than it needs; each job asks for its own permissions.
+permissions: {}
+
+# Publishing runs one at a time and never cancels a run that is already updating the appcast. A third
+# tag pushed while one run is publishing and another waits replaces the waiting one: push tags one at
+# a time, and re-run a cancelled run from the Actions tab.
+concurrency:
+  group: ${{ inputs.dry_run && 'microfish-release-dry-run' || 'microfish-release-publish' }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: Check the tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.gate.outputs.tag }}
+      short: ${{ steps.gate.outputs.short }}
+      channel: ${{ steps.gate.outputs.channel }}
+      prerelease: ${{ steps.gate.outputs.prerelease }}
+      dry_run: ${{ steps.gate.outputs.dry_run }}
+      ref: ${{ steps.gate.outputs.ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Validate the tag and the promotion rule
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSHED_REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_ALLOW_UNSOAKED: ${{ inputs.allow_unsoaked_stable }}
+          DEFAULT_BRANCH: main
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = push ]; then
+            tag="$PUSHED_REF_NAME"; dry_run=false
+          else
+            tag="$INPUT_TAG"; dry_run="$INPUT_DRY_RUN"
+          fi
+          if [ -z "$tag" ]; then
+            [ "$dry_run" = true ] || { echo "::error::A real release needs a tag."; exit 1; }
+            tag=dev; ref="$GITHUB_SHA"
+          else
+            ref="refs/tags/$tag"
+            git fetch --no-tags origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+            git fetch --no-tags origin '+refs/heads/release/*:refs/remotes/origin/release/*' || true
+            git rev-parse -q --verify "refs/tags/$tag" >/dev/null || { echo "::error::Tag $tag does not exist."; exit 1; }
+            flags=()
+            [ "$INPUT_ALLOW_UNSOAKED" = true ] && flags+=(--allow-unsoaked)
+            app/Scripts/release-gate.sh "$tag" --main-ref "origin/${DEFAULT_BRANCH}" "${flags[@]+"${flags[@]}"}"
+          fi
+          fields="$(python3 -I app/Scripts/version.py "$tag" --env)"
+          eval "$fields"
+          {
+            echo "tag=$tag"
+            echo "short=$SHORT"
+            echo "channel=$CHANNEL"
+            echo "prerelease=$PRERELEASE"
+            echo "dry_run=$dry_run"
+            echo "ref=$ref"
+          } >> "$GITHUB_OUTPUT"
+          echo "### $tag ($CHANNEL)$([ "$dry_run" = true ] && echo ', dry run')" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build, notarize, sign the update
+    needs: gate
+    runs-on: macos-26 # newest GA arm64 image (macos-latest is the same today); Xcode comes from select-xcode.sh
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.gate.outputs.tag }}
+      DRY_RUN: ${{ needs.gate.outputs.dry_run }}
+    steps:
+      - name: Where the temporary keychain goes
+        run: echo "KEYCHAIN_PATH=$RUNNER_TEMP/microfish-build.keychain-db" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.ref }}
+          persist-credentials: false
+      - name: Check the secrets are there
+        if: ${{ needs.gate.outputs.dry_run != 'true' }}
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPSTORE_CONNECT_API_KEY_P8: ${{ secrets.APPSTORE_CONNECT_API_KEY_P8 }}
+          APPSTORE_CONNECT_API_KEY_ID: ${{ secrets.APPSTORE_CONNECT_API_KEY_ID }}
+          APPSTORE_CONNECT_API_ISSUER_ID: ${{ secrets.APPSTORE_CONNECT_API_ISSUER_ID }}
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          missing=0
+          for name in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD APPSTORE_CONNECT_API_KEY_P8 \
+                      APPSTORE_CONNECT_API_KEY_ID APPSTORE_CONNECT_API_ISSUER_ID SPARKLE_ED_PRIVATE_KEY; do
+            if [ -z "${!name}" ]; then echo "::error::Secret $name is not set."; missing=1; fi
+          done
+          exit "$missing"
+      - name: Select Xcode
+        run: app/Scripts/select-xcode.sh
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+      - name: Fetch Sparkle (pinned, checksum-verified)
+        run: app/Scripts/fetch-sparkle.sh
+
+      - name: Import the Developer ID certificate into a temporary keychain
+        if: ${{ needs.gate.outputs.dry_run != 'true' }}
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          keychain_password="$(uuidgen)"
+          echo "::add-mask::$keychain_password"
+          p12="$RUNNER_TEMP/microfish-certificate.p12"
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$p12"
+          security create-keychain -p "$keychain_password" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 7200 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$keychain_password" "$KEYCHAIN_PATH"
+          security import "$p12" -k "$KEYCHAIN_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$KEYCHAIN_PATH" >/dev/null
+          rm -f "$p12"
+          # Put it first in the search list so codesign and notarytool find it, and keep the others.
+          existing="$(security list-keychains -d user | tr -d '"')"
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $existing
+          # The identity is looked up, never stored: it is the Developer ID Application certificate in the .p12.
+          # Only its hash is kept (masked); the name and team are not printed.
+          hash="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk '/Developer ID Application/ {print $2; exit}')"
+          [ -n "$hash" ] || { echo "::error::No Developer ID Application identity in the imported certificate."; exit 1; }
+          echo "::add-mask::$hash"
+          {
+            echo "MICROFISH_SIGN_IDENTITY=$hash"
+            echo "MICROFISH_KEYCHAIN=$KEYCHAIN_PATH"
+          } >> "$GITHUB_ENV"
+          echo "Developer ID Application identity found in the temporary keychain."
+
+      - name: Build, sign and verify Microfish.app
+        run: |
+          set -euo pipefail
+          sign=(); [ "$DRY_RUN" = true ] && sign=(--sign -)
+          version="$TAG"
+          app/Scripts/build-app.sh --version "$version" "${sign[@]+"${sign[@]}"}" --out "$RUNNER_TEMP/out"
+
+      - name: Notarize
+        if: ${{ needs.gate.outputs.dry_run != 'true' }}
+        env:
+          APPSTORE_CONNECT_API_KEY_P8: ${{ secrets.APPSTORE_CONNECT_API_KEY_P8 }}
+          APPSTORE_CONNECT_API_KEY_ID: ${{ secrets.APPSTORE_CONNECT_API_KEY_ID }}
+          APPSTORE_CONNECT_API_ISSUER_ID: ${{ secrets.APPSTORE_CONNECT_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s' "$APPSTORE_CONNECT_API_KEY_P8" > "$key"
+          app="$RUNNER_TEMP/out/Microfish.app"
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/notarize-upload.zip"
+          result="$RUNNER_TEMP/notary-result.json"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize-upload.zip" \
+            --key "$key" --key-id "$APPSTORE_CONNECT_API_KEY_ID" --issuer "$APPSTORE_CONNECT_API_ISSUER_ID" \
+            --wait --timeout 60m --output-format json > "$result" || true
+          status="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status",""))' "$result" 2>/dev/null || true)"
+          id="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("id",""))' "$result" 2>/dev/null || true)"
+          echo "Notarization submission $id: ${status:-no status}"
+          if [ "$status" != Accepted ]; then
+            if [ -n "$id" ]; then
+              xcrun notarytool log "$id" --key "$key" --key-id "$APPSTORE_CONNECT_API_KEY_ID" --issuer "$APPSTORE_CONNECT_API_ISSUER_ID" || true
+            else
+              cat "$result" || true
+            fi
+            echo "::error::Notarization was not accepted (${status:-no status})."
+            exit 1
+          fi
+          rm -f "$key" "$RUNNER_TEMP/notarize-upload.zip"
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          spctl -a -vv -t exec "$app"
+
+      - name: Zip
+        id: zip
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release"
+          zip_path="$(app/Scripts/package.sh "$RUNNER_TEMP/out/Microfish.app" --out "$RUNNER_TEMP/release" | head -n 1)"
+          echo "zip=$zip_path" >> "$GITHUB_OUTPUT"
+          plutil -extract LSMinimumSystemVersion raw "$RUNNER_TEMP/out/Microfish.app/Contents/Info.plist" > "$RUNNER_TEMP/release/min-macos.txt"
+          ls -l "$RUNNER_TEMP/release"
+
+      - name: Sign the update with the Sparkle EdDSA key
+        if: ${{ needs.gate.outputs.dry_run != 'true' }}
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          ZIP: ${{ steps.zip.outputs.zip }}
+        run: |
+          set -euo pipefail
+          # The key goes to sign_update on stdin; it is never written to disk.
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | app/Vendor/Sparkle/bin/sign_update --ed-key-file - "$ZIP" > "$RUNNER_TEMP/release/signature.txt"
+          grep -q 'sparkle:edSignature=' "$RUNNER_TEMP/release/signature.txt"
+          cat "$RUNNER_TEMP/release/signature.txt"
+
+      - name: Upload the release files
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ needs.gate.outputs.dry_run == 'true' && 'Microfish-dry-run' || 'Microfish-release' }}
+          path: ${{ runner.temp }}/release/*
+          retention-days: ${{ needs.gate.outputs.dry_run == 'true' && 7 || 30 }}
+          if-no-files-found: error
+
+      - name: Clean up keys and the temporary keychain
+        if: ${{ always() }}
+        run: |
+          rm -f "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/microfish-certificate.p12" "$RUNNER_TEMP/notarize-upload.zip"
+          if [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
+          true
+
+  publish:
+    name: Publish the release and the appcast item
+    needs: [gate, build]
+    if: ${{ needs.gate.outputs.dry_run != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the release, push the appcast branch
+    env:
+      TAG: ${{ needs.gate.outputs.tag }}
+      SHORT: ${{ needs.gate.outputs.short }}
+      PRERELEASE: ${{ needs.gate.outputs.prerelease }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.ref }}
+          fetch-depth: 0
+          persist-credentials: true # the appcast push below uses it; nothing from the build runs in this job
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: Microfish-release
+          path: release
+      - name: Create the GitHub release (first publishing step; existing assets are never changed)
+        run: |
+          set -euo pipefail
+          zip="release/Microfish-${SHORT}.zip"
+          [ -f "$zip" ] || { echo "::error::$zip is missing from the build artifact."; exit 1; }
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A re-run after the release was created: it must be the very same build, or stop.
+            published="$(mktemp -d)"
+            gh release download "$TAG" --pattern "Microfish-${SHORT}.zip" --dir "$published"
+            if [ "$(shasum -a 256 "$published/Microfish-${SHORT}.zip" | cut -d' ' -f1)" != "$(shasum -a 256 "$zip" | cut -d' ' -f1)" ]; then
+              echo "::error::$TAG is already published with a different build. Published assets are never replaced: fix forward with a new version."
+              exit 1
+            fi
+            echo "Release $TAG already exists with this exact build; continuing to the appcast."
+          else
+            if [ "$PRERELEASE" = true ]; then flags=(--prerelease --latest=false); else flags=(--latest); fi
+            gh release create "$TAG" "$zip" --verify-tag --title "Microfish ${SHORT}" --generate-notes "${flags[@]}"
+          fi
+      - name: Add the appcast item on the appcast branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin appcast >/dev/null 2>&1; then
+            git fetch --no-tags origin appcast
+            git worktree add ../appcast-worktree -B appcast origin/appcast
+          else
+            git worktree add --orphan -b appcast ../appcast-worktree
+          fi
+          python3 -I app/Scripts/appcast.py add \
+            --appcast ../appcast-worktree/appcast.xml \
+            --tag "$TAG" \
+            --zip "release/Microfish-${SHORT}.zip" \
+            --signing-output "$(cat release/signature.txt)" \
+            --min-system "$(cat release/min-macos.txt)" \
+            --repo "$REPO"
+          python3 -I app/Scripts/appcast.py check ../appcast-worktree/appcast.xml
+          cd ../appcast-worktree
+          git add appcast.xml
+          if git diff --cached --quiet; then
+            echo "The appcast already has this item."
+          else
+            git commit -m "appcast: ${SHORT}"
+            for attempt in 1 2 3; do
+              if git push origin appcast; then break; fi
+              [ "$attempt" = 3 ] && { echo "::error::Could not push the appcast branch."; exit 1; }
+              git pull --rebase origin appcast
+            done
+          fi
+          echo "Appcast: https://raw.githubusercontent.com/${REPO}/appcast/appcast.xml" >> "$GITHUB_STEP_SUMMARY"

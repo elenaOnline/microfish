@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Nothing here needs more than reading the repo, and nothing here uses a secret.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  scripts:
+    name: Release scripts and workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Python tests (version numbers, appcast)
+        run: |
+          python3 -I app/Scripts/test_version.py
+          python3 -I app/Scripts/test_appcast.py
+      - name: Release gate tests
+        run: app/Scripts/test-release-gate.sh
+      - name: Shell syntax
+        run: |
+          for f in app/Scripts/*.sh; do bash -n "$f"; done
+      - name: Lint workflows (actionlint, pinned and checksum-verified)
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          dir="$(mktemp -d)"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            -o "$dir/actionlint.tar.gz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  $dir/actionlint.tar.gz" | sha256sum --check --strict
+          tar -xzf "$dir/actionlint.tar.gz" -C "$dir" actionlint
+          "$dir/actionlint" -color
+
+  app:
+    name: Engine tests, helper, ad-hoc app
+    runs-on: macos-26 # newest GA arm64 image; the app is arm64-only. See RELEASING.md.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select Xcode
+        run: app/Scripts/select-xcode.sh
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+          cargo --version
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+      - name: Engine tests
+        run: cargo test --locked
+      - name: Fetch Sparkle (pinned, checksum-verified)
+        run: app/Scripts/fetch-sparkle.sh
+      - name: Helper tests (headless)
+        run: |
+          python3 app/Tests/run.py --src app/Sources --scratch "$RUNNER_TEMP/helper-tests" live press tabfix queue hudfix
+      - name: Build, sign (ad-hoc) and verify the app
+        run: app/Scripts/build-app.sh --version dev --sign - --out "$RUNNER_TEMP/out" --package
+      - name: Upload the ad-hoc build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Microfish-ci-adhoc
+          path: ${{ runner.temp }}/out/Microfish-*.zip
+          retention-days: 7
+          if-no-files-found: error

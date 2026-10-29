@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template for Contents/Library/LaunchAgents/@ENGINE_LABEL@.plist, registered with
+     SMAppService.agent(plistName:). Static on purpose: launchd cannot expand "~" or env vars here.
+     No log paths: the engine appends its own stdout/stderr to ~/Library/Logs/Microfish/engine.log.
+     No MachServices key: a bridge lookup of the service must never relaunch an engine the user quit. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>@ENGINE_LABEL@</string>
+	<key>BundleProgram</key>
+	<string>@ENGINE_PROGRAM@</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>Microfish Engine</string>
+		<string>launch</string>
+	</array>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>@APP_ID@</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>MICROFISH_BUNDLED</key>
+		<string>1</string>
+		<key>PANERU_MACH_SERVICE</key>
+		<string>@ENGINE_LABEL@</string>
+		<key>PANERU_TRIAL_EDGE_SNAP</key>
+		<string>1</string>
+		<key>PANERU_TRIAL_TAB_BAR_HEIGHT</key>
+		<string>28</string>
+	</dict>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>KeepAlive</key>
+	<false/>
+</dict>
+</plist>
