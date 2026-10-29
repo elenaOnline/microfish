@@ -152,6 +152,8 @@ do {
  fcheck(menu.items[1].action == #selector(Navigator.checkForUpdates(_:)) && menu.items[1].target === nav,"Check for Updates… sits right after Settings…")
  fcheck(!nav.validateMenuItem(menu.items[1]),"Check for Updates… is disabled without an updater")
  fcheck(menu.items[0].keyEquivalent == "," && menu.items[0].keyEquivalentModifierMask == .command,"Settings… is ⌘,")
+ #if compiler(>=6.4)  // NSMenuItem.preferredImageVisibility is in the macOS 27 SDK only (as in the sources)
  if #available(macOS 27.0, *) { fcheck(menu.items.filter { !$0.isSeparatorItem }.allSatisfy { $0.preferredImageVisibility == .hidden },"no row carries an image") }
+ #endif
 }
 print("Final HUD checks passed:", finalChecks)

@@ -98,7 +98,9 @@ jobs:
             # A rehearsal enters the `release` environment (real secrets), so like a real release it runs only from
             # a protected tag (rehearsal-*, allowed by the environment's tag rules), and that tag must be on main.
             # The version it builds comes from the `tag` input and need not exist: nothing is published.
-            [ "$REF_TYPE" = tag ] && [[ "$PUSHED_REF_NAME" == rehearsal-* ]] || { echo "::error::A rehearsal runs from a rehearsal-* tag: choose it under 'Use workflow from'."; exit 1; }
+            if [ "$REF_TYPE" != tag ] || [[ "$PUSHED_REF_NAME" != rehearsal-* ]]; then
+              echo "::error::A rehearsal runs from a rehearsal-* tag: choose it under 'Use workflow from'."; exit 1
+            fi
             [ -n "$INPUT_TAG" ] || { echo "::error::A rehearsal needs the version to build in 'tag' (for example v0.1.0-beta.1)."; exit 1; }
             [ -n "$INPUT_ARTIFACT_KEY" ] || { echo "::error::A rehearsal needs artifact_key: the signed app carries the certificate's name and must not be a public artifact."; exit 1; }
             git rev-parse -q --verify "refs/remotes/origin/${DEFAULT_BRANCH}" >/dev/null || { echo "::error::origin/${DEFAULT_BRANCH} was not fetched."; exit 1; }
