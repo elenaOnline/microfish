@@ -39,5 +39,9 @@
 	<string>@FEED_URL@</string>
 	<key>SUPublicEDKey</key>
 	<string>@SPARKLE_PUBLIC_KEY@</string>
+	<!-- Checks start on with a visible switch in Settings › Updates, so Sparkle never asks on second launch.
+	     Automatic download and install stays off until the user turns it on. -->
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
 </dict>
 </plist>
