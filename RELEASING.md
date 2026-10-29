@@ -86,7 +86,8 @@ SHA only.
    checkout is `fetch-depth: 0`, so every branch and tag is already local (no later `git fetch`, which
    would need credentials on a private repository).
 2. **build** (`macos-26`, Apple silicon, the newest generally available image; Xcode is chosen by
-   `app/Scripts/select-xcode.sh`, newest installed; environment `release`): check out that SHA and verify
+   `app/Scripts/select-xcode.sh`: the newest SDK whose own linker links SkyLight, with `DEVELOPER_DIR` set so the
+   engine's build.rs uses the same SDK (in October 2026 that is Xcode 26.x, SDK 26.5); environment `release`): check out that SHA and verify
    the tag still points at it (`verify-tag.sh`, through the GitHub API); install the pinned Rust toolchain
    (`RUST_VERSION` in the workflow, not "stable", so a stable promoted weeks after its beta is built by the
    same compiler); fetch the pinned Sparkle (SHA-256 checked);
@@ -308,11 +309,16 @@ sees these secrets, and a step only gets the ones it lists under `env:` (the eng
 
 ## Limits of this setup
 
-- Environment rules, the tag ruleset and `verify-tag.sh` against the real GitHub API have not been exercised
-  (no push was possible): `verify-tag.sh` ran against a stand-in `gh`.
-- The workflows have not run on GitHub yet: they were validated with `actionlint` (and `shellcheck`),
-  by running the shell steps locally against stand-in inputs, and by building the app with the same
-  script. The first dry run is the real test.
+- Exercised for real on 2026-10-29: the rehearsals (`rehearsal-2` on the first certificate, `rehearsal-3` on the
+  current one), then `v0.1.0-beta.1` (gate, build with notarization, publish with the signed appcast), the tag
+  ruleset (admin bypass), the environment's tag rules and required reviewer, and `verify-tag.sh` against the
+  GitHub API. Not yet exercised: a stable promotion, a `release/X.Y` hotfix, a re-run after a partial publish,
+  and an installed copy taking a Sparkle update from this feed (the first beta-to-beta update).
+- The current Developer ID certificate chains to Apple's original Developer ID intermediate, which expires on
+  2027-02-01, and so does the certificate. Shipped builds keep working (secure timestamp, notarized), but no
+  release can be signed with it after that date: make a replacement under the G2 intermediate before then
+  (developer.apple.com, Certificates, +, Developer ID Application, Profile Type **G2 Sub-CA**), replace the two
+  certificate secrets and rehearse. The designated requirement stays identical.
 - Dependency licenses are listed from `cargo metadata` (`app/Scripts/licenses.py`), with the license
   files found in each crate. `cargo-about` would add a curated table for crates that ship no license
   file; swap it in if a notice is ever challenged.
