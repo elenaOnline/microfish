@@ -1,6 +1,7 @@
 main.swift
 Paths.swift
 Provisioning.swift
+Location.swift
 EngineControl.swift
 EngineRefresh.swift
 LiveSignals.swift

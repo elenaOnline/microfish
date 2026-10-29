@@ -38,7 +38,7 @@ ENGINE_PROGRAM="Contents/Helpers/${ENGINE_APP_NAME}.app/Contents/MacOS/${ENGINE_
 # Re-measure with --probe-min-macos after changing sources. Tested on macOS 27 only.
 MIN_MACOS="15.0"
 PLACEHOLDER_KEY="PLACEHOLDER-SPARKLE-PUBLIC-KEY-NOT-FOR-RELEASE"
-DEFAULT_SOURCES="main.swift TabBars.swift Settings.swift ShortcutRecorder.swift SpatialOverview.swift LiveSignals.swift Paths.swift"
+DEFAULT_SOURCES="main.swift TabBars.swift Settings.swift ShortcutRecorder.swift SpatialOverview.swift LiveSignals.swift Paths.swift Location.swift"
 
 VERSION="dev"; SIGN="${MICROFISH_SIGN_IDENTITY:--}"; OUT="$REPO/build"
 ENGINE_BIN=""; SKIP_ENGINE=0; SPARKLE_ARG=""; DO_PACKAGE=0; STRICT=0; ALLOW_PLACEHOLDER=0; ALLOW_ADHOC=0

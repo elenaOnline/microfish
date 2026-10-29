@@ -2,7 +2,7 @@
 """Headless test runner for the Microfish helper. Builds app/Sources (+ a suite's test file) into a scratch dir and runs it.
 No windows, no Dock icons, no sound; nothing reaches launchd, SMAppService or a real engine (NAVIGATOR_TESTS builds refuse).
 Usage: app/Tests/run.py [--scratch DIR] [suite ...]
-Suites: provision engine quit live press tabfix queue hudfix leak pixel (default: all that can run here), and
+Suites: provision engine location quit live press tabfix queue hudfix leak pixel (default: all that can run here), and
   hud drag spatial team: these four need test sources that live in the old workspace (work/*-tests.swift and
   polish/teams/minimap/tests), not in this repo; they are skipped with that reason.
   pixel needs a baseline tree of the old sources (--pixel-base DIR); without it, it is skipped.
@@ -39,14 +39,15 @@ def build(name, text, others=OTHERS, defines=('NAVIGATOR_TESTS',)):
     return d/'tests'
 main_text = lambda: (src/'main.swift').read_text()
 def with_main(name, test_file): return lambda: build(name, main_text() + '\n' + (here/test_file).read_text())
-LIB = ['Paths.swift', 'Provisioning.swift', 'EngineControl.swift', 'EngineRefresh.swift']   # the standalone suites need no UI code
+LIB = ['Paths.swift', 'Provisioning.swift', 'Location.swift', 'EngineControl.swift', 'EngineRefresh.swift']   # the standalone suites need no UI code
 def suite_provision(): return build('provision', (here/'provision-tests.swift').read_text(), others=LIB)
 def suite_engine(): return build('engine', (here/'engine-tests.swift').read_text(), others=LIB)
+def suite_location(): return build('location', (here/'location-tests.swift').read_text(), others=LIB)
 def suite_leak(): return here/'leak-churn.py'
 def suite_pixel(): return here/'pixel-diff.py'
 SKIPPED = {k: 'its test sources live in the old workspace (work/*-tests.swift, polish/teams/minimap/tests), not in this repo'
            for k in ['hud', 'drag', 'spatial', 'team']}
-SUITES = {'provision': suite_provision, 'engine': suite_engine, 'quit': with_main('quit', 'quit-tests.swift'),
+SUITES = {'provision': suite_provision, 'engine': suite_engine, 'location': suite_location, 'quit': with_main('quit', 'quit-tests.swift'),
           'live': with_main('live', 'live-signals-tests.swift'), 'press': with_main('press', 'press-tests.swift'),
           'tabfix': with_main('tabfix', 'tab-fixes-tests.swift'), 'queue': with_main('queue', 'queue-tests.swift'),
           'hudfix': with_main('hudfix', 'hud-final-tests.swift'), 'updatestop': with_main('updatestop', 'update-stop-tests.swift'), 'leak': suite_leak, 'pixel': suite_pixel}
