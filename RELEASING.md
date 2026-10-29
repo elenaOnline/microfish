@@ -118,6 +118,40 @@ A dry run (`dry_run`, the default for a manual run) runs only the gate and build
 uploads the zip as a 7-day artifact; it needs no secrets (its jobs use the environment `release-dry-run`,
 which has none) and also runs the signature self-test with a throwaway key.
 
+### Rehearsing a release (real signature and notarization, nothing published)
+
+A rehearsal runs the gate and build jobs exactly as a real release does: Developer ID signature, Apple
+notarization, staple, Gatekeeper check, the Sparkle signature of the zip (verified against the app's
+`SUPublicEDKey`), and the appcast item, signed and verified. Then it stops: no GitHub release, no push to
+the `appcast` branch, no `v*` tag. Use it before the first release, and whenever the certificate or a
+secret changes.
+
+It needs the real secrets, so it runs in the `release` environment, and so it must run from a protected
+tag: `rehearsal-N` on `main` (the environment allows tags `v*` and `rehearsal-*`; the tag ruleset protects
+both). The repository is public and its Actions artifacts can be downloaded by anyone signed in to
+GitHub, while a signed app carries the certificate's name (`codesign -dv` shows it), so the artifact is
+encrypted to a key you make on your Mac:
+
+```sh
+git switch main && git pull
+git tag rehearsal-2 && git push origin rehearsal-2              # the next unused number
+pub="$(app/Scripts/rehearsal.sh keygen ~/microfish-rehearsal-2)" # private key stays in that folder
+gh workflow run release.yml --ref rehearsal-2 -f rehearsal=true -f dry_run=false \
+  -f tag=v0.1.0-beta.1 -f artifact_key="$pub"
+```
+
+`tag` is the version the build carries; it need not exist. If the environment has a required reviewer,
+approve the **build** job (only it enters `release`; there is no publish job). Then:
+
+```sh
+gh run download <run-id> -n Microfish-rehearsal-encrypted -D ~/microfish-rehearsal-2/artifact
+app/Scripts/rehearsal.sh open ~/microfish-rehearsal-2/artifact ~/microfish-rehearsal-2/rehearsal.key ~/microfish-rehearsal-2/files
+```
+
+`files/` holds `Microfish-<version>.zip`, `signature.txt`, `min-macos.txt` and the signed `appcast.xml`.
+Delete the folder when you are done. Rehearsal tags can stay: they are never built by a push, and each
+one only marks the commit that was rehearsed.
+
 `build-app.sh` also runs on a Mac: `app/Scripts/build-app.sh --sign - --out /tmp/microfish-build` for an
 ad-hoc build, or `MICROFISH_SIGN_IDENTITY="Developer ID Application" app/Scripts/build-app.sh ...` with
 the certificate in your keychain. `--probe-min-macos` re-measures the lowest deployment target.
@@ -192,22 +226,25 @@ workflow on a branch gets nothing, and a leaked write token alone cannot ship a 
 a solo maintainer is one extra click per job (two per release) if you turn on the reviewer. Dry runs use
 `release-dry-run`, which GitHub creates empty on first use.
 
-Note: environment protection rules (required reviewers, deployment branch and tag rules) on a **private**
-repository need GitHub Pro, Team or Enterprise; on a public repository they are free. Environment secrets
-themselves work either way. If the private repository's plan lacks the rules, add them when the repository
-goes public and, until then, treat the tag ruleset (below) as the gate.
+**Current state (2026-10-28).** The repository is public, which makes environments, their tag rules,
+required reviewers and rulesets free. All of the below exists, created through the GitHub API (the same
+settings as the clicks): ruleset `Release tags` (Active; targets `v*` and `rehearsal-*`; creation, update,
+deletion restricted; Repository admin bypass), environment `release` (tag rules `v*` and `rehearsal-*`,
+required reviewer `elenaOnline`), and its six secrets. Check with
+`gh api repos/elenaOnline/microfish/rulesets`, `gh api repos/elenaOnline/microfish/environments` and
+`gh secret list --env release` (names only).
 
 1. **Tag ruleset** (stops anyone but you creating, moving or deleting a release tag).
    https://github.com/elenaOnline/microfish/settings/rules, **New ruleset**, **New tag ruleset**.
    Ruleset Name `Release tags`; Enforcement status **Active**; under **Bypass list**, **Add bypass**,
    **Repository admin**, mode **Always allow**; under **Target tags**, **Add target**, **Include by
-   pattern**, type `v*`, **Add**; under **Rules** tick **Restrict creations**, **Restrict updates** and
+   pattern**, type `v*`, **Add**, and the same for `rehearsal-*`; under **Rules** tick **Restrict creations**, **Restrict updates** and
    **Restrict deletions**; **Create**. (As admin you bypass it, and you can still tag; a collaborator's or
    a stolen non-admin token cannot.)
 2. **Environment.** https://github.com/elenaOnline/microfish/settings/environments, **New environment**,
    Name `release`, **Configure environment**. Under **Deployment branches and tags** choose **Selected
    branches and tags**, **Add deployment branch or tag rule**, Ref type **Tag**, Name pattern `v*`,
-   **Add rule**. Under **Deployment protection rules** tick **Required reviewers**, add `elenaOnline`,
+   **Add rule**; again for `rehearsal-*` (rehearsals, above). Under **Deployment protection rules** tick **Required reviewers**, add `elenaOnline`,
    **Save protection rules** (leave "Prevent self-review" off: you are the only maintainer). Leave the wait
    timer off. Optional but recommended: the reviewer rule; without it the tag rule and ruleset still hold.
 3. **Secrets, in that environment.** On the same page, under **Environment secrets**, **Add environment
@@ -250,6 +287,12 @@ sees these secrets, and a step only gets the ones it lists under `env:` (the eng
   the two secrets. The designated requirement is `identifier + anchor apple generic + team`, not the
   certificate, so a renewed certificate from the same team keeps the app's identity, its permission
   grants and Sparkle's check on the installed app.
+  The same holds for a new certificate after the account's name changes (the name is fixed inside each
+  certificate, so only builds signed with the new one show the new name): replace the two certificate
+  secrets, run a rehearsal, and check that `codesign -d -r-` is unchanged and the leaf certificate's
+  SHA-1 is the new one. **Do not revoke the old certificate**: revoking a Developer ID certificate stops
+  every app signed with it from installing or launching. Leave it to expire; builds signed while it was
+  valid keep working because they carry a secure timestamp.
 - **App Store Connect key**: create a new one, update the three `APPSTORE_CONNECT_*` secrets, revoke the old.
 - **Sparkle EdDSA key**: rotate only deliberately, and test it first. The key signs the appcast as well
   as the archives, and the app verifies the feed against its installed `SUPublicEDKey`: during a rotation
