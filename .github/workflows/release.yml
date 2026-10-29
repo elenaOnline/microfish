@@ -2,7 +2,10 @@ name: Release
 
 # Push a tag vX.Y.Z or vX.Y.Z-beta.N (see RELEASING.md) and this builds, notarizes, publishes the
 # GitHub release and adds the item to the appcast. "Run workflow" with dry_run (the default) builds an
-# ad-hoc signed app, skips notarization and publishing, and uploads the zip as an artifact.
+# ad-hoc signed app, skips notarization and publishing, and uploads the zip as an artifact. "Run workflow" with
+# rehearsal, from a rehearsal-* tag, does everything a real release does up to publishing (Developer ID signature,
+# notarization, staple, Sparkle signature, a signed appcast) and publishes nothing; the artifact is encrypted to
+# a public key you pass in, because the signed app carries the certificate's name and this repository is public.
 #
 # Secrets live in the GitHub environment `release` (deployment rule: v* tags only), and only the build and
 # publish jobs of a real release enter it. A dry run uses the secret-less environment `release-dry-run`.
@@ -23,6 +26,15 @@ on:
         required: true
         type: boolean
         default: true
+      rehearsal:
+        description: "Rehearsal: everything a real release does except publishing (real signature, notarization, appcast). Run from a rehearsal-* tag; 'tag' is the version to build; overrides dry_run"
+        required: false
+        type: boolean
+        default: false
+      artifact_key:
+        description: "Rehearsal only: RSA public key (PEM, base64 on one line) the artifact is encrypted to"
+        required: false
+        type: string
       allow_unsoaked_stable:
         description: "Allow a stable tag that has no earlier beta of the same X.Y.Z (the promotion rule)"
         required: false
@@ -36,7 +48,7 @@ permissions: {}
 # tag pushed while one run is publishing and another waits replaces the waiting one: push tags one at
 # a time, and re-run a cancelled run from the Actions tab.
 concurrency:
-  group: ${{ inputs.dry_run && 'microfish-release-dry-run' || 'microfish-release-publish' }}
+  group: ${{ inputs.rehearsal && 'microfish-release-rehearsal' || (inputs.dry_run && 'microfish-release-dry-run' || 'microfish-release-publish') }}
   cancel-in-progress: false
 
 env:
@@ -59,6 +71,8 @@ jobs:
       channel: ${{ steps.gate.outputs.channel }}
       prerelease: ${{ steps.gate.outputs.prerelease }}
       dry_run: ${{ steps.gate.outputs.dry_run }}
+      rehearsal: ${{ steps.gate.outputs.rehearsal }}
+      ref_tag: ${{ steps.gate.outputs.ref_tag }}
       sha: ${{ steps.gate.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -75,9 +89,31 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
           INPUT_ALLOW_UNSOAKED: ${{ inputs.allow_unsoaked_stable }}
+          INPUT_REHEARSAL: ${{ inputs.rehearsal }}
+          INPUT_ARTIFACT_KEY: ${{ inputs.artifact_key }}
           DEFAULT_BRANCH: main
         run: |
           set -euo pipefail
+          if [ "$EVENT" != push ] && [ "$INPUT_REHEARSAL" = true ]; then
+            # A rehearsal enters the `release` environment (real secrets), so like a real release it runs only from
+            # a protected tag (rehearsal-*, allowed by the environment's tag rules), and that tag must be on main.
+            # The version it builds comes from the `tag` input and need not exist: nothing is published.
+            [ "$REF_TYPE" = tag ] && [[ "$PUSHED_REF_NAME" == rehearsal-* ]] || { echo "::error::A rehearsal runs from a rehearsal-* tag: choose it under 'Use workflow from'."; exit 1; }
+            [ -n "$INPUT_TAG" ] || { echo "::error::A rehearsal needs the version to build in 'tag' (for example v0.1.0-beta.1)."; exit 1; }
+            [ -n "$INPUT_ARTIFACT_KEY" ] || { echo "::error::A rehearsal needs artifact_key: the signed app carries the certificate's name and must not be a public artifact."; exit 1; }
+            git rev-parse -q --verify "refs/remotes/origin/${DEFAULT_BRANCH}" >/dev/null || { echo "::error::origin/${DEFAULT_BRANCH} was not fetched."; exit 1; }
+            sha="$(git rev-parse "refs/tags/$PUSHED_REF_NAME^{commit}")"
+            git merge-base --is-ancestor "$sha" "origin/${DEFAULT_BRANCH}" || { echo "::error::$PUSHED_REF_NAME is not on ${DEFAULT_BRANCH}."; exit 1; }
+            tag="$INPUT_TAG"
+            fields="$(python3 -I app/Scripts/version.py "$tag" --env)"
+            eval "$fields"
+            {
+              echo "tag=$tag"; echo "short=$SHORT"; echo "channel=$CHANNEL"; echo "prerelease=$PRERELEASE"
+              echo "dry_run=false"; echo "rehearsal=true"; echo "ref_tag=$PUSHED_REF_NAME"; echo "sha=$sha"
+            } >> "$GITHUB_OUTPUT"
+            echo "### Rehearsal of $tag ($CHANNEL) from $PUSHED_REF_NAME, commit ${sha}: nothing is published" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           if [ "$EVENT" = push ]; then
             tag="$PUSHED_REF_NAME"; dry_run=false
           else
@@ -114,6 +150,8 @@ jobs:
             echo "channel=$CHANNEL"
             echo "prerelease=$PRERELEASE"
             echo "dry_run=$dry_run"
+            echo "rehearsal=false"
+            echo "ref_tag=$([ "$tag" = dev ] || echo "$tag")"
             echo "sha=$sha"
           } >> "$GITHUB_OUTPUT"
           echo "### $tag ($CHANNEL), commit ${sha}$([ "$dry_run" = true ] && echo ', dry run')" >> "$GITHUB_STEP_SUMMARY"
@@ -131,6 +169,8 @@ jobs:
       TAG: ${{ needs.gate.outputs.tag }}
       SHA: ${{ needs.gate.outputs.sha }}
       DRY_RUN: ${{ needs.gate.outputs.dry_run }}
+      REHEARSAL: ${{ needs.gate.outputs.rehearsal }}
+      REF_TAG: ${{ needs.gate.outputs.ref_tag }}
       REPO: ${{ github.repository }}
     steps:
       - name: Where the temporary keychain goes
@@ -145,7 +185,8 @@ jobs:
         run: |
           set -euo pipefail
           [ "$(git rev-parse HEAD)" = "$SHA" ] || { echo "::error::The checkout is not the commit the gate approved."; exit 1; }
-          if [ "$TAG" != dev ]; then app/Scripts/verify-tag.sh "$TAG" "$SHA" "$REPO"; fi
+          # The tag the run came from (a rehearsal's rehearsal-* tag; a release's own tag).
+          if [ -n "$REF_TAG" ]; then app/Scripts/verify-tag.sh "$REF_TAG" "$SHA" "$REPO"; fi
       - name: Check the secrets are there
         if: ${{ needs.gate.outputs.dry_run != 'true' }}
         env:
@@ -289,6 +330,47 @@ jobs:
           pub="$(plutil -extract SUPublicEDKey raw "$RUNNER_TEMP/zip-Info.plist")"
           "$RUNNER_TEMP/tools/verify-ed-signature" zip "$ZIP" --public-key "$pub" --signature-output "$RUNNER_TEMP/release/signature.txt"
 
+      - name: Write, sign and check the appcast the publish job would push (rehearsal; nothing is pushed)
+        if: ${{ needs.gate.outputs.rehearsal == 'true' }}
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          ZIP: ${{ steps.zip.outputs.zip }}
+        run: |
+          set -euo pipefail
+          feed="$RUNNER_TEMP/release/appcast.xml"
+          python3 -I app/Scripts/appcast.py add --appcast "$feed" --tag "$TAG" --zip "$ZIP" \
+            --signing-output "$(cat "$RUNNER_TEMP/release/signature.txt")" \
+            --min-system "$(cat "$RUNNER_TEMP/release/min-macos.txt")" --notes embedded --repo "$REPO"
+          python3 -I app/Scripts/appcast.py check "$feed"
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | app/Vendor/Sparkle/bin/sign_update --ed-key-file - "$feed" >/dev/null
+          pub="$(plutil -extract SUPublicEDKey raw "$RUNNER_TEMP/zip-Info.plist")"
+          [ "$pub" = "$(tr -d '[:space:]' < app/Packaging/sparkle-public-key.txt)" ] || { echo "::error::The zip carries a different SUPublicEDKey than the repository."; exit 1; }
+          "$RUNNER_TEMP/tools/verify-ed-signature" feed "$feed" --public-key "$pub"
+          python3 -I app/Scripts/appcast.py check "$feed"
+
+      - name: Encrypt the files to artifact_key (rehearsal; the signed app carries the certificate name)
+        if: ${{ needs.gate.outputs.rehearsal == 'true' }}
+        env:
+          ARTIFACT_KEY: ${{ inputs.artifact_key }}
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$RUNNER_TEMP/seal"; mkdir -p "$work"
+          printf '%s' "$ARTIFACT_KEY" | base64 --decode > "$work/recipient.pem"
+          /usr/bin/openssl pkey -pubin -in "$work/recipient.pem" -noout || { echo "::error::artifact_key is not a PEM public key."; exit 1; }
+          tar -C "$RUNNER_TEMP/release" -cf "$work/files.tar" .
+          key="$(/usr/bin/openssl rand -hex 32)"; iv="$(/usr/bin/openssl rand -hex 16)"
+          echo "::add-mask::$key"
+          sum="$(shasum -a 256 "$work/files.tar" | cut -d' ' -f1)"
+          /usr/bin/openssl enc -aes-256-cbc -K "$key" -iv "$iv" -in "$work/files.tar" -out "$work/files.tar.enc"
+          printf '%s %s %s' "$key" "$iv" "$sum" | /usr/bin/openssl pkeyutl -encrypt -pubin -inkey "$work/recipient.pem" \
+            -pkeyopt rsa_padding_mode:oaep -out "$work/files.key.enc"
+          rm -f "$work/files.tar" "$work/recipient.pem"
+          # Only ciphertext goes into the artifact.
+          rm -rf "$RUNNER_TEMP/release"; mkdir -p "$RUNNER_TEMP/release"
+          mv "$work/files.tar.enc" "$work/files.key.enc" "$RUNNER_TEMP/release/"
+          ls -l "$RUNNER_TEMP/release"
+
       - name: Self-test of the signature tooling (dry run, throwaway key)
         if: ${{ needs.gate.outputs.dry_run == 'true' }}
         run: app/Scripts/test-signing.sh "$RUNNER_TEMP/tools/verify-ed-signature"
@@ -296,9 +378,9 @@ jobs:
       - name: Upload the release files
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ needs.gate.outputs.dry_run == 'true' && 'Microfish-dry-run' || 'Microfish-release' }}
+          name: ${{ needs.gate.outputs.rehearsal == 'true' && 'Microfish-rehearsal-encrypted' || (needs.gate.outputs.dry_run == 'true' && 'Microfish-dry-run' || 'Microfish-release') }}
           path: ${{ runner.temp }}/release/*
-          retention-days: ${{ needs.gate.outputs.dry_run == 'true' && 7 || 30 }}
+          retention-days: ${{ (needs.gate.outputs.dry_run == 'true' || needs.gate.outputs.rehearsal == 'true') && 7 || 30 }}
           if-no-files-found: error
 
       - name: Clean up keys and the temporary keychain
@@ -313,7 +395,7 @@ jobs:
   publish:
     name: Publish the release and the appcast item
     needs: [gate, build]
-    if: ${{ needs.gate.outputs.dry_run != 'true' }}
+    if: ${{ needs.gate.outputs.dry_run != 'true' && needs.gate.outputs.rehearsal != 'true' }}
     # macOS because Sparkle's sign_update (which signs the appcast) is a macOS tool. This job builds nothing
     # and runs only scripts from the approved commit; it holds the write token and the Sparkle key.
     runs-on: macos-26
