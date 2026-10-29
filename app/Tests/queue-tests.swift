@@ -62,7 +62,8 @@ do {
   Thread.sleep(forTimeInterval: 0.05)
   queue.async { markerAt = now() }
   pump { markerAt != 0 }
-  ok(markerAt - t0 < 200, "serial queue stays available while the bridge runs (\(markerAt - t0) ms)")
+  // Bound by the command itself (sleep 0.4), not by a latency budget: a shared CI runner took 200 ms here.
+  ok(markerAt - t0 < 380, "serial queue stays available while the bridge runs (\(markerAt - t0) ms)")
   ok(finishedAt == 0, "command still running at that moment")
   pump { finishedAt != 0 }
   ok(finishedAt - t0 >= 380, "completion waits for the process (\(finishedAt - t0) ms)")
