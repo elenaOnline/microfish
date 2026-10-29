@@ -47,13 +47,13 @@ func spatialKeyEquivalent(_ chord:String)->(key:String,mask:NSEvent.ModifierFlag
     if name.hasPrefix("f"),let n=Int(name.dropFirst()),(1...20).contains(n) { return (fn(0xF703+n),mask) }
     return nil
 }
-/// Live bindings: config/shortcut-defaults.json, overridden by the `shortcuts` map in config/preferences.json (an empty chord means unset).
-func spatialShortcutChords(root:URL)->[String:String] {
+/// Live bindings: the bundled shortcut-defaults.json, overridden by the `shortcuts` map in preferences.json (an empty chord means unset).
+func spatialShortcutChords(catalog:URL=MicrofishPaths.shortcutCatalog,preferences:URL=MicrofishPaths.preferences)->[String:String] {
     var out:[String:String]=[:]
-    if let data=try? Data(contentsOf:root.appendingPathComponent("config/shortcut-defaults.json")),let list=(try? JSONSerialization.jsonObject(with:data)) as? [[String:String]] {
+    if let data=try? Data(contentsOf:catalog),let list=(try? JSONSerialization.jsonObject(with:data)) as? [[String:String]] {
         for entry in list { if let id=entry["id"] { out[id]=entry["default"] ?? "" } }
     }
-    if let data=try? Data(contentsOf:root.appendingPathComponent("config/preferences.json")),let prefs=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any],let custom=prefs["shortcuts"] as? [String:String] {
+    if let data=try? Data(contentsOf:preferences),let prefs=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any],let custom=prefs["shortcuts"] as? [String:String] {
         for (id,chord) in custom { out[id]=chord }
     }
     return out
@@ -809,13 +809,13 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
     var onReload: (() -> Void)?
     var onRefresh: ((@escaping (Bool) -> Void) -> Void)?
     private var refreshing = false
-    var pinsPath = ""
-    // The refresh script ends a failed run with one plain sentence (SystemExit); show it, not a log path.
-    // A crash ends with a traceback instead, which is not for the panel.
+    var pinsPath = MicrofishPaths.viewPins.path
+    // Refresh ends a failed run with one plain sentence in refresh.log; show it, not a log path.
+    // Anything that looks like an exception line is not for the panel.
     func refreshFailure() -> String {
-        let log=URL(fileURLWithPath:pinsPath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("work/refresh.log")
+        let log=MicrofishPaths.refreshLog
         let last=((try? String(contentsOf:log,encoding:.utf8)) ?? "").split(separator:"\n").last.map(String.init)?.trimmingCharacters(in:.whitespaces) ?? ""
-        // The script's own messages are sentences; exception lines look like "Name: detail".
+        // Refresh's own messages are sentences; exception lines look like "Name: detail".
         let exceptionLine = last.range(of:#"^[A-Za-z_][\w.]*: "#,options:.regularExpression) != nil
         let plain = !last.isEmpty && last.count < 160 && !exceptionLine && !last.hasPrefix("File ") && !last.hasPrefix("Traceback")
         return plain ? last : "Couldn’t restart window tracking."
@@ -833,17 +833,10 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
     var engineProbe: (@escaping (Bool?) -> Void) -> Void = SpatialOverviewController.askEngine
     static func askEngine(_ done: @escaping (Bool?) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let engine = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.deletingLastPathComponent().appendingPathComponent("Microfish")
+            // EngineControl.isActive: a slow answer counts as present, an engine that cannot be run as unknown.
             var answer: Bool?
-            if FileManager.default.isExecutableFile(atPath: engine.path) {
-                let child = Process(); child.executableURL = engine; child.arguments = ["query", "active"]
-                child.standardOutput = FileHandle.nullDevice; child.standardError = FileHandle.nullDevice
-                if (try? child.run()) != nil {
-                    let deadline = Date().addingTimeInterval(1.5)
-                    while child.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
-                    if child.isRunning { child.terminate(); child.waitUntilExit(); answer = true }  // slow is not absent
-                    else { answer = child.terminationStatus == 0 }
-                }
+            if FileManager.default.isExecutableFile(atPath: MicrofishPaths.engineExecutable.path) {
+                answer = EngineControl.probe(callLimit: 1.5).isActive()
             }
             DispatchQueue.main.async { done(answer) }
         }
@@ -879,7 +872,7 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
         map.pins=Dictionary(uniqueKeysWithValues:decoded.compactMap { key,value in
             guard let slot=Int(key), (0...9).contains(slot) else { return nil }; return (slot,value)
         })
-        if let data=try? Data(contentsOf:rootURL.appendingPathComponent("config/preferences.json")), let prefs=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any], let gap=prefs["windowGap"] as? Double { map.pinPadding=gap }
+        if let data=try? Data(contentsOf:MicrofishPaths.preferences), let prefs=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any], let gap=prefs["windowGap"] as? Double { map.pinPadding=gap }
     }
     func showMoveResult(_ success: Bool) { content?.message = success ? "Column moved" : "Couldn’t move that column. The layout changed. Try again." }
     func popoverWillClose(_ notification: Notification) {
@@ -920,13 +913,11 @@ final class SpatialOverviewController: NSObject, NSPopoverDelegate {
         guard let value=sender.representedObject as? [String:String], let action=value["action"] else { return }
         popover.performClose(nil); onViewAction?(action,value["slot"].flatMap(Int.init))
     }
-    /// The install root (view-pins.json is work/state/paneru/view-pins.json).
-    private var rootURL: URL { URL(fileURLWithPath:pinsPath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent() }
     /// The Views menu: one row per View with its live shortcut drawn by AppKit, then Previous View and Undo.
     func makeViewsMenu() -> NSMenu {
         let data=(try? Data(contentsOf:URL(fileURLWithPath:pinsPath))) ?? Data()
         let pins=(try? JSONSerialization.jsonObject(with:data)) as? [String:[String:Any]] ?? [:]
-        let chords=spatialShortcutChords(root:rootURL)
+        let chords=spatialShortcutChords()
         let menu=NSMenu(title:"Views"); menu.autoenablesItems=false
         let statusPath=URL(fileURLWithPath:pinsPath).deletingLastPathComponent().appendingPathComponent("view-status.json")
         if let data=try? Data(contentsOf:statusPath), let status=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any] {

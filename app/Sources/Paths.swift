@@ -42,6 +42,10 @@ enum MicrofishPaths {
     static var refreshBackups: URL { support.appendingPathComponent("Backups/Refresh", isDirectory: true) }
     static var snapshot: URL { runtime.appendingPathComponent("navigator.tsv") }
     static var intent: URL { runtime.appendingPathComponent("navigator.intent") }
+    static var refreshLock: URL { runtime.appendingPathComponent("refresh.lock") }
+    /// Saved-session files the engine writes under `State/paneru/`.
+    static var viewPins: URL { engineState.appendingPathComponent("view-pins.json") }
+    static var viewStatus: URL { engineState.appendingPathComponent("view-status.json") }
 
     /// The bundle's `Contents/Resources` (icon, `Lua/microfish.lua`, `Defaults/`, `shortcut-defaults.json`).
     static var resources: URL {
@@ -61,6 +65,18 @@ enum MicrofishPaths {
         env["MICROFISH_BRIDGE"].map { URL(fileURLWithPath: $0) }
             ?? contents.appendingPathComponent("MacOS/microfish-command")
     }
+    /// The launch agent plist inside the bundle (`Contents/Library/LaunchAgents/`), the one SMAppService registers.
+    static var agentPlist: URL {
+        env["MICROFISH_AGENT_PLIST"].map { URL(fileURLWithPath: $0) }
+            ?? contents.appendingPathComponent("Library/LaunchAgents/\(engineAgentPlist)")
+    }
+    /// `gui/<uid>/<label>`: the launchd domain target `launchctl kickstart` and `kill` take.
+    static var engineDomainTarget: String { "gui/\(getuid())/\(engineLabel)" }
+    /// Defaults key holding the SHA-256 of the agent plist that was last registered.
+    static let registeredPlistHashKey = "MicrofishRegisteredAgentPlistSHA256"
+    /// Where the user turns the engine on: System Settings > Privacy & Security > Accessibility
+    /// (macOS 27 titles the pane "Device Control and Data Access").
+    static let accessibilityPane = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
     /// Environment for engine CLI and bridge children, so they reach this install's engine.
     static var childEnvironment: [String: String] {
         var e = env

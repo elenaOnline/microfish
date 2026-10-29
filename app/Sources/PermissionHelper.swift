@@ -1,5 +1,9 @@
 import AppKit
 
+// NOT part of the app's source list (Sources/SOURCES): kept for onboarding. It is a standalone program (own
+// main), a draggable-tile guide to the Accessibility pane from the days when Microfish was bare executables.
+// A first-run permission guide inside Microfish.app can reuse its wording and layout.
+
 // Microfish Access: helps you give Microfish the macOS "Device Control and Data Access" permission (the
 // Privacy_Accessibility pane). Shows the Microfish program as a draggable file tile; it never grants access
 // or starts Microfish itself.
