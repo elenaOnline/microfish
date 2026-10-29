@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 // Renders the real Settings window on the Updates pane through the window server while it is parked off
-// every screen (never key, accessory app, nothing on a display). usage: render <fixture-root> <out-dir>
+// every screen (never key, accessory app, nothing on a display). usage: render <fixture-root> <out-dir> (the fixture is reached through MICROFISH_SUPPORT_DIR etc., set by build.sh)
 @main struct Render {
     @MainActor static func main() throws {
         let app = NSApplication.shared; app.setActivationPolicy(.accessory); app.finishLaunching()
@@ -17,8 +17,8 @@ import SwiftUI
         // disabled fade lag by one capture when several states share a process.
         func shoot(_ look: String, _ name: String, otherPaneDraft: Bool = false, comparePane: SettingsPane? = nil, _ setup: () -> Void) throws {
             if !only.isEmpty && !only.contains("\(look)-\(name)") { return }
-            try? FileManager.default.removeItem(at: root.appendingPathComponent("work"))   // drafts persisted by the previous state
-            let c = SettingsController(rootURL: root)
+            try? FileManager.default.removeItem(at: MicrofishPaths.drafts)   // drafts persisted by the previous state
+            let c = SettingsController()
             guard let window = c.testWindow else { fatalError("no window") }
             window.appearance = NSAppearance(named: look == "dark" ? .darkAqua : .aqua)
             setup()
