@@ -152,15 +152,22 @@ impl ProcessApi for ProcessOS {
     }
 }
 
-/// Bundle identifier of Microfish's helper (`MicrofishNavigator`).
-pub const MICROFISH_HELPER_BUNDLE_ID: &str = "local.microfish.navigator";
+/// Bundle identifier of Microfish's helper: the `Microfish.app` bundle itself.
+pub const MICROFISH_HELPER_BUNDLE_ID: &str = "net.webreceptor.microfish";
+/// The helper's identifier in the pre-bundle workspace install (bare `MicrofishNavigator`).
+pub const MICROFISH_LEGACY_HELPER_BUNDLE_ID: &str = "local.microfish.navigator";
 
 /// Whether a process with this identity is Microfish's own helper. The bundle
 /// identifier is authoritative; the executable path covers a helper built
 /// without an embedded Info.plist.
 pub fn is_microfish_helper(bundle_id: Option<&str>, executable: Option<&str>) -> bool {
-    bundle_id == Some(MICROFISH_HELPER_BUNDLE_ID)
-        || executable.is_some_and(|path| path.ends_with("/bin/MicrofishNavigator"))
+    matches!(
+        bundle_id,
+        Some(MICROFISH_HELPER_BUNDLE_ID | MICROFISH_LEGACY_HELPER_BUNDLE_ID)
+    ) || executable.is_some_and(|path| {
+        path.ends_with("/bin/MicrofishNavigator")
+            || path.ends_with("/Microfish.app/Contents/MacOS/Microfish")
+    })
 }
 
 /// Whether a process may be managed: a regular app, or one a window rule
@@ -443,6 +450,19 @@ mod tests {
     #[test]
     fn microfish_helper_is_recognised_by_bundle_id_or_executable() {
         assert!(is_microfish_helper(Some("local.microfish.navigator"), None));
+        assert!(is_microfish_helper(Some("net.webreceptor.microfish"), None));
+        assert!(is_microfish_helper(
+            None,
+            Some("/Applications/Microfish.app/Contents/MacOS/Microfish")
+        ));
+        assert!(!is_microfish_helper(
+            Some("net.webreceptor.microfish.engine"),
+            None
+        ));
+        assert!(!is_microfish_helper(
+            Some("net.webreceptor.microfishy"),
+            None
+        ));
         assert!(is_microfish_helper(
             None,
             Some("/Applications/Microfish.app/Contents/MacOS/bin/MicrofishNavigator")

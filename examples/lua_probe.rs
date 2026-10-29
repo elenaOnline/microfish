@@ -9,7 +9,9 @@ use mlua::{Lua, LuaOptions, StdLib};
 
 fn main() -> mlua::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let path = args.first().expect("usage: lua_probe <script.lua> [args...]");
+    let path = args
+        .first()
+        .expect("usage: lua_probe <script.lua> [args...]");
     // SAFETY: as in the engine; the state stays on this thread and `ffi` is wanted.
     let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL, LuaOptions::new()) };
     let arg = lua.create_table()?;
