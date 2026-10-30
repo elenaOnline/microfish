@@ -284,7 +284,7 @@ sees these secrets, and a step only gets the ones it lists under `env:` (the eng
 
 ## Key rotation
 
-- **Developer ID certificate** (expires after five years, or if replaced): export the new `.p12`, update
+- **Developer ID certificate** (expires on the date in the certificate, see Limits, or if replaced): export the new `.p12`, update
   the two secrets. The designated requirement is `identifier + anchor apple generic + team`, not the
   certificate, so a renewed certificate from the same team keeps the app's identity, its permission
   grants and Sparkle's check on the installed app.
@@ -310,15 +310,31 @@ sees these secrets, and a step only gets the ones it lists under `env:` (the eng
 ## Limits of this setup
 
 - Exercised for real on 2026-10-29: the rehearsals (`rehearsal-2` on the first certificate, `rehearsal-3` on the
-  current one), then `v0.1.0-beta.1` (gate, build with notarization, publish with the signed appcast), the tag
+  second), then `v0.1.0-beta.1` (gate, build with notarization, publish with the signed appcast), the tag
   ruleset (admin bypass), the environment's tag rules and required reviewer, and `verify-tag.sh` against the
-  GitHub API. Not yet exercised: a stable promotion, a `release/X.Y` hotfix, a re-run after a partial publish,
-  and an installed copy taking a Sparkle update from this feed (the first beta-to-beta update).
-- The current Developer ID certificate chains to Apple's original Developer ID intermediate, which expires on
-  2027-02-01, and so does the certificate. Shipped builds keep working (secure timestamp, notarized), but no
-  release can be signed with it after that date: make a replacement under the G2 intermediate before then
-  (developer.apple.com, Certificates, +, Developer ID Application, Profile Type **G2 Sub-CA**), replace the two
-  certificate secrets and rehearse. The designated requirement stays identical.
+  GitHub API; on 2026-10-30 `rehearsal-4` on the current (G2) certificate. Not yet exercised: a stable
+  promotion, a `release/X.Y` hotfix, a re-run after a partial publish, and an installed copy taking a Sparkle
+  update from this feed (the first beta-to-beta update).
+- **Certificate renewal: next one due by 2027-10-29.** The current Developer ID Application certificate chains
+  to Apple's G2 Developer ID intermediate (valid to 2031) and itself expires on **2027-11-29**. After that no
+  release can be signed with it; shipped builds keep working (secure timestamp, notarized). Renew a month
+  early so a rehearsal fits before the date:
+  1. Keychain Access, menu Keychain Access, Certificate Assistant, **Request a Certificate From a Certificate
+     Authority...**; your email, Common Name anything, **Saved to disk**, Continue.
+  2. https://developer.apple.com/account/resources/certificates/add , choose **Developer ID Application**,
+     Continue; when asked for the Developer ID Certificate Intermediary choose **G2 Sub-CA (Xcode 11.4.1 or
+     later)**; upload the request file,
+     Continue, Download; open the `.cer` so it joins the login keychain next to its key.
+  3. Export the `.p12` and replace the two certificate secrets (Key rotation, above); run a rehearsal and check
+     that the leaf certificate is the new one, its issuer OU is `G2`, and `codesign -d -r-` is unchanged.
+
+  **Do not create it in Xcode** (Settings, Accounts, Manage Certificates): on 2026-10-29 that made a
+  certificate under the original intermediate, which expires on 2027-02-01, and the certificate with it.
+  Only the developer.apple.com page above lets you choose the intermediate. **Check the expiry date in the
+  certificate you get, not an assumed term:** Developer ID certificates used to run five years, Apple now says
+  G2 ones are issued for one year, and the current one runs about 13 months (2026-10-30 to 2027-11-29).
+  Read it with `openssl x509 -noout -enddate` on the `.cer`, or in Keychain Access (Expires), then move the
+  date at the top of this bullet.
 - Dependency licenses are listed from `cargo metadata` (`app/Scripts/licenses.py`), with the license
   files found in each crate. `cargo-about` would add a curated table for crates that ship no license
   file; swap it in if a notice is ever challenged.
