@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Microfish: a scrolling, tiling window manager for macOS</title>
+  <meta name="description" content="Microfish is a scrolling, tiling window manager for macOS. Windows sit in columns on a strip that scrolls sideways.">
+  <meta property="og:title" content="Microfish">
+  <meta property="og:description" content="A scrolling, tiling window manager for macOS.">
+  <meta property="og:image" content="https://elenaonline.github.io/microfish/media/social-preview.png">
+  <meta property="og:url" content="https://elenaonline.github.io/microfish/">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" type="image/png" href="media/icon.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="site">
+    <div class="wrap">
+      <a class="name" href="./">Microfish</a>
+      <nav aria-label="Site">
+        <a href="https://github.com/elenaOnline/microfish">GitHub</a>
+        <a href="https://github.com/elenaOnline/microfish/releases">Releases</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div class="hero">
+      <img src="media/hero.jpg" width="1600" height="1040" alt="Microfish: windows in columns on a strip, with the minimap along the bottom of the screen">
+      <h1>Microfish</h1>
+      <p>Microfish is a scrolling, tiling window manager for macOS, in the style of niri and PaperWM. Windows sit in columns on a strip that scrolls sideways. A column can hold a stack or a set of tabs, and optional rows put several strips on one display. A three-finger swipe scrolls the strip, and a minimap shows where you are.</p>
+      <div class="download">
+        <a class="button" id="download" href="https://github.com/elenaOnline/microfish/releases/download/v0.1.0-beta.1/Microfish-0.1.0-beta.1.zip"><span id="download-label">Download Microfish 0.1.0-beta.1</span></a>
+        <p class="meta" id="download-meta">beta · 11.0 MB · macOS 15 or later, Apple silicon</p>
+      </div>
+      <p class="note">Microfish is in beta; there is no stable release yet. It is built for macOS 15 and has only been tested on macOS 27. <a href="https://github.com/elenaOnline/microfish/releases">All releases</a></p>
+    </div>
+
+    <section id="tour">
+      <div class="tour-head">
+        <h2>What it does</h2>
+        <button type="button" class="pause" id="pause" hidden>Pause animations</button>
+      </div>
+      <figure class="clip">
+        <video autoplay muted loop playsinline preload="metadata" poster="media/swipe.jpg" aria-labelledby="cap-swipe">
+          <source src="media/swipe.mp4" type="video/mp4">
+        </video>
+        <figcaption id="cap-swipe"><strong>Swipe.</strong> A three-finger swipe scrolls the strip sideways and it glides to a stop. Holding Hyper and scrolling does the same.</figcaption>
+      </figure>
+      <figure class="clip">
+        <video autoplay muted loop playsinline preload="metadata" poster="media/focus-move.jpg" aria-labelledby="cap-focus-move">
+          <source src="media/focus-move.mp4" type="video/mp4">
+        </video>
+        <figcaption id="cap-focus-move"><strong>Focus and move.</strong> <kbd>Hyper</kbd> <kbd>←</kbd> <kbd>→</kbd> focuses the neighboring column. Add <kbd>⇧</kbd> to swap the focused window with it.</figcaption>
+      </figure>
+      <figure class="clip">
+        <video autoplay muted loop playsinline preload="metadata" poster="media/widths.jpg" aria-labelledby="cap-widths">
+          <source src="media/widths.mp4" type="video/mp4">
+        </video>
+        <figcaption id="cap-widths"><strong>Widths.</strong> <kbd>Hyper</kbd> <kbd>R</kbd> cycles a column through a third, a half, two thirds and the full width of the screen; with <kbd>⇧</kbd> it cycles back. <kbd>Hyper</kbd> <kbd>F</kbd> is full width and <kbd>Hyper</kbd> <kbd>C</kbd> centers.</figcaption>
+      </figure>
+      <figure class="clip">
+        <video autoplay muted loop playsinline preload="metadata" poster="media/tabs.jpg" aria-labelledby="cap-tabs">
+          <source src="media/tabs.mp4" type="video/mp4">
+        </video>
+        <figcaption id="cap-tabs"><strong>Stacks and tabs.</strong> <kbd>Hyper</kbd> <kbd>[</kbd> and <kbd>]</kbd> stack the focused window into the column to its left or right. <kbd>Hyper</kbd> <kbd>T</kbd> shows a stack as tabs, with a folder-style tab bar, and <kbd>Hyper</kbd> <kbd>K</kbd> <kbd>J</kbd> switch between them.</figcaption>
+      </figure>
+      <figure class="clip">
+        <video autoplay muted loop playsinline preload="metadata" poster="media/rows.jpg" aria-labelledby="cap-rows">
+          <source src="media/rows.mp4" type="video/mp4">
+        </video>
+        <figcaption id="cap-rows"><strong>Rows.</strong> Rows are off by default. Turn on <strong>Virtual rows</strong> in <strong>Settings › Rows</strong>, and <kbd>Hyper</kbd> <kbd>↑</kbd> <kbd>↓</kbd> moves between strips stacked vertically on the display.</figcaption>
+      </figure>
+      <figure class="clip">
+        <video autoplay muted loop playsinline preload="metadata" poster="media/minimap.jpg" aria-labelledby="cap-minimap">
+          <source src="media/minimap.mp4" type="video/mp4">
+        </video>
+        <figcaption id="cap-minimap"><strong>Minimap.</strong> Holding Hyper, swiping or scrolling shows a minimap of the strip. <strong>Settings › Minimap</strong> picks its style (Cards, Compact or Titles), position and timing.</figcaption>
+      </figure>
+      <figure class="clip">
+        <video autoplay muted loop playsinline preload="metadata" poster="media/map.jpg" aria-labelledby="cap-map">
+          <source src="media/map.mp4" type="video/mp4">
+        </video>
+        <figcaption id="cap-map"><strong>Window map.</strong> Left-click the menu-bar icon for a map of every row and column. You can drag a column to another row, and the <strong>Views</strong> menu saves and recalls arrangements.</figcaption>
+      </figure>
+    </section>
+
+    <section id="install">
+      <h2>Install</h2>
+      <ol>
+        <li>Unzip the download and move <strong>Microfish</strong> into the <strong>Applications</strong> folder. Microfish only runs from there (or from <code>~/Applications</code>).</li>
+        <li>Open Microfish. macOS says it was downloaded from the internet and asks whether to open it. The app is signed with a Developer ID and notarized by Apple, so choose <strong>Open</strong>. A menu-bar icon appears.</li>
+        <li>If Microfish says it needs your approval, open <strong>System Settings › General › Login Items &amp; Extensions</strong> and allow the Microfish background item (it may be listed as <strong>Microfish</strong> or <strong>Microfish Engine</strong>), then open Microfish again.</li>
+        <li>When the alert &ldquo;Allow Microfish to Control Windows&rdquo; appears, choose <strong>Continue</strong>. Then turn on both <strong>Microfish Engine</strong> and <strong>Microfish</strong> in <strong>System Settings › Privacy &amp; Security › Device Control and Data Access</strong>. On macOS before 27 that pane is called <strong>Accessibility</strong>. Windows start tiling once the engine has access.</li>
+        <li>If three fingers already switch full-screen apps, set <strong>System Settings › Trackpad › More Gestures › Swipe between full-screen applications</strong> to four fingers, or change Microfish to four fingers in <strong>Settings › Behavior › Swipe with</strong>.</li>
+      </ol>
+      <p>Screen Recording is optional. It is only used by <strong>Match selected tab to app color</strong> in <strong>Settings › Appearance</strong>. Microfish has no network access apart from update checks, and it collects nothing.</p>
+      <p><strong>Hyper</strong> is Control-Option-Command (<kbd>⌃⌥⌘</kbd>). Caps Lock can be mapped to Hyper with <a href="https://karabiner-elements.pqrs.org">Karabiner-Elements</a> (optional). Every shortcut can be changed in <strong>Settings › Shortcuts</strong>. The <a href="https://github.com/elenaOnline/microfish#keys">full list of default keys</a> is in the README.</p>
+
+      <h3>Homebrew</h3>
+      <pre><code>brew trust elenaonline/tap
+brew install --cask elenaonline/tap/microfish</code></pre>
+      <p>The cask installs the newest published build, which today is the beta. Homebrew 7 refuses casks from a tap you haven&rsquo;t trusted, which is what the first line is for. Older Homebrew has no <code>brew trust</code>; skip that line there.</p>
+    </section>
+
+    <section id="updates">
+      <h2>Updates</h2>
+      <p>Microfish uses <a href="https://sparkle-project.org">Sparkle</a> to check this project&rsquo;s releases. Every update is code-signed and notarized by Apple, and signed with an EdDSA key that the app checks before installing. Before an update replaces the app, Microfish stops the engine cleanly (it saves your session), then relaunches.</p>
+      <p>In <strong>Settings › Updates</strong>, <strong>Automatically check for updates</strong> is on by default and <strong>Automatically download and install updates</strong> is off. <strong>Check for Updates…</strong> is in the menu-bar menu.</p>
+      <p><strong>Get beta updates</strong> is off by default. Every release so far is a beta, so a copy of <code>0.1.0-beta.1</code> is offered nothing newer until you turn that switch on. Turning betas off never downgrades you: you stay on the beta until a newer stable version arrives.</p>
+    </section>
+
+    <section id="uninstall">
+      <h2>Uninstall</h2>
+      <ol>
+        <li>Choose <strong>Quit Microfish</strong> from the menu-bar icon.</li>
+        <li>Drag Microfish out of Applications into the Trash. With Homebrew, run <code>brew uninstall --cask microfish</code> instead.</li>
+        <li>Optional: remove <strong>Microfish</strong> and <strong>Microfish Engine</strong> from <strong>Device Control and Data Access</strong> (Accessibility before macOS 27), and check <strong>Login Items &amp; Extensions</strong> for a leftover Microfish item.</li>
+        <li>Optional: delete what Microfish wrote:
+<pre><code>rm -r ~/Library/"Application Support"/Microfish ~/Library/Logs/Microfish
+rm -r ~/Library/Caches/net.webreceptor.microfish ~/Library/HTTPStorages/net.webreceptor.microfish
+defaults delete net.webreceptor.microfish</code></pre>
+        </li>
+      </ol>
+    </section>
+
+    <section id="limits">
+      <h2>Requirements and known limits</h2>
+      <ul>
+        <li>An Apple silicon Mac on macOS 15 or later. Intel is not supported yet.</li>
+        <li>Nothing before macOS 27 has been tested, although Microfish is built for 15.</li>
+        <li><strong>Displays have separate Spaces</strong> must be on in <strong>System Settings › Desktop &amp; Dock</strong>. It is on by default; the engine refuses to start without it.</li>
+        <li>This is a beta, and rows are off by default.</li>
+        <li>Updating from inside the app has been tested with throwaway keys, but no installed copy has taken an update from the real feed yet.</li>
+      </ul>
+      <p>The <a href="https://github.com/elenaOnline/microfish#known-limits">README</a> has the rest.</p>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <p><a href="https://github.com/elenaOnline/microfish">Source on GitHub</a> · MIT license</p>
+      <p>The engine is a patched build of <a href="https://github.com/karinushka/paneru">Paneru</a> by Karinushka and contributors. Updates use <a href="https://sparkle-project.org">Sparkle</a>. The scrolling model comes from <a href="https://github.com/YaLTeR/niri">niri</a> and <a href="https://github.com/paperwm/PaperWM">PaperWM</a>.</p>
+    </div>
+  </footer>
+  <script src="site.js" defer></script>
+</body>
+</html>

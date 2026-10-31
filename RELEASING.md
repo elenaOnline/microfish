@@ -71,9 +71,26 @@ the tag, `dry_run` unticked (the environment's tag rule would refuse a branch an
 published stables (`version.py is-latest`).
 
 **The first public release should be a stable promoted from a beta.** `releases/latest` is a 404 until a
-stable exists, and the README's install link points there. Soak `v0.1.0-beta.N` privately (or as a
+stable exists, so the README links the tagged zip and the releases list instead. Soak `v0.1.0-beta.N` privately (or as a
 pre-release), then tag `v0.1.0` on the same commit before telling anyone the repository exists. If a beta
 must go out first, the README says where to look (the full releases list).
+
+## Repo presentation
+
+After each release is published, update the places that name a specific build. The workflows and scripts
+don't touch them.
+
+- **Homebrew cask**, in the separate repository elenaOnline/homebrew-tap (`Casks/microfish.rb`): set
+  `version` and `sha256` (`shasum -a 256` of the published zip). That repository's README has the steps.
+- **README.md**: the direct download link and its size in the Download section. The badge and the Pages
+  site (`docs/index.html`) resolve the newest release themselves; the site's fallback link, which is used
+  only when the GitHub API can't be reached, is the same zip, so update it too.
+- **Pages** serves `docs/` from `main` (Settings › Pages › Build and deployment: Deploy from a branch,
+  `main`, `/docs`). Pushing to `main` redeploys it. The social preview image is `docs/media/social-preview.png`,
+  uploaded by hand: https://github.com/elenaOnline/microfish/settings › General › Social preview › Edit ›
+  Upload an image….
+- When a stable ships, change the wording that says there is no stable release yet (README Download and
+  Known limits, the site, the cask's caveats).
 
 ## What the pipeline does
 
